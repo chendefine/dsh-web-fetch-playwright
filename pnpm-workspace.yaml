@@ -1,0 +1,5 @@
+# Keep the plugin's dependency store local to this checkout so `pnpm install`
+# never touches a shared store, and let native build scripts run if a
+# dependency needs one (node-gyp etc.).
+packages:
+  - '.'

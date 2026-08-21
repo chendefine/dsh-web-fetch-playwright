@@ -1,0 +1,228 @@
+/* Plugin-configuration fields — the shipped ui-settings-plugins field styles
+   (label / badge / input / hint on dsw-alias tokens) plus the radio-group and
+   checkbox rows this card adds on the same rhythm. */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 0;
+  margin: 0;
+  border: 0;
+  border-top: 1px solid var(--dsw-alias-border-l2);
+}
+
+.field:first-child {
+  border-top: 0;
+}
+
+/* The same field without card-level chrome: renders inside a radio option,
+   so the option box supplies the container and the border. The layout is
+   spelled out rather than composed from .field — the build pipeline drops
+   CSS Modules `composes`, and a lost flex column would leave the input at
+   its intrinsic width instead of stretching to the option box. */
+.fieldEmbedded {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-top: 0;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.label {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-primary);
+}
+
+.badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.badge {
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  line-height: 17px;
+  white-space: nowrap;
+  font-weight: 500;
+  background: var(--dsw-alias-bg-module-platform);
+  color: var(--dsw-alias-label-secondary);
+}
+
+.reset {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+}
+
+.reset:hover:not(:disabled) {
+  color: var(--dsw-alias-label-primary);
+}
+
+.reset:disabled {
+  cursor: default;
+}
+
+.input {
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-3);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-primary);
+}
+
+.input:focus-visible {
+  outline: none;
+  border-color: var(--dsw-alias-brand-primary);
+}
+
+.input:disabled {
+  color: var(--dsw-alias-label-tertiary);
+  cursor: default;
+}
+
+/* Invalid input: same shape as .input with the error border. Self-contained
+   (no `composes: input`) for the same build-pipeline reason as .fieldEmbedded. */
+.inputInvalid {
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--dsw-alias-label-error);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-3);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-primary);
+}
+
+.invalid {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-error);
+}
+
+.hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* ── radio group ──────────────────────────────────────────────────────── */
+
+.radioGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Option box: the pickable header (radio + label/hint) and, when the option
+   carries a nested fill-in field, that field indented under the text column. */
+.radioOption {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-3);
+}
+
+.radioOption:has(input[type='radio']:checked) {
+  border-color: var(--dsw-alias-brand-primary);
+}
+
+.radioPick {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.radioPick input[type='radio'] {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+  accent-color: var(--dsw-alias-brand-primary);
+}
+
+.radioPick input[type='radio']:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 1px;
+}
+
+.radioText {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.radioLabel {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-primary);
+}
+
+.radioHint {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* Nested fill-in field, aligned with the label/hint text column (radio
+   14px + 10px gap). */
+.radioContent {
+  margin-left: 24px;
+}
+
+.radioContent input[type='text']:enabled {
+  cursor: text;
+}
+
+/* ── checkbox ─────────────────────────────────────────────────────────── */
+
+.checkboxRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.checkboxRow input[type='checkbox'] {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--dsw-alias-brand-primary);
+}
+
+.checkboxRow input[type='checkbox']:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 1px;
+}

@@ -1,0 +1,91 @@
+{
+  "name": "dsh-web-fetch-playwright",
+  "version": "0.1.0",
+  "description": "Playwright/CDP web-fetch provider for the DeepSeek Harness web capability: renders pages in a real browser, denoises them (Readability + DOMPurify), and returns markdown.",
+  "type": "module",
+  "license": "MIT",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json",
+    "./client": {
+      "types": "./lib/types/client/index.d.ts",
+      "default": "./lib/client.js"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "lib/types/**/*.d.ts",
+    "src",
+    "cordis.patch.yml",
+    "dsh.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "rm -rf lib && tsc -p tsconfig.build.json --emitDeclarationOnly && tsdown",
+    "prepare": "pnpm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": ">=3.18.1-rc.1 <4",
+    "@joplin/turndown-plugin-gfm": "^1.0.56",
+    "@mozilla/readability": "^0.6.0",
+    "dompurify": "^3.2.4",
+    "jsdom": "^26.0.0",
+    "playwright-core": "^1.50.0",
+    "turndown": "^7.2.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.1-rc.1 <5",
+    "@deepseek-ai/dsh-settings": ">=0.1.0-rc.6 <1",
+    "@deepseek-ai/dsh-web": ">=0.1.0-rc.6 <1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "link:/app/dsh/vendor/cordis",
+    "@deepseek-ai/dsh-client-locale": "link:/app/dsh/packages/client/locale",
+    "@deepseek-ai/dsh-client-runtime": "link:/app/dsh/packages/client/runtime",
+    "@deepseek-ai/dsh-client-ui-settings": "link:/app/dsh/packages/client/ui-settings",
+    "@deepseek-ai/dsh-client-ui-settings-plugins": "link:/app/dsh/packages/client/ui-settings-plugins",
+    "@deepseek-ai/dsh-client-ui-slots": "link:/app/dsh/packages/client/ui-slots",
+    "@deepseek-ai/dsh-settings": "link:/app/dsh/packages/settings/settings",
+    "@deepseek-ai/dsh-web": "link:/app/dsh/packages/web/web",
+    "@types/jsdom": "link:/opt/dsh/plugins/cdp-live-view/node_modules/@types/jsdom",
+    "@types/node": "^24.0.0",
+    "@types/react": "^18.3.1",
+    "@types/react-dom": "^18.3.1",
+    "@types/turndown": "link:/app/dsh/packages/web/tool-web/node_modules/@types/turndown",
+    "lightningcss": "^1.32.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tsdown": "^0.22.2",
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.8"
+  }
+}

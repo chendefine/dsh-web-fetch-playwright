@@ -1,0 +1,31 @@
+# dsh-web-fetch-playwright bundle layer.
+#
+# 1. Pin the web seam's fetch provider to this plugin's provider (id
+#    'playwright'). A patch replaces the targeted row's WHOLE config, so the
+#    shipped search selection is restated verbatim — losing it would break
+#    web_search.
+# 2. Enable the model-facing web_fetch tool with a browser-realistic budget
+#    (launch + render + denoise takes longer than a plain HTTP GET; 60s
+#    matches the deployment's search budget). `disabled: false` re-enables
+#    the row the dsh-web-app layer disables (that layer parks tool-web on the
+#    preset plane with fetch: false; this layer — applied after it — turns
+#    the host-plane row back on so every session gets web_fetch).
+# 3. Insert this package's host plugin row.
+#
+# Bundle layers load at the next profile start; the settings section
+# ('web-fetch-playwright') layering over the row config is hot-reloaded.
+- id: web
+  config:
+    searchProvider: deepseek-official
+    fetchProvider: playwright
+
+- id: tool-web
+  disabled: false
+  config:
+    fetch: true
+    fetchTimeoutMs: 60000
+    searchTimeoutMs: 60000
+
+- insert:
+    - id: web-fetch-playwright
+      name: dsh-web-fetch-playwright
