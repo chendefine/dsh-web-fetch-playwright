@@ -1,8 +1,10 @@
 /**
  * Integration smoke: a real local HTTP server through the REAL provider
  * (real playwright resolution, real browser launch, real denoise pipeline).
- * Self-skips when no usable local playwright/browser exists so the suite
- * stays green on machines without browsers.
+ * Self-skips when no usable local playwright/browser exists — resolution
+ * succeeding is not enough (playwright-core resolves even without browsers),
+ * so a launch probe runs once in `beforeAll` and the cases skip when it fails
+ * — keeping the suite green on machines and CI runners without browsers.
  */
 import { createServer } from 'node:http'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -18,6 +20,8 @@ const PAGE = `<!doctype html><html><head><title>Smoke page</title></head><body>
 
 let server: ReturnType<typeof createServer>
 let baseUrl: string
+let browserAvailable = false
+let backendSource = ''
 
 beforeAll(async () => {
   server = createServer((req, res) => {
@@ -28,6 +32,18 @@ beforeAll(async () => {
   const address = server.address()
   if (address === null || typeof address === 'string') throw new Error('no server address')
   baseUrl = `http://127.0.0.1:${String(address.port)}/`
+
+  // Resolution succeeding is not enough: the bundled playwright-core resolves
+  // even when no browser binary is installed, and launch is the real gate.
+  try {
+    const resolution = await resolvePlaywrightBackend('')
+    backendSource = resolution.source
+    const browser = await resolution.chromium.launch({ headless: true, timeout: 20_000 })
+    await browser.close()
+    browserAvailable = true
+  } catch (error) {
+    console.warn(`skipping browser smoke: ${String(error instanceof Error ? error.message : error)}`)
+  }
 })
 
 afterAll(async () => {
@@ -36,15 +52,11 @@ afterAll(async () => {
 
 describe('PlaywrightFetchProvider integration', () => {
   it('fetches a local page through a real browser and denoises it', { timeout: 120_000 }, async () => {
-    let resolution: Awaited<ReturnType<typeof resolvePlaywrightBackend>>
-    try {
-      resolution = await resolvePlaywrightBackend('')
-    } catch (error) {
-      // No playwright on this machine — skip rather than fail.
-      console.warn(`skipping browser smoke: ${String(error instanceof Error ? error.message : error)}`)
+    if (!browserAvailable) {
+      console.warn('skipping browser smoke (no launchable browser)')
       return
     }
-    console.warn(`smoke backend: ${resolution.source}`)
+    console.warn(`smoke backend: ${backendSource}`)
 
     const provider = new PlaywrightFetchProvider(() => ({
       backend: 'local',
@@ -64,10 +76,8 @@ describe('PlaywrightFetchProvider integration', () => {
   })
 
   it('returns raw html with denoise off', { timeout: 120_000 }, async () => {
-    try {
-      await resolvePlaywrightBackend('')
-    } catch {
-      console.warn('skipping browser smoke (no playwright)')
+    if (!browserAvailable) {
+      console.warn('skipping browser smoke (no launchable browser)')
       return
     }
     const provider = new PlaywrightFetchProvider(() => ({
@@ -82,10 +92,8 @@ describe('PlaywrightFetchProvider integration', () => {
   })
 
   it('maps an unreachable page to a structured WebError', { timeout: 120_000 }, async () => {
-    try {
-      await resolvePlaywrightBackend('')
-    } catch {
-      console.warn('skipping browser smoke (no playwright)')
+    if (!browserAvailable) {
+      console.warn('skipping browser smoke (no launchable browser)')
       return
     }
     const provider = new PlaywrightFetchProvider(() => ({

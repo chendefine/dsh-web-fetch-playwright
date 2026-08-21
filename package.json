@@ -1,7 +1,7 @@
 {
   "name": "dsh-web-fetch-playwright",
   "version": "0.1.0",
-  "description": "Playwright/CDP web-fetch provider for the DeepSeek Harness web capability: renders pages in a real browser, denoises them (Readability + DOMPurify), and returns markdown.",
+  "description": "Playwright/CDP web-fetch provider for DeepSeek Harness: renders pages in a real browser, denoises them (Readability + DOMPurify), and returns markdown.",
   "type": "module",
   "license": "MIT",
   "main": "lib/index.js",
@@ -27,11 +27,14 @@
     "src",
     "cordis.patch.yml",
     "dsh.plugin.json",
-    "README.md"
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "rm -rf lib && tsc -p tsconfig.build.json --emitDeclarationOnly && tsdown",
     "prepare": "pnpm run build",
+    "prepublishOnly": "pnpm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
@@ -47,6 +50,42 @@
         "@deepseek-ai/dsh-client-ui-settings"
       ]
     }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "playwright",
+    "cdp",
+    "web-fetch",
+    "fetch-provider",
+    "markdown",
+    "bundle"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chendefine/dsh-web-fetch-playwright.git"
+  },
+  "homepage": "https://github.com/chendefine/dsh-web-fetch-playwright#readme",
+  "bugs": {
+    "url": "https://github.com/chendefine/dsh-web-fetch-playwright/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "disclosure": {
+    "cloud": false,
+    "network": [],
+    "offlineMode": false,
+    "apiKeys": [],
+    "permissions": [
+      "network:fetch (renders the URLs the user requests in a local browser)",
+      "network:connect (user-configured CDP endpoint, default 127.0.0.1:9222)",
+      "fs:read (user-configured playwright/browser executable path)"
+    ],
+    "jurisdiction": [],
+    "retention": "none"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": ">=3.18.1-rc.1 <4",
@@ -68,19 +107,19 @@
     }
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "link:/app/dsh/vendor/cordis",
-    "@deepseek-ai/dsh-client-locale": "link:/app/dsh/packages/client/locale",
-    "@deepseek-ai/dsh-client-runtime": "link:/app/dsh/packages/client/runtime",
-    "@deepseek-ai/dsh-client-ui-settings": "link:/app/dsh/packages/client/ui-settings",
-    "@deepseek-ai/dsh-client-ui-settings-plugins": "link:/app/dsh/packages/client/ui-settings-plugins",
-    "@deepseek-ai/dsh-client-ui-slots": "link:/app/dsh/packages/client/ui-slots",
-    "@deepseek-ai/dsh-settings": "link:/app/dsh/packages/settings/settings",
-    "@deepseek-ai/dsh-web": "link:/app/dsh/packages/web/web",
-    "@types/jsdom": "link:/opt/dsh/plugins/cdp-live-view/node_modules/@types/jsdom",
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-client-locale": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-client-runtime": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-client-ui-settings": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-client-ui-settings-plugins": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-client-ui-slots": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-settings": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-web": "0.1.1-rc.1",
+    "@types/jsdom": "^30.0.0",
     "@types/node": "^24.0.0",
     "@types/react": "^18.3.1",
     "@types/react-dom": "^18.3.1",
-    "@types/turndown": "link:/app/dsh/packages/web/tool-web/node_modules/@types/turndown",
+    "@types/turndown": "^5.0.6",
     "lightningcss": "^1.32.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

@@ -1,7 +1,7 @@
 {
   "name": "dsh-web-fetch-playwright",
   "version": "0.1.0",
-  "description": "Playwright/CDP web-fetch provider with Readability-based markdown denoising for the DeepSeek Harness web capability.",
+  "description": "Playwright/CDP web-fetch provider for DeepSeek Harness: renders pages in a real browser, denoises them (Readability + DOMPurify), and returns markdown.",
   "entry": {
     "name": "dsh-web-fetch-playwright",
     "inject": []
