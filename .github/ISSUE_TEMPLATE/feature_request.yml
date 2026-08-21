@@ -1,0 +1,24 @@
+name: Feature request
+description: Suggest an improvement — a new backend option, a denoise mode, or a config field.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can't you do today? What would unblock you?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: The shape of the option or behavior you'd like to see.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Any links, pages, or scenarios that motivate this.

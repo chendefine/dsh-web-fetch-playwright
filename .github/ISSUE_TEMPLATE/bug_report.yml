@@ -1,0 +1,56 @@
+name: Bug report
+description: Report a bug in the fetch provider, the denoise pipeline, or the settings card.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please fill in the fields below; a minimal reproduction is the fastest path to a fix.
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - Local Playwright
+        - Remote CDP endpoint
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: Fetch URL (or a sanitized equivalent)
+      description: Which page reproduces the issue, if one does.
+    validations:
+      required: false
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the full error message / tool output if there is one.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Backend selector, playwrightPath / cdpEndpoint, denoise setting (omit paths that identify you).
+  - type: input
+    id: version
+    attributes:
+      label: Plugin version
+      description: The `version` from package.json, or `npm view dsh-web-fetch-playwright version`.
+    validations:
+      required: true
+  - type: input
+    id: dsh-version
+    attributes:
+      label: DeepSeek Harness version
+      description: e.g. the `@deepseek-ai/dsh-web` version the profile loads.
