@@ -7,7 +7,7 @@
  */
 
 import type { SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
-import { CardForm, checkboxField, radioField, textField } from './form.ts'
+import { CardForm, checkboxField, numberField, radioField, textField } from './form.ts'
 import type { CardShell, CardFieldState, CardActions, SnapshotStore } from './form.ts'
 
 /**
@@ -26,6 +26,8 @@ export interface PlaywrightSettings {
   cdpEndpoint?: string
   /** Whether the Readability + DOMPurify pipeline runs. */
   denoise?: boolean
+  /** How many fetches may render at once (1–200); blank = backend default. */
+  maxConcurrency?: number
 }
 
 /** What the Playwright card renders. */
@@ -38,6 +40,8 @@ export interface PlaywrightCardState extends CardShell {
   cdpEndpoint: CardFieldState
   /** Denoise checkbox (draft 'true'/'false'). */
   denoise: CardFieldState
+  /** Concurrency input (draft decimal integer). */
+  maxConcurrency: CardFieldState
 }
 
 /** The registration-side face the card's slot entry injects. */
@@ -64,6 +68,7 @@ export class PlaywrightCardController {
         textField('playwrightPath'),
         textField('cdpEndpoint'),
         checkboxField('denoise'),
+        numberField('maxConcurrency', 1, 200),
       ],
     )
     this.store = this.form.bind(() => this.projection())
@@ -76,6 +81,7 @@ export class PlaywrightCardController {
       playwrightPath: this.form.field('playwrightPath'),
       cdpEndpoint: this.form.field('cdpEndpoint'),
       denoise: this.form.field('denoise'),
+      maxConcurrency: this.form.field('maxConcurrency'),
     }
   }
 

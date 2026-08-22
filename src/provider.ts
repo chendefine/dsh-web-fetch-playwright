@@ -4,10 +4,16 @@
  * error taxonomy (URL hygiene, abort/timeout translation, content-type
  * classification) so the tool layer sees the same codes from either backend.
  *
- * Lifecycle is per-fetch and fully reversible: local launches close their
- * browser, CDP connections disconnect, and an aborted signal closes both —
- * no browser outlives the call that opened it. Concurrency is capped at
- * {@link MAX_CONCURRENT_FETCHES} local browsers.
+ * Lifecycle: the local backend launches a browser per fetch and closes it —
+ * nothing outlives the call. The CDP backend keeps ONE shared connection to
+ * the remote browser for the provider's lifetime; each fetch only opens an
+ * isolated context (a tab) inside it and closes that on completion, so the
+ * concurrency cap counts tabs, not browsers. Either way, an aborted signal
+ * closes the fetch's context. Concurrency is capped at the `maxConcurrency`
+ * setting (explicit, or the backend default — {@link DEFAULT_MAX_CONCURRENCY_LOCAL}
+ * browsers / {@link DEFAULT_MAX_CONCURRENCY_CDP} tabs); further fetches wait
+ * briefly in a queue and fail fast (rather than hang until abort) when no
+ * slot frees.
  *
  * Private-network and SSRF protection is not implemented (same stance as the
  * shipped HTTP provider); a page this provider can reach is whatever the
@@ -18,8 +24,9 @@
 
 import { WebError } from '@deepseek-ai/dsh-web'
 import type { WebFetchProvider, WebFetchRequest, WebFetchResult } from '@deepseek-ai/dsh-web'
-import { normalizeCdpEndpoint } from './config.ts'
+import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, effectiveMaxConcurrency, normalizeCdpEndpoint } from './config.ts'
 import type { ResolvedConfig } from './config.ts'
+import { CdpConnectionPool } from './cdp-pool.ts'
 import { htmlToMarkdown } from './markdown.ts'
 import { resolveCdpBackend, resolvePlaywrightBackend } from './playwright-resolve.ts'
 import type { PlaywrightBrowser, PlaywrightContext } from './types.ts'
@@ -36,8 +43,13 @@ const MAX_BODY_CHARS = 100_000
 /** Cap on rendered HTML fed into the synchronous denoise pipeline. */
 const MAX_PIPELINE_INPUT_CHARS = 2_000_000
 
-/** How many browsers may render at once; further fetches queue. */
-const MAX_CONCURRENT_FETCHES = 2
+/**
+ * How long a fetch may sit in the concurrency queue before failing fast.
+ * Waiting longer cannot help — the per-fetch deadline leaves too little
+ * budget to render after dequeue — and failing fast tells the caller to
+ * retry or raise `maxConcurrency` instead of hanging until an abort.
+ */
+const QUEUE_TIMEOUT_MS = 20_000
 
 /** Default per-fetch budget (ms), inside the tool layer's 60s. */
 const DEFAULT_TIMEOUT_MS = 45_000
@@ -45,10 +57,23 @@ const DEFAULT_TIMEOUT_MS = 45_000
 /** Best-effort post-DOM settle wait (ms) so SPA content can finish rendering. */
 const SETTLE_MS = 5_000
 
-/** One open browser plus its per-fetch context, closed together. */
+/**
+ * Grace period (ms) for context/browser closes in the cleanup path. A wedged
+ * `close()` must never hold a concurrency slot hostage — a leaked slot would
+ * fail every later fetch with the queue error until restart.
+ */
+const CLOSE_GRACE_MS = 2_000
+
+/**
+ * One render session: a browser and the context this fetch owns. Local
+ * backends own the browser too; CDP sessions ride the shared connection and
+ * only their context closes at the end.
+ */
 export interface BrowserSession {
   browser: PlaywrightBrowser
   context: PlaywrightContext
+  /** True when `browser` is the CDP pool's shared connection — never closed per fetch. */
+  sharedBrowser?: boolean
 }
 
 /**
@@ -87,43 +112,87 @@ class Deadline {
   }
 }
 
-/** A cap-{@link MAX_CONCURRENT_FETCHES} async semaphore with abort support. */
+/**
+ * A bounded async semaphore with abort support. The limit is live-resizable
+ * (`resize`) because the config thunk re-reads on every fetch — raising it
+ * wakes queued waiters immediately; lowering it lets in-flight holders run
+ * out naturally.
+ */
 class Semaphore {
   private active = 0
-  private readonly queue: Array<{ start: () => void; abort: () => void }> = []
+  private limit: number
+  private readonly queue: Array<{ start: () => void; fail: (error: WebError) => void }> = []
 
-  /** Take a slot, or queue until one frees; an aborted signal rejects the wait. */
+  /** @param limit - how many holders may run at once. */
+  constructor(limit: number) {
+    this.limit = limit
+  }
 
-  acquire(signal: AbortSignal): Promise<void> {
-    if (this.active < MAX_CONCURRENT_FETCHES) {
+  /** Apply a new limit, starting queued waiters for any capacity it opens. */
+  resize(limit: number): void {
+    this.limit = limit
+    this.drain()
+  }
+
+  /**
+   * Take a slot, or queue until one frees. A queued fetch fails fast on the
+   * caller's abort signal or after `queueTimeoutMs` without a slot — the
+   * queue wait must not eat the whole fetch budget only to die mid-render.
+   */
+  acquire(signal: AbortSignal, queueTimeoutMs: number): Promise<void> {
+    if (this.active < this.limit) {
       this.active++
       return Promise.resolve()
     }
     return new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer)
+        signal.removeEventListener('abort', onAbort)
+      }
       const waiter = {
         start: () => {
-          signal.removeEventListener('abort', waiter.abort)
+          cleanup()
           this.active++
           resolve()
         },
-        abort: () => {
+        fail: (error: WebError) => {
           const index = this.queue.indexOf(waiter)
           if (index !== -1) this.queue.splice(index, 1)
-          reject(new WebError('web fetch aborted while waiting for a free browser slot', 'WEB_ABORTED'))
+          cleanup()
+          reject(error)
         },
       }
+      const timer = setTimeout(() => {
+        waiter.fail(new WebError(
+          `all ${String(this.limit)} rendering slots stayed busy for ${String(queueTimeoutMs)}ms; retry shortly, or raise the maxConcurrency setting`,
+          'WEB_FETCH_TIMEOUT',
+        ))
+      }, queueTimeoutMs)
+      const onAbort = () => {
+        waiter.fail(new WebError('web fetch aborted while waiting for a free rendering slot', 'WEB_ABORTED'))
+      }
       this.queue.push(waiter)
-      signal.addEventListener('abort', waiter.abort, { once: true })
+      signal.addEventListener('abort', onAbort, { once: true })
     })
   }
 
   release(): void {
-    const next = this.queue.shift()
+    // Below the limit a freed slot hands straight to the next waiter; above
+    // it (the limit was lowered) the slot disappears instead.
+    const next = this.active <= this.limit ? this.queue.shift() : undefined
     if (next === undefined) {
       this.active = Math.max(0, this.active - 1)
       return
     }
     next.start()
+  }
+
+  private drain(): void {
+    while (this.active < this.limit) {
+      const next = this.queue.shift()
+      if (next === undefined) return
+      next.start()
+    }
   }
 }
 
@@ -162,7 +231,12 @@ function classifyContentType(contentType: string | undefined): FetchableKind | u
 /** Translate a thrown pipeline error into the seam's WebError taxonomy. */
 function translateError(error: unknown, deadline: Deadline): WebError {
   if (deadline.isTimeout) return new WebError('playwright web fetch timed out', 'WEB_FETCH_TIMEOUT', { cause: error })
-  if (deadline.signal.aborted) return new WebError('web fetch aborted', 'WEB_ABORTED', { cause: error })
+  if (deadline.signal.aborted) {
+    // An outer cancellation of a queued fetch already carries the precise
+    // "waiting for a free rendering slot" message — keep it over the generic abort.
+    if (error instanceof WebError) return error
+    return new WebError('web fetch aborted', 'WEB_ABORTED', { cause: error })
+  }
   if (error instanceof WebError) return error
   return new WebError(`playwright web fetch failed: ${String(error instanceof Error ? error.message : error)}`, 'WEB_PROVIDER_ERROR', { cause: error })
 }
@@ -175,16 +249,31 @@ function translateError(error: unknown, deadline: Deadline): WebError {
 export class PlaywrightFetchProvider implements WebFetchProvider {
   readonly id = PLAYWRIGHT_FETCH_PROVIDER_ID
 
-  private readonly semaphore = new Semaphore()
+  private readonly semaphore = new Semaphore(DEFAULT_MAX_CONCURRENCY_LOCAL)
+
+  /** Shared CDP connection; injectable so the suite can substitute a fake. */
+  protected readonly cdpPool: CdpConnectionPool
 
   /**
    * @param configSource - thunk returning the currently authoritative config.
+   * @param cdpPool - optional pool over the CDP backend (tests inject fakes).
    */
-  constructor(private readonly configSource: () => ResolvedConfig) {}
+  constructor(private readonly configSource: () => ResolvedConfig, cdpPool?: CdpConnectionPool) {
+    this.cdpPool = cdpPool ?? new CdpConnectionPool(defaultCdpConnect)
+  }
 
   /** Cheap and side-effect free; backend problems surface per fetch instead. */
   available(): boolean {
     return true
+  }
+
+  /**
+   * Drop the shared CDP connection (plugin teardown). Local browsers need
+   * nothing — they never outlive their fetch. In-flight CDP fetches keep
+   * their leases and close them when they finish.
+   */
+  async dispose(): Promise<void> {
+    await this.cdpPool.dispose()
   }
 
   async fetch(request: WebFetchRequest, signal?: AbortSignal): Promise<WebFetchResult> {
@@ -193,16 +282,19 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     const url = validateFetchUrl(request.url)
     const deadline = new Deadline(signal, DEFAULT_TIMEOUT_MS)
 
-    await this.semaphore.acquire(deadline.signal)
     let session: BrowserSession | undefined
+    let acquired = false
     try {
+      // The live config decides the limit per fetch (explicit setting, else
+      // the backend default); raising it immediately starts queued waiters.
+      this.semaphore.resize(effectiveMaxConcurrency(config))
+      await this.semaphore.acquire(deadline.signal, QUEUE_TIMEOUT_MS)
+      acquired = true
       session = await this.openSession(config, deadline)
       // An aborted deadline must also interrupt Playwright's own waits:
       // closing the context rejects every pending page operation.
-      const onAbort = () => {
-        void session?.context.close().catch(() => {})
-        void session?.browser.close().catch(() => {})
-      }
+      const held = session
+      const onAbort = () => { void closeSession(held) }
       deadline.signal.addEventListener('abort', onAbort, { once: true })
       try {
         return await this.retrieve(session, url, config, deadline)
@@ -212,10 +304,12 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     } catch (error: unknown) {
       throw translateError(error, deadline)
     } finally {
-      // Local launches exit; CDP connections merely disconnect.
-      await session?.context.close().catch(() => {})
-      await session?.browser.close().catch(() => {})
-      this.semaphore.release()
+      // Local launches exit; CDP connections merely disconnect. Both closes
+      // are grace-bounded so a wedged browser can never pin a concurrency slot.
+      await closeSession(session)
+      // Only a slot actually taken is given back — a queued fetch that failed
+      // to acquire must not hand a phantom slot to the next waiter.
+      if (acquired) this.semaphore.release()
     }
   }
 
@@ -230,12 +324,13 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     const timeout = Math.min(deadline.remainingMs(), 20_000)
     if (config.backend === 'cdp') {
       const endpoint = normalizeCdpEndpoint(config.cdpEndpoint)
-      const { chromium, source } = await resolveCdpBackend()
+      const { source } = await resolveCdpBackend()
       try {
-        const browser = await chromium.connectOverCDP(endpoint, { timeout })
-        const context = await browser.newContext()
-        await installResourceFilter(context)
-        return { browser, context }
+        // One shared connection per provider; this fetch leases an isolated
+        // context (a tab in the remote browser) and closes only that.
+        const lease = await this.cdpPool.acquire(endpoint, timeout)
+        await installResourceFilter(lease.context)
+        return { browser: lease.browser, context: lease.context, sharedBrowser: true }
       } catch (error: unknown) {
         throw new WebError(
           `cannot connect to the CDP endpoint ${endpoint} (${source}); is the browser started with --remote-debugging-port? ${String(error instanceof Error ? error.message : error)}`,
@@ -309,6 +404,39 @@ function capResult(url: string, statusCode: number, body: { kind: 'html' | 'text
     body: { kind: body.kind, content: truncated ? body.content.slice(0, MAX_BODY_CHARS) : body.content },
     truncated,
   }
+}
+
+/**
+ * Close a session's fetch-owned context, plus its browser when the session
+ * launched one (local backend). CDP sessions ride the shared connection,
+ * which stays open. Every close is grace-bounded so cleanup always completes
+ * and the concurrency slot is released even when Playwright hangs.
+ */
+async function closeSession(session: BrowserSession | undefined): Promise<void> {
+  if (session === undefined) return
+  await closeWithGrace(session.context)
+  if (session.sharedBrowser !== true) await closeWithGrace(session.browser)
+}
+
+/** One best-effort `close()` that resolves within the grace period. */
+async function closeWithGrace(closeable: { close(): Promise<void> }): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, CLOSE_GRACE_MS)
+    void closeable.close().then(
+      () => { clearTimeout(timer); resolve() },
+      () => { clearTimeout(timer); resolve() },
+    )
+  })
+}
+
+/**
+ * The real CDP connect the pool runs with: the bundled playwright-core's
+ * `connectOverCDP`. Kept as a function (not inline) so the pool constructor
+ * stays injectable for tests.
+ */
+async function defaultCdpConnect(endpoint: string, timeoutMs: number): Promise<PlaywrightBrowser> {
+  const { chromium } = await resolveCdpBackend()
+  return await chromium.connectOverCDP(endpoint, { timeout: timeoutMs })
 }
 
 /**

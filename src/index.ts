@@ -19,6 +19,8 @@ import { PlaywrightFetchProvider } from './provider.ts'
 
 export { Config, DEFAULT_CDP_ENDPOINT, normalizeCdpEndpoint } from './config.ts'
 export type { Config as PlaywrightFetchConfig, PlaywrightBackend, ResolvedConfig } from './config.ts'
+export { CdpConnectionPool } from './cdp-pool.ts'
+export type { CdpConnect, CdpLease } from './cdp-pool.ts'
 export { PLAYWRIGHT_FETCH_PROVIDER_ID, PlaywrightFetchProvider } from './provider.ts'
 export { htmlToMarkdown } from './markdown.ts'
 export type { DenoiseMode, DenoiseResult } from './markdown.ts'
@@ -48,5 +50,9 @@ export function apply(ctx: Context, config: Config): void {
     // needs no re-registration.
     onChange: () => {},
   })
-  ctx.web.registerFetchProvider(new PlaywrightFetchProvider(() => current()))
+  // The CDP backend holds one shared connection for the provider's lifetime;
+  // drop it when this plugin unloads so restarts don't strand sockets.
+  const provider = new PlaywrightFetchProvider(() => current())
+  ctx.effect(() => () => { void provider.dispose() }, 'dsh-web-fetch-playwright: shared CDP connection')
+  ctx.web.registerFetchProvider(provider)
 }

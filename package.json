@@ -1,6 +1,6 @@
 {
   "name": "dsh-web-fetch-playwright",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Playwright/CDP web-fetch provider for DeepSeek Harness: renders pages in a real browser, denoises them (Readability + DOMPurify), and returns markdown.",
   "type": "module",
   "license": "MIT",

@@ -12,6 +12,24 @@ import z from '@deepseek-ai/schemastery'
 /** Default CDP endpoint when the settings section leaves it blank. */
 export const DEFAULT_CDP_ENDPOINT = '127.0.0.1:9222'
 
+/**
+ * Default concurrency for the local backend: each slot launches a whole
+ * Chromium, so the default stays frugal; parallel `web_fetch` bursts stop
+ * queueing without a browser farm per fetch.
+ */
+export const DEFAULT_MAX_CONCURRENCY_LOCAL = 4
+
+/**
+ * Default concurrency for the CDP backend: the browser already exists, each
+ * fetch only opens a tab (isolated context) inside it over one shared
+ * connection — so the budget behaves like "max concurrent tabs" and defaults
+ * high.
+ */
+export const DEFAULT_MAX_CONCURRENCY_CDP = 50
+
+/** Ceiling the schema accepts for `maxConcurrency` (local slots are browsers). */
+export const MAX_CONCURRENCY_CEILING = 200
+
 /** Which browser backend serves a fetch. */
 export type PlaywrightBackend = 'local' | 'cdp'
 
@@ -29,6 +47,12 @@ export interface Config {
   cdpEndpoint?: string
   /** Whether the Readability + DOMPurify denoise pipeline runs before markdown. */
   denoise?: boolean
+  /**
+   * How many fetches may render at once. Blank = backend default (4 for
+   * local — each slot launches a browser; 50 for CDP — each slot is a tab in
+   * the already-running remote browser).
+   */
+  maxConcurrency?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -39,10 +63,30 @@ export const Config: z<Config> = z.object({
   playwrightPath: z.string().default(''),
   cdpEndpoint: z.string().default(''),
   denoise: z.boolean().default(true),
+  // Optional on purpose: the effective default depends on `backend`, which a
+  // static schema default cannot express.
+  maxConcurrency: z.number().step(1).min(1).max(MAX_CONCURRENCY_CEILING),
 })
 
-/** Complete config after schemastery applies every field default. */
-export type ResolvedConfig = Required<Config>
+/**
+ * Complete config after schemastery applies the field defaults it owns.
+ * `maxConcurrency` stays optional — {@link effectiveMaxConcurrency} resolves
+ * it against the backend.
+ */
+export type ResolvedConfig = Omit<Required<Config>, 'maxConcurrency'> & { maxConcurrency?: number }
+
+/**
+ * The concurrency limit a fetch actually runs with: an explicit setting
+ * wins; otherwise the backend default (local launches browsers, CDP only
+ * opens tabs, so their budgets differ by an order of magnitude).
+ *
+ * @param config - the resolved settings section (or any partial of it).
+ * @returns the effective limit for the semaphore.
+ */
+export function effectiveMaxConcurrency(config: Pick<Config, 'backend' | 'maxConcurrency'>): number {
+  if (typeof config.maxConcurrency === 'number') return config.maxConcurrency
+  return config.backend === 'cdp' ? DEFAULT_MAX_CONCURRENCY_CDP : DEFAULT_MAX_CONCURRENCY_LOCAL
+}
 
 /**
  * Normalize a configured CDP endpoint for `chromium.connectOverCDP`:

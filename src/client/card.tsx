@@ -112,6 +112,19 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
         onEdit={(text) => { props.edit('denoise', text) }}
         onReset={() => { props.resetField('denoise') }}
       />
+      <ValueField
+        id="plugin-config-playwright-concurrency"
+        label={t('maxConcurrency')}
+        hint={t('maxConcurrencyHint')}
+        placeholder={t('maxConcurrencyPlaceholder')}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        invalidLabel={t('invalidText')}
+        disabled={disabled}
+        {...state.maxConcurrency}
+        onEdit={(text) => { props.edit('maxConcurrency', text) }}
+        onReset={() => { props.resetField('maxConcurrency') }}
+      />
     </PluginCard>
   )
 }

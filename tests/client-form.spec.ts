@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import type { SettingsScope, SettingsScopeSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
-import { CardForm, checkboxField, radioField, textField } from '../src/client/form.ts'
+import { CardForm, checkboxField, numberField, radioField, textField } from '../src/client/form.ts'
 
 /** Minimal reactive scope double: a snapshot, a publish path, and a write log. */
 class FakeScope implements SettingsScope<Record<string, unknown>> {
@@ -55,12 +55,13 @@ class FakeScope implements SettingsScope<Record<string, unknown>> {
   }
 }
 
-/** The card's field set: backend radio, two text inputs, one checkbox. */
+/** The card's field set: backend radio, two text inputs, one checkbox, one number. */
 function makeForm(scope: SettingsScope<Record<string, unknown>>) {
   return new CardForm(scope, [
     radioField('backend', ['local', 'cdp']),
     textField('playwrightPath'),
     checkboxField('denoise'),
+    numberField('maxConcurrency', 1, 8),
   ])
 }
 
@@ -143,6 +144,29 @@ describe('CardForm', () => {
     await form.save()
     expect(scope.writes).toEqual([{ field: 'denoise', op: 'set', value: false }])
     expect(form.field('denoise').text).toBe('false')
+  })
+
+  it('numberField round-trips in-range integers and clears on empty', async () => {
+    const scope = new FakeScope({ maxConcurrency: 4 })
+    const form = makeForm(scope)
+    expect(form.field('maxConcurrency').text).toBe('4')
+    form.actions().edit('maxConcurrency', '6')
+    expect(form.field('maxConcurrency').invalid).toBe(false)
+    await form.save()
+    expect(scope.writes).toEqual([{ field: 'maxConcurrency', op: 'set', value: 6 }])
+    form.actions().edit('maxConcurrency', '')
+    await form.save()
+    expect(scope.writes[scope.writes.length - 1]).toEqual({ field: 'maxConcurrency', op: 'unset' })
+  })
+
+  it('numberField rejects out-of-range and non-integer drafts, blocking the save', () => {
+    const form = makeForm(new FakeScope({ maxConcurrency: 4 }))
+    for (const bad of ['0', '9', '2.5', '-1', 'four', '1 2']) {
+      form.actions().edit('maxConcurrency', bad)
+      expect(form.field('maxConcurrency').invalid, bad).toBe(true)
+      expect(form.shell().invalid, bad).toBe(true)
+    }
+    form.actions().discard()
   })
 
   it('an external scope change republishes through the bound snapshot store', () => {

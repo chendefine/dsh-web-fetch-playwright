@@ -141,6 +141,29 @@ export function checkboxField(field: string): CardFieldSpec {
 }
 
 /**
+ * An integer field over an inclusive range. The draft is the decimal string;
+ * an empty draft clears the field (re-inherit the schema default), and
+ * anything but an integer in range blocks the save as invalid.
+ * @param field - field name inside the namespace section.
+ * @param min - smallest accepted integer (inclusive).
+ * @param max - largest accepted integer (inclusive).
+ * @returns the field's conversion spec.
+ */
+export function numberField(field: string, min: number, max: number): CardFieldSpec {
+  return {
+    field,
+    format: value => typeof value === 'number' && Number.isInteger(value) ? String(value) : '',
+    parse: (text) => {
+      const trimmed = text.trim()
+      if (trimmed === '') return { kind: 'clear' }
+      if (!/^\d+$/.test(trimmed)) return undefined
+      const value = Number(trimmed)
+      return value >= min && value <= max ? { kind: 'set', value } : undefined
+    },
+  }
+}
+
+/**
  * Stages the Playwright card's edits over one settings namespace and writes
  * them on save. Publishes through a snapshot store because slot components
  * read through a selector while both the scope and the drafts change below.

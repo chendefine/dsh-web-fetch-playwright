@@ -12,6 +12,7 @@ export type PlaywrightCardLocaleKey =
   | 'playwrightPath' | 'playwrightPathHint' | 'playwrightPathPlaceholder'
   | 'cdpEndpoint' | 'cdpEndpointHint'
   | 'denoise' | 'denoiseHint'
+  | 'maxConcurrency' | 'maxConcurrencyHint' | 'maxConcurrencyPlaceholder'
   | 'overridden' | 'reset' | 'readOnly' | 'expand' | 'collapse'
   | 'save' | 'saving' | 'discard' | 'unsaved' | 'saveFailed' | 'invalidText'
 
@@ -38,6 +39,9 @@ export const en: Record<PlaywrightCardLocaleKey, string> = {
   cdpEndpointHint: 'host:port or http(s)/ws URL. Leave blank for 127.0.0.1:9222.',
   denoise: 'Enable the denoise algorithm',
   denoiseHint: 'Readability + DOMPurify strip nav bars, sidebars, footers, and ads before converting to markdown.',
+  maxConcurrency: 'Max concurrent fetches',
+  maxConcurrencyHint: 'How many pages may render at once (1–200). Blank = auto: 4 local browsers, 50 CDP tabs in the remote browser.',
+  maxConcurrencyPlaceholder: '(auto: local 4 / CDP 50)',
   overridden: 'Overridden',
   reset: 'Reset to default',
   readOnly: 'This deployment stores settings read-only.',
@@ -67,6 +71,9 @@ export const zh: Record<PlaywrightCardLocaleKey, string> = {
   cdpEndpointHint: 'host:port 或 http(s)/ws 地址；留空默认 127.0.0.1:9222。',
   denoise: '启用降噪算法',
   denoiseHint: '使用 Readability + DOMPurify 清洗导航栏、侧边栏、页脚与贴片广告后再转为 Markdown。',
+  maxConcurrency: '最大并发抓取数',
+  maxConcurrencyHint: '同时渲染的页面上限（1–200）；留空自动：本地 4 个浏览器，CDP 在远端浏览器里 50 个标签页。',
+  maxConcurrencyPlaceholder: '（自动：本地 4 / CDP 50）',
   overridden: '已覆盖',
   reset: '恢复默认',
   readOnly: '本部署的设置为只读。',

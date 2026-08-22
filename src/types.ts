@@ -42,6 +42,10 @@ export interface PlaywrightRoute {
 export interface PlaywrightBrowser {
   newContext(): Promise<PlaywrightContext>
   close(): Promise<void>
+  /** Liveness probe; absent on minimal fakes (assumed live). */
+  isConnected?(): boolean
+  /** Optional disconnect notification used to drop a stale shared CDP connection. */
+  on?(event: 'disconnected', listener: () => void): unknown
 }
 
 /** The `chromium` namespace of whichever Playwright module serves a fetch. */

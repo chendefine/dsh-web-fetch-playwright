@@ -1,11 +1,13 @@
 /**
  * The provider over a fake browser session: URL hygiene, content-type
- * branching, the denoise toggle, body caps, and error taxonomy — plus one
- * real-socket case for the CDP connect failure path.
+ * branching, the denoise toggle, body caps, error taxonomy, the concurrency
+ * queue (gated sessions), plus one real-socket case for the CDP connect
+ * failure path.
  */
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WebError } from '@deepseek-ai/dsh-web'
 import type { ResolvedConfig } from '../src/config.ts'
+import { CdpConnectionPool } from '../src/cdp-pool.ts'
 import { PlaywrightFetchProvider } from '../src/provider.ts'
 import type { BrowserSession } from '../src/provider.ts'
 import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage, PlaywrightResponse } from '../src/types.ts'
@@ -70,12 +72,81 @@ class FakeProvider extends PlaywrightFetchProvider {
       playwrightPath: '',
       cdpEndpoint: '',
       denoise: true,
+      maxConcurrency: 4,
       ...config,
     }))
   }
 
   protected async openSession(): Promise<BrowserSession> {
     return fakeSession(this.spec)
+  }
+}
+
+/**
+ * The provider over a fake session whose `openSession` blocks on a test-held
+ * gate: concurrency-queue behavior without real browser launches. `started`
+ * records `openSession` entries in arrival order.
+ */
+class GatedProvider extends PlaywrightFetchProvider {
+  readonly started: number[] = []
+  private gate: Promise<void> = Promise.resolve()
+
+  constructor(config: Partial<ResolvedConfig>) {
+    super(() => ({
+      backend: 'local',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      denoise: true,
+      maxConcurrency: 4,
+      ...config,
+    }))
+  }
+
+  /** Make every subsequent `openSession` await the given promise. */
+  blockOn(gate: Promise<void>): void {
+    this.gate = gate
+  }
+
+  protected async openSession(): Promise<BrowserSession> {
+    this.started.push(this.started.length)
+    await this.gate
+    return fakeSession({})
+  }
+}
+
+/**
+ * A fake shared CDP connection for provider-level tests: every fetch leases
+ * its own context (tab) over ONE browser, whose connect/close counts are
+ * tracked for assertions.
+ */
+function fakeCdpConnection(spec: FakePageSpec = {}) {
+  const state = { connects: 0, contextsOpened: 0, contextsClosed: 0, browserClosed: false }
+  const page: PlaywrightPage = {
+    goto: async () => {
+      if (spec.gotoError !== undefined) throw spec.gotoError
+      return fakeResponse(spec)
+    },
+    waitForLoadState: async () => {},
+    url: () => spec.finalUrl ?? 'https://final.example.com/docs',
+    content: async () => spec.html ?? ARTICLE_HTML,
+    close: async () => {},
+  }
+  const browser: PlaywrightBrowser = {
+    newContext: async () => {
+      state.contextsOpened++
+      const context: PlaywrightContext = {
+        newPage: async () => page,
+        route: async () => {},
+        close: async () => { state.contextsClosed++ },
+      }
+      return context
+    },
+    close: async () => { state.browserClosed = true },
+  }
+  return {
+    state,
+    /** A pool whose connect always lands on this one connection. */
+    pool: new CdpConnectionPool(async () => { state.connects++; return browser }),
   }
 }
 
@@ -169,8 +240,132 @@ describe('PlaywrightFetchProvider', () => {
     const result = await new FakeProvider({}, { networkIdleError: true }).fetch({ url: 'https://example.com/spa' })
     expect(result.body.kind).toBe('text')
   })
+})
 
-  it('reports a dead CDP endpoint as WEB_PROVIDER_ERROR naming the endpoint', { timeout: 30_000 }, async () => {
+describe('PlaywrightFetchProvider concurrency queue', () => {
+  /** Flush pending microtasks/macrotasks without waiting on gated fetches. */
+  async function flush(): Promise<void> {
+    await new Promise(resolve => { setImmediate(resolve) })
+  }
+
+  /** Real-timer safety net: a timed-out test's `finally` never runs. */
+  afterEach(() => {
+    vi.clearAllTimers()
+    vi.useRealTimers()
+  })
+
+  it('renders up to maxConcurrency pages at once and queues the rest', async () => {
+    const provider = new GatedProvider({})
+    provider.blockOn(new Promise<void>(() => {}))
+    const controllers = Array.from({ length: 5 }, () => new AbortController())
+    const fetches = controllers.map((controller, i) =>
+      provider.fetch({ url: `https://example.com/page-${String(i)}` }, controller.signal).catch(() => {}) as Promise<unknown>)
+    await flush()
+    // The four slot holders reached openSession; the fifth is still queued.
+    expect(provider.started).toEqual([0, 1, 2, 3])
+    controllers.forEach(controller => controller.abort())
+    await flush()
+    void fetches
+  })
+
+  it('fails a queued fetch fast with a retry hint instead of hanging until abort', async () => {
+    // Only the timeout functions are faked: flush() relies on a real setImmediate.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const provider = new GatedProvider({ maxConcurrency: 1 })
+    provider.blockOn(new Promise<void>(() => {}))
+    void provider.fetch({ url: 'https://example.com/holder' }).catch(() => {}) // occupies the only slot
+    await flush()
+    expect(provider.started).toEqual([0])
+    const queued = provider.fetch({ url: 'https://example.com/queued' }).catch(error => error)
+    await vi.advanceTimersByTimeAsync(20_000)
+    const error = await queued
+    expect(error).toBeInstanceOf(WebError)
+    expect((error as WebError).code).toBe('WEB_FETCH_TIMEOUT')
+    expect((error as WebError).message).toContain('rendering slots stayed busy')
+    expect((error as WebError).message).toContain('maxConcurrency')
+  })
+
+  it('keeps the slot message when the caller cancels a queued fetch', async () => {
+    const provider = new GatedProvider({ maxConcurrency: 1 })
+    provider.blockOn(new Promise<void>(() => {}))
+    void provider.fetch({ url: 'https://example.com/holder' }).catch(() => {}) // occupies the only slot
+    await flush()
+    const controller = new AbortController()
+    const queued = provider.fetch({ url: 'https://example.com/queued' }, controller.signal).catch(error => error)
+    await flush()
+    controller.abort()
+    const error = await queued
+    expect(error).toBeInstanceOf(WebError)
+    expect((error as WebError).code).toBe('WEB_ABORTED')
+    expect((error as WebError).message).toContain('waiting for a free rendering slot')
+  })
+
+  it('does not release a phantom slot when a queued fetch fails', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const provider = new GatedProvider({ maxConcurrency: 1 })
+    provider.blockOn(new Promise<void>(() => {}))
+    void provider.fetch({ url: 'https://example.com/holder' }).catch(() => {}) // occupies the only slot
+    await flush()
+    const queued = provider.fetch({ url: 'https://example.com/queued' }).catch(error => error)
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(await queued).toBeInstanceOf(WebError)
+    // The failed waiter held no slot: a later fetch still queues (and fails
+    // on its own patience) rather than slipping into a phantom free slot.
+    const later = provider.fetch({ url: 'https://example.com/later' }).catch(error => error)
+    await vi.advanceTimersByTimeAsync(20_000)
+    const laterFailure = await later
+    expect(laterFailure).toBeInstanceOf(WebError)
+    expect((laterFailure as WebError).message).toContain('rendering slots stayed busy')
+    expect(provider.started).toEqual([0])
+  })
+})
+
+describe('PlaywrightFetchProvider CDP backend', () => {
+  it('rides one shared connection; each fetch closes only its tab context', async () => {
+    const { state, pool } = fakeCdpConnection()
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'cdp',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      denoise: true,
+    }), pool)
+
+    const first = await provider.fetch({ url: 'https://example.com/a' })
+    const second = await provider.fetch({ url: 'https://example.com/b' })
+    expect(first.statusCode).toBe(200)
+    expect(second.statusCode).toBe(200)
+
+    // Two fetches, two isolated tabs, ONE connection — never closed per fetch.
+    expect(state.connects).toBe(1)
+    expect(state.contextsOpened).toBe(2)
+    expect(state.contextsClosed).toBe(2)
+    expect(state.browserClosed).toBe(false)
+
+    // Teardown (plugin unload) is what drops the shared connection.
+    await provider.dispose()
+    expect(state.browserClosed).toBe(true)
+  })
+
+  it('runs many concurrent CDP fetches as tabs without queueing', async () => {
+    const { state, pool } = fakeCdpConnection()
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'cdp',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      denoise: true,
+    }), pool)
+
+    const results = await Promise.all(Array.from({ length: 50 }, (_, i) =>
+      provider.fetch({ url: `https://example.com/tab-${String(i)}` })))
+    expect(results.every(result => result.statusCode === 200)).toBe(true)
+    // All fifty rode the single connection as concurrent tabs — the CDP
+    // default concurrency is high enough that none queued.
+    expect(state.connects).toBe(1)
+    expect(state.contextsOpened).toBe(50)
+    expect(state.contextsClosed).toBe(50)
+  })
+
+  it('wraps a dead CDP endpoint as WEB_PROVIDER_ERROR naming the endpoint', { timeout: 30_000 }, async () => {
     const provider = new PlaywrightFetchProvider(() => ({
       backend: 'cdp',
       playwrightPath: '',

@@ -12,9 +12,9 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plug
 - **Denoise pipeline** — Mozilla Readability extracts the article, DOMPurify removes layout/noise tags (nav, sidebar, footer, ads, forms), and Turndown with the GFM plugin converts to Markdown with the same style options as the shipped `tool-web` renderer.
 - **Two backends** — launch a local Playwright browser, or drive an already-running browser over its DevTools Protocol (CDP) endpoint.
 - **Browser resolution** — a configured path, a `playwright` CLI on `$PATH`, or the bundled `playwright-core`; CDP needs no local browser at all.
-- **Isolated sessions** — every fetch uses its own browser context; local launches close their browser, CDP connections only disconnect. Nothing outlives the call that opened it.
-- **Live configuration** — a settings card (设置 → 插件 → 插件配置) edits the backend and denoise toggle; changes apply to the next fetch without a restart.
-- **Budget-aware** — per-fetch deadline (45s), concurrent-fetch semaphore (2 browsers), image/font/media subrequests aborted, body capped at 100k chars.
+- **Isolated sessions** — every fetch uses its own browser context. Local launches close their browser per fetch; the CDP backend keeps **one shared connection** to the remote browser and each fetch opens an isolated context (a tab) inside it, closed when done.
+- **Live configuration** — a settings card (设置 → 插件 → 插件配置) edits the backend, denoise toggle, and concurrency; changes apply to the next fetch without a restart.
+- **Budget-aware** — per-fetch deadline (45s); concurrency is backend-priced (`maxConcurrency`, default 4 local browsers / **50 CDP tabs**; queued fetches fail fast with a retry hint after 20s instead of hanging); image/font/media subrequests aborted; body capped at 100k chars.
 
 ## How it works
 
@@ -67,6 +67,7 @@ The settings card (设置 → 插件 → 插件配置 → *Playwright 网页爬�
 | `playwrightPath` | (blank) | Local backend: path to a `playwright` executable or a Chromium-family browser binary. Blank = discover on `$PATH`, then fall back to the bundled `playwright-core`. |
 | `cdpEndpoint` | `127.0.0.1:9222` | Remote backend: `host:port`, `http(s)://…` or `ws(s)://…`. |
 | `denoise` | `true` | Run the denoise pipeline; off returns the full rendered HTML for the tool layer to convert. |
+| `maxConcurrency` | *(auto)* | How many fetches may render at once (1–200). Blank = backend default: **4** for local (each slot launches a browser) / **50** for CDP (each slot is just a tab in the already-running remote browser). Beyond the limit, fetches wait briefly; if no slot frees within 20s they fail with `WEB_FETCH_TIMEOUT` and a hint to retry or raise this setting, rather than hanging until the tool budget aborts. |
 
 Local backend resolution order:
 
@@ -74,7 +75,7 @@ Local backend resolution order:
 2. A `playwright` executable on `$PATH` (its package knows that installation's browser registry).
 3. The bundled `playwright-core` — requires `PLAYWRIGHT_BROWSERS_PATH` or browsers in the default cache; otherwise the error suggests `playwright install chromium`.
 
-CDP mode needs no local browser: it connects fresh per fetch and uses an isolated context, so it never pollutes an existing browser session.
+CDP mode needs no local browser: the provider holds **one shared connection** for its lifetime (reconnecting automatically if it drops, and reconnecting to the new endpoint when the setting changes), and every fetch leases a fresh isolated context — a tab in your browser — that closes when the fetch completes. Concurrency therefore counts tabs, which is why the CDP default is high (50). Unloading the plugin drops the shared connection.
 
 ## Development
 

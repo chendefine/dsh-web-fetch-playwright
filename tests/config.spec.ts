@@ -1,11 +1,20 @@
 /**
- * Config schema defaults and the CDP endpoint normalizer (pure, network-free).
+ * Config schema defaults, the CDP endpoint normalizer, and the
+ * backend-dependent concurrency resolution (pure, network-free).
  */
 import { describe, expect, it } from 'vitest'
-import { Config, DEFAULT_CDP_ENDPOINT, normalizeCdpEndpoint } from '../src/config.ts'
+import {
+  Config,
+  DEFAULT_CDP_ENDPOINT,
+  DEFAULT_MAX_CONCURRENCY_CDP,
+  DEFAULT_MAX_CONCURRENCY_LOCAL,
+  MAX_CONCURRENCY_CEILING,
+  effectiveMaxConcurrency,
+  normalizeCdpEndpoint,
+} from '../src/config.ts'
 
 describe('Config', () => {
-  it('fills every field default', () => {
+  it('fills every field default it owns (maxConcurrency stays optional)', () => {
     const resolved = Config({})
     expect(resolved).toEqual({
       backend: 'local',
@@ -16,13 +25,35 @@ describe('Config', () => {
   })
 
   it('accepts a full CDP section unchanged', () => {
-    const resolved = Config({ backend: 'cdp', cdpEndpoint: 'browser.lan:9223', denoise: false })
+    const resolved = Config({ backend: 'cdp', cdpEndpoint: 'browser.lan:9223', denoise: false, maxConcurrency: 50 })
     expect(resolved).toEqual({
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: 'browser.lan:9223',
       denoise: false,
+      maxConcurrency: 50,
     })
+  })
+
+  it('accepts maxConcurrency across its whole integer range and rejects outside it', () => {
+    expect(Config({ maxConcurrency: 1 }).maxConcurrency).toBe(1)
+    expect(Config({ maxConcurrency: MAX_CONCURRENCY_CEILING }).maxConcurrency).toBe(MAX_CONCURRENCY_CEILING)
+    expect(() => Config({ maxConcurrency: 0 })).toThrow()
+    expect(() => Config({ maxConcurrency: MAX_CONCURRENCY_CEILING + 1 })).toThrow()
+    expect(() => Config({ maxConcurrency: 2.5 })).toThrow()
+  })
+})
+
+describe('effectiveMaxConcurrency', () => {
+  it('defaults per backend: local browsers are dear, CDP tabs are cheap', () => {
+    expect(effectiveMaxConcurrency({ backend: 'local' })).toBe(DEFAULT_MAX_CONCURRENCY_LOCAL)
+    expect(effectiveMaxConcurrency({ backend: 'cdp' })).toBe(DEFAULT_MAX_CONCURRENCY_CDP)
+    expect(DEFAULT_MAX_CONCURRENCY_CDP).toBeGreaterThan(DEFAULT_MAX_CONCURRENCY_LOCAL)
+  })
+
+  it('an explicit setting wins over both backend defaults', () => {
+    expect(effectiveMaxConcurrency({ backend: 'local', maxConcurrency: 50 })).toBe(50)
+    expect(effectiveMaxConcurrency({ backend: 'cdp', maxConcurrency: 2 })).toBe(2)
   })
 })
 
