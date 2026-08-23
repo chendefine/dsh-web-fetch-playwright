@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-23
+
+### Fixed
+
+- CI no longer fails on every push: the matrix dropped Node 20 and runs on Node 22/24. `pnpm/action-setup` with a floating `version: 11` resolves to pnpm 11.22.0, which requires Node ≥ 22.13 (`node:sqlite`) and crashed the Node 20 job inside `setup-node` before any step ran, with fail-fast cancelling the healthy 22/24 jobs. Node 20 cannot be restored by pinning pnpm alone: the `tsdown` 0.22 build (run by `prepare` on install) also requires Node ≥ 22.18.
+- `CONTRIBUTING.md` now states the toolchain needs Node ≥ 22 while the published plugin itself still runs on Node ≥ 20 (no Node 22+ APIs in the runtime code or build output).
+
 ## [0.2.0] - 2026-08-21
 
 ### Changed

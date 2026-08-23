@@ -20,7 +20,7 @@ The host half is a [Cordis](https://github.com/shigma/cordis) function plugin re
 
 ## Development
 
-Requirements: Node.js ≥ 20, pnpm ≥ 10.
+Requirements: Node.js ≥ 22, pnpm ≥ 11.
 
 ```sh
 pnpm install
