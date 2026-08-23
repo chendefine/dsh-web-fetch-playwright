@@ -61,6 +61,8 @@ After a bundle plugin is added to the profile layer stack, **restart `dsh web`**
 
 The settings card (设置 → 插件 → 插件配置 → *Playwright 网页爬取*) edits the `web-fetch-playwright` settings section live:
 
+![Playwright 网页爬取 plugin configuration card](./playwright-plugin-config.png)
+
 | Field | Default | Description |
 | --- | --- | --- |
 | `backend` | `local` | Radio: *Local Playwright* or *Remote CDP endpoint*, each with its own nested input. |

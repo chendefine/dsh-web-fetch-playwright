@@ -61,6 +61,8 @@ bundle 插件加入 profile 层栈后需**重启 `dsh web`** 生效；卸载用 
 
 设置卡片（设置 → 插件 → 插件配置 → *Playwright 网页爬取*）实时编辑 `web-fetch-playwright` 设置段：
 
+![Playwright 网页爬取 plugin configuration card](./playwright-plugin-config.png)
+
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
 | `backend` | `local` | radio：本地 Playwright / 远端 CDP 地址，每个选项内嵌各自的填空。 |
