@@ -6,30 +6,33 @@
  *
  * Lifecycle: the local backend launches a browser per fetch and closes it —
  * nothing outlives the call. The CDP backend keeps ONE shared connection to
- * the remote browser for the provider's lifetime; each fetch only opens an
- * isolated context (a tab) inside it and closes that on completion, so the
- * concurrency cap counts tabs, not browsers. Either way, an aborted signal
- * closes the fetch's context. Concurrency is capped at the `maxConcurrency`
- * setting (explicit, or the backend default — {@link DEFAULT_MAX_CONCURRENCY_LOCAL}
- * browsers / {@link DEFAULT_MAX_CONCURRENCY_CDP} tabs); further fetches wait
- * briefly in a queue and fail fast (rather than hang until abort) when no
- * slot frees.
+ * the remote browser for the provider's lifetime; each fetch only opens a
+ * page (tab) inside it and closes that on completion — in a throwaway
+ * isolated context, or (the default, `shareBrowserContext`) in the remote
+ * browser's default context so its profile, cookies, and persistent logins
+ * apply; that default context is never closed. The concurrency cap counts
+ * tabs, not browsers. Either way, an aborted signal closes the fetch's page.
+ * Concurrency is capped at the `maxConcurrency` setting (explicit, or the
+ * backend default — {@link DEFAULT_MAX_CONCURRENCY_LOCAL} browsers /
+ * {@link DEFAULT_MAX_CONCURRENCY_CDP} tabs); further fetches wait briefly in
+ * a queue and fail fast (rather than hang until abort) when no slot frees.
  *
  * Private-network and SSRF protection is not implemented (same stance as the
  * shipped HTTP provider); a page this provider can reach is whatever the
- * browser can reach.
+ * browser can reach. Profile mode additionally acts WITH the remote
+ * browser's logged-in sessions (see the README's risk notes).
  *
  * @module dsh-web-fetch-playwright/provider
  */
 
 import { WebError } from '@deepseek-ai/dsh-web'
 import type { WebFetchProvider, WebFetchRequest, WebFetchResult } from '@deepseek-ai/dsh-web'
-import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, effectiveMaxConcurrency, normalizeCdpEndpoint } from './config.ts'
+import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, effectiveContextMode, effectiveMaxConcurrency, normalizeCdpEndpoint } from './config.ts'
 import type { ResolvedConfig } from './config.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
 import { htmlToMarkdown } from './markdown.ts'
 import { resolveCdpBackend, resolvePlaywrightBackend } from './playwright-resolve.ts'
-import type { PlaywrightBrowser, PlaywrightContext } from './types.ts'
+import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage, PlaywrightRoute } from './types.ts'
 
 /** Stable id this provider registers under (the bundle patch pins it). */
 export const PLAYWRIGHT_FETCH_PROVIDER_ID = 'playwright'
@@ -65,15 +68,20 @@ const SETTLE_MS = 5_000
 const CLOSE_GRACE_MS = 2_000
 
 /**
- * One render session: a browser and the context this fetch owns. Local
- * backends own the browser too; CDP sessions ride the shared connection and
- * only their context closes at the end.
+ * One render session: a browser, the context this fetch works in, and the
+ * tab it owns. Local backends own the browser too; CDP sessions ride the
+ * shared connection, and in `profile` mode the context is the remote
+ * browser's default context — shared, never closed, only the tab is.
  */
 export interface BrowserSession {
   browser: PlaywrightBrowser
   context: PlaywrightContext
+  /** The fetch-owned tab this fetch renders in. */
+  page: PlaywrightPage
   /** True when `browser` is the CDP pool's shared connection — never closed per fetch. */
   sharedBrowser?: boolean
+  /** True when `context` is the remote default context — close only the page. */
+  persistent?: boolean
 }
 
 /**
@@ -292,7 +300,8 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       acquired = true
       session = await this.openSession(config, deadline)
       // An aborted deadline must also interrupt Playwright's own waits:
-      // closing the context rejects every pending page operation.
+      // closing the page rejects every pending operation on it (and, for
+      // fetch-owned contexts, the context close that follows takes the rest).
       const held = session
       const onAbort = () => { void closeSession(held) }
       deadline.signal.addEventListener('abort', onAbort, { once: true })
@@ -314,7 +323,7 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
   }
 
   /**
-   * Open the configured backend and its per-fetch context. Split out so the
+   * Open the configured backend and its per-fetch page. Split out so the
    * test suite can substitute a fake browser.
    * @param config - the resolved settings section.
    * @param deadline - the fetch budget, applied to launch/connect timeouts.
@@ -326,11 +335,19 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       const endpoint = normalizeCdpEndpoint(config.cdpEndpoint)
       const { source } = await resolveCdpBackend()
       try {
-        // One shared connection per provider; this fetch leases an isolated
-        // context (a tab in the remote browser) and closes only that.
-        const lease = await this.cdpPool.acquire(endpoint, timeout)
-        await installResourceFilter(lease.context)
-        return { browser: lease.browser, context: lease.context, sharedBrowser: true }
+        // One shared connection per provider; this fetch leases a tab — in a
+        // throwaway isolated context, or in the remote profile's default
+        // context (profile mode), whose persistent logins then apply.
+        const lease = await this.cdpPool.acquire(endpoint, timeout, effectiveContextMode(config))
+        await installResourceFilter(lease.page)
+        guardPopups(lease.page)
+        return {
+          browser: lease.browser,
+          context: lease.context,
+          page: lease.page,
+          sharedBrowser: true,
+          persistent: lease.persistent,
+        }
       } catch (error: unknown) {
         throw new WebError(
           `cannot connect to the CDP endpoint ${endpoint} (${source}); is the browser started with --remote-debugging-port? ${String(error instanceof Error ? error.message : error)}`,
@@ -340,12 +357,19 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       }
     }
     const { chromium, executablePath, source } = await resolvePlaywrightBackend(config.playwrightPath)
+    let browser: PlaywrightBrowser | undefined
     try {
-      const browser = await chromium.launch({ headless: true, ...(executablePath !== undefined ? { executablePath } : {}), timeout })
+      browser = await chromium.launch({ headless: true, ...(executablePath !== undefined ? { executablePath } : {}), timeout })
       const context = await browser.newContext()
-      await installResourceFilter(context)
-      return { browser, context }
+      const page = await context.newPage()
+      await installResourceFilter(page)
+      guardPopups(page)
+      return { browser, context, page }
     } catch (error: unknown) {
+      // A partial setup (browser launched, then newContext/newPage failed)
+      // must not strand the process — closing the browser takes its
+      // contexts and pages with it.
+      await browser?.close().catch(() => {})
       throw new WebError(
         `cannot launch the local browser (${source}); run \`playwright install chromium\` or point the settings path at a playwright/browser executable. ${String(error instanceof Error ? error.message : error)}`,
         'WEB_PROVIDER_ERROR',
@@ -354,14 +378,14 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     }
   }
 
-  /** Navigate, settle, and decode one URL inside an open session. */
+  /** Navigate, settle, and decode one URL inside an open session's tab. */
   private async retrieve(
     session: BrowserSession,
     url: URL,
     config: ResolvedConfig,
     deadline: Deadline,
   ): Promise<WebFetchResult> {
-    const page = await session.context.newPage()
+    const page = session.page
     const response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: deadline.remainingMs() })
 
     const kind = classifyContentType(response?.headers()['content-type'])
@@ -407,14 +431,17 @@ function capResult(url: string, statusCode: number, body: { kind: 'html' | 'text
 }
 
 /**
- * Close a session's fetch-owned context, plus its browser when the session
- * launched one (local backend). CDP sessions ride the shared connection,
- * which stays open. Every close is grace-bounded so cleanup always completes
- * and the concurrency slot is released even when Playwright hangs.
+ * Close a session's fetch-owned tab, then its context unless the context is
+ * the remote default context (profile mode — closing it would tear down the
+ * whole shared connection), then its browser when the session launched one
+ * (local backend). CDP sessions ride the shared connection, which stays
+ * open. Every close is grace-bounded so cleanup always completes and the
+ * concurrency slot is released even when Playwright hangs.
  */
 async function closeSession(session: BrowserSession | undefined): Promise<void> {
   if (session === undefined) return
-  await closeWithGrace(session.context)
+  await closeWithGrace(session.page)
+  if (session.persistent !== true) await closeWithGrace(session.context)
   if (session.sharedBrowser !== true) await closeWithGrace(session.browser)
 }
 
@@ -442,16 +469,34 @@ async function defaultCdpConnect(endpoint: string, timeoutMs: number): Promise<P
 /**
  * Abort image/font/media subrequests: the markdown output keeps their URLs
  * but never renders them, so downloading them only spends the budget.
- * Best-effort — a context that refuses interception still fetches.
+ * Installed on the PAGE (never the context): in profile mode a context-level
+ * route would intercept the remote browser's other tabs too. Best-effort —
+ * a page that refuses interception still fetches.
  */
-async function installResourceFilter(context: PlaywrightContext): Promise<void> {
+async function installResourceFilter(owner: {
+  route(glob: string, handler: (route: PlaywrightRoute) => Promise<void>): Promise<void>
+}): Promise<void> {
   try {
-    await context.route('**/*', async (route) => {
+    await owner.route('**/*', async (route) => {
       const type = route.request().resourceType()
       if (type === 'image' || type === 'font' || type === 'media') await route.abort()
       else await route.continue()
     })
   } catch {
     // keep going without the filter
+  }
+}
+
+/**
+ * Close any popup a fetched page spawns so nothing outlives the fetch's tab
+ * — `page.close()` does not auto-close windows the page opened, and in
+ * profile mode a stray tab would stay in the user's remote browser.
+ * Best-effort: a page that refuses listeners just loses the guard.
+ */
+function guardPopups(page: PlaywrightPage): void {
+  try {
+    page.on?.('popup', popup => { void popup.close().catch(() => {}) })
+  } catch {
+    // keep going without the guard
   }
 }

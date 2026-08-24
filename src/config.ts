@@ -33,6 +33,12 @@ export const MAX_CONCURRENCY_CEILING = 200
 /** Which browser backend serves a fetch. */
 export type PlaywrightBackend = 'local' | 'cdp'
 
+/**
+ * How the CDP backend scopes a fetch: a throwaway isolated context, or a tab
+ * in the remote browser's real profile (default context).
+ */
+export type CdpContextMode = 'isolated' | 'profile'
+
 /** Plugin config: everything optional — the schema fills the defaults. */
 export interface Config {
   /** Backend selector: local Playwright launch or a remote CDP endpoint. */
@@ -45,6 +51,14 @@ export interface Config {
   playwrightPath?: string
   /** CDP backend: `host:port`, `http(s)://…`, or `ws(s)://…`. Empty = default. */
   cdpEndpoint?: string
+  /**
+   * CDP backend only. `true` (default): each fetch is a tab in the remote
+   * browser's default context — the real profile — so cookies/localStorage
+   * come from (and are written back to) it and its persistent logins apply.
+   * `false`: a fresh incognito-like isolated context per fetch, no shared
+   * state. Meaningless for the local backend (collapses to isolated).
+   */
+  shareBrowserContext?: boolean
   /** Whether the Readability + DOMPurify denoise pipeline runs before markdown. */
   denoise?: boolean
   /**
@@ -62,6 +76,7 @@ export const Config: z<Config> = z.object({
   backend: z.union([z.const('local'), z.const('cdp')]).default('local'),
   playwrightPath: z.string().default(''),
   cdpEndpoint: z.string().default(''),
+  shareBrowserContext: z.boolean().default(true),
   denoise: z.boolean().default(true),
   // Optional on purpose: the effective default depends on `backend`, which a
   // static schema default cannot express.
@@ -86,6 +101,21 @@ export type ResolvedConfig = Omit<Required<Config>, 'maxConcurrency'> & { maxCon
 export function effectiveMaxConcurrency(config: Pick<Config, 'backend' | 'maxConcurrency'>): number {
   if (typeof config.maxConcurrency === 'number') return config.maxConcurrency
   return config.backend === 'cdp' ? DEFAULT_MAX_CONCURRENCY_CDP : DEFAULT_MAX_CONCURRENCY_LOCAL
+}
+
+/**
+ * The context mode a fetch actually runs with: profile (a tab in the remote
+ * browser's real profile) requires the CDP backend — a local launch has no
+ * meaningful shared profile — and the checkbox (which defaults on, so an
+ * absent value reads as `true`, mirroring the schema default); everything
+ * else collapses to isolated.
+ *
+ * @param config - the resolved settings section (or any partial of it).
+ * @returns the mode the pool acquires its lease with.
+ */
+export function effectiveContextMode(config: Pick<Config, 'backend' | 'shareBrowserContext'>): CdpContextMode {
+  if (config.backend === 'cdp' && config.shareBrowserContext !== false) return 'profile'
+  return 'isolated'
 }
 
 /**

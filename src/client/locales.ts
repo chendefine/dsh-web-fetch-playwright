@@ -11,6 +11,7 @@ export type PlaywrightCardLocaleKey =
   | 'backendLabel' | 'backendLocal' | 'backendLocalHint' | 'backendCdp' | 'backendCdpHint'
   | 'playwrightPath' | 'playwrightPathHint' | 'playwrightPathPlaceholder'
   | 'cdpEndpoint' | 'cdpEndpointHint'
+  | 'shareBrowserContext' | 'shareBrowserContextHint'
   | 'denoise' | 'denoiseHint'
   | 'maxConcurrency' | 'maxConcurrencyHint' | 'maxConcurrencyPlaceholder'
   | 'overridden' | 'reset' | 'readOnly' | 'expand' | 'collapse'
@@ -37,6 +38,8 @@ export const en: Record<PlaywrightCardLocaleKey, string> = {
   playwrightPathPlaceholder: '(auto: playwright from $PATH)',
   cdpEndpoint: 'CDP endpoint',
   cdpEndpointHint: 'host:port or http(s)/ws URL. Leave blank for 127.0.0.1:9222.',
+  shareBrowserContext: 'Share the browser context (profile logins)',
+  shareBrowserContextHint: 'Each fetch opens a tab in the remote browser\u2019s real profile \u2014 cookies and localStorage are shared and its persistent logins apply. Unchecked: every fetch uses a fresh isolated context.',
   denoise: 'Enable the denoise algorithm',
   denoiseHint: 'Readability + DOMPurify strip nav bars, sidebars, footers, and ads before converting to markdown.',
   maxConcurrency: 'Max concurrent fetches',
@@ -69,6 +72,8 @@ export const zh: Record<PlaywrightCardLocaleKey, string> = {
   playwrightPathPlaceholder: '（自动：按 $PATH 查找 playwright）',
   cdpEndpoint: 'CDP 地址',
   cdpEndpointHint: 'host:port 或 http(s)/ws 地址；留空默认 127.0.0.1:9222。',
+  shareBrowserContext: '共享浏览器上下文（复用登录态）',
+  shareBrowserContextHint: '每次抓取在远端浏览器的真实 profile 里开一个标签页：共享 cookie 与 localStorage、复用已登录会话，页面会看到你的登录身份；取消勾选则每次抓取使用全新隔离上下文。',
   denoise: '启用降噪算法',
   denoiseHint: '使用 Readability + DOMPurify 清洗导航栏、侧边栏、页脚与贴片广告后再转为 Markdown。',
   maxConcurrency: '最大并发抓取数',

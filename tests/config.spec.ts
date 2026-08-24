@@ -9,6 +9,7 @@ import {
   DEFAULT_MAX_CONCURRENCY_CDP,
   DEFAULT_MAX_CONCURRENCY_LOCAL,
   MAX_CONCURRENCY_CEILING,
+  effectiveContextMode,
   effectiveMaxConcurrency,
   normalizeCdpEndpoint,
 } from '../src/config.ts'
@@ -20,16 +21,18 @@ describe('Config', () => {
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      shareBrowserContext: true,
       denoise: true,
     })
   })
 
   it('accepts a full CDP section unchanged', () => {
-    const resolved = Config({ backend: 'cdp', cdpEndpoint: 'browser.lan:9223', denoise: false, maxConcurrency: 50 })
+    const resolved = Config({ backend: 'cdp', cdpEndpoint: 'browser.lan:9223', shareBrowserContext: false, denoise: false, maxConcurrency: 50 })
     expect(resolved).toEqual({
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: 'browser.lan:9223',
+      shareBrowserContext: false,
       denoise: false,
       maxConcurrency: 50,
     })
@@ -54,6 +57,21 @@ describe('effectiveMaxConcurrency', () => {
   it('an explicit setting wins over both backend defaults', () => {
     expect(effectiveMaxConcurrency({ backend: 'local', maxConcurrency: 50 })).toBe(50)
     expect(effectiveMaxConcurrency({ backend: 'cdp', maxConcurrency: 2 })).toBe(2)
+  })
+})
+
+describe('effectiveContextMode', () => {
+  it('CDP shares the remote profile by default; an explicit opt-out isolates', () => {
+    // Absent value reads as the schema default (true) — the checkbox's
+    // "unchecked draft formats as ''" case collapses to the same thing.
+    expect(effectiveContextMode({ backend: 'cdp' })).toBe('profile')
+    expect(effectiveContextMode({ backend: 'cdp', shareBrowserContext: true })).toBe('profile')
+    expect(effectiveContextMode({ backend: 'cdp', shareBrowserContext: false })).toBe('isolated')
+  })
+
+  it('the local backend has no shared profile to use — always isolated', () => {
+    expect(effectiveContextMode({ backend: 'local' })).toBe('isolated')
+    expect(effectiveContextMode({ backend: 'local', shareBrowserContext: true })).toBe('isolated')
   })
 })
 

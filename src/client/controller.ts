@@ -24,6 +24,12 @@ export interface PlaywrightSettings {
   playwrightPath?: string
   /** CDP backend: endpoint (host:port / http(s) / ws). */
   cdpEndpoint?: string
+  /**
+   * CDP backend: whether fetches share the remote browser's context (its
+   * real profile — cookies, localStorage, persistent logins) as tabs, or
+   * each use a fresh isolated context. Absent = schema default (true).
+   */
+  shareBrowserContext?: boolean
   /** Whether the Readability + DOMPurify pipeline runs. */
   denoise?: boolean
   /** How many fetches may render at once (1–200); blank = backend default. */
@@ -38,6 +44,8 @@ export interface PlaywrightCardState extends CardShell {
   playwrightPath: CardFieldState
   /** CDP endpoint input. */
   cdpEndpoint: CardFieldState
+  /** CDP shared-context checkbox (draft 'true'/'false'). */
+  shareBrowserContext: CardFieldState
   /** Denoise checkbox (draft 'true'/'false'). */
   denoise: CardFieldState
   /** Concurrency input (draft decimal integer). */
@@ -67,6 +75,7 @@ export class PlaywrightCardController {
         radioField('backend', ['local', 'cdp']),
         textField('playwrightPath'),
         textField('cdpEndpoint'),
+        checkboxField('shareBrowserContext'),
         checkboxField('denoise'),
         numberField('maxConcurrency', 1, 200),
       ],
@@ -80,6 +89,7 @@ export class PlaywrightCardController {
       backend: this.form.field('backend'),
       playwrightPath: this.form.field('playwrightPath'),
       cdpEndpoint: this.form.field('cdpEndpoint'),
+      shareBrowserContext: this.form.field('shareBrowserContext'),
       denoise: this.form.field('denoise'),
       maxConcurrency: this.form.field('maxConcurrency'),
     }

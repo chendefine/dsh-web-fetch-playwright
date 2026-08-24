@@ -1,8 +1,9 @@
 /**
  * The Playwright plugin-configuration card: backend radio group (each option
- * carrying its backend-specific input nested inside — local path under Local
- * Playwright, CDP endpoint under Remote CDP) plus the denoise checkbox,
- * staged and saved through the card form like the built-in plugin cards.
+ * carrying its backend-specific inputs nested inside — local path under Local
+ * Playwright, CDP endpoint and shared-context checkbox under Remote CDP) plus
+ * the denoise checkbox, staged and saved through the card form like the
+ * built-in plugin cards.
  *
  * @module dsh-web-fetch-playwright/client/card
  */
@@ -75,20 +76,35 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
             label: t('backendCdp'),
             hint: t('backendCdpHint'),
             content: (
-              <ValueField
-                embedded
-                id="plugin-config-playwright-cdp"
-                label={t('cdpEndpoint')}
-                hint={t('cdpEndpointHint')}
-                placeholder="127.0.0.1:9222"
-                overriddenLabel={t('overridden')}
-                resetLabel={t('reset')}
-                invalidLabel={t('invalidText')}
-                disabled={disabled || backend !== 'cdp'}
-                {...state.cdpEndpoint}
-                onEdit={(text) => { props.edit('cdpEndpoint', text) }}
-                onReset={() => { props.resetField('cdpEndpoint') }}
-              />
+              <>
+                <ValueField
+                  embedded
+                  id="plugin-config-playwright-cdp"
+                  label={t('cdpEndpoint')}
+                  hint={t('cdpEndpointHint')}
+                  placeholder="127.0.0.1:9222"
+                  overriddenLabel={t('overridden')}
+                  resetLabel={t('reset')}
+                  invalidLabel={t('invalidText')}
+                  disabled={disabled || backend !== 'cdp'}
+                  {...state.cdpEndpoint}
+                  onEdit={(text) => { props.edit('cdpEndpoint', text) }}
+                  onReset={() => { props.resetField('cdpEndpoint') }}
+                />
+                <CheckboxField
+                  embedded
+                  id="plugin-config-playwright-share-context"
+                  label={t('shareBrowserContext')}
+                  hint={t('shareBrowserContextHint')}
+                  checked={state.shareBrowserContext.text !== 'false'}
+                  overridden={state.shareBrowserContext.overridden}
+                  overriddenLabel={t('overridden')}
+                  resetLabel={t('reset')}
+                  disabled={disabled || backend !== 'cdp'}
+                  onEdit={(text) => { props.edit('shareBrowserContext', text) }}
+                  onReset={() => { props.resetField('shareBrowserContext') }}
+                />
+              </>
             ),
           },
         ]}

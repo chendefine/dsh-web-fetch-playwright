@@ -22,6 +22,17 @@ const PAGE = `<!doctype html><html><head><title>Smoke page</title></head><body>
 <footer>footer noise</footer>
 </body></html>`
 
+/** Cookie-jar probe page: the marker only renders when the request carried
+ *  the cookie a previous response in the SAME context set. The title is kept
+ *  short so Readability keeps the (distinct) h1 heading. */
+const COOKIE_PAGE_SEEN = `<!doctype html><html><head><title>Probe</title></head><body>
+<main><article><h1>Cookie probe COOKIE-SEEN</h1><p>The shared context carried the cookie this far.</p><p>A second paragraph so the article extractor locks onto the main content region.</p></article></main>
+</body></html>`
+
+const COOKIE_PAGE_BLANK = `<!doctype html><html><head><title>Probe</title></head><body>
+<main><article><h1>Cookie probe</h1><p>No cookie rode along with this request.</p><p>A second paragraph so the article extractor locks onto the main content region.</p></article></main>
+</body></html>`
+
 let server: ReturnType<typeof createServer>
 let baseUrl: string
 let browserAvailable = false
@@ -29,6 +40,16 @@ let backendSource = ''
 
 beforeAll(async () => {
   server = createServer((req, res) => {
+    if (req.url !== undefined && req.url.startsWith('/cookie')) {
+      if ((req.headers.cookie ?? '').includes('dsh-profile-probe=')) {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+        res.end(COOKIE_PAGE_SEEN)
+      } else {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'set-cookie': 'dsh-profile-probe=1; Path=/' })
+        res.end(COOKIE_PAGE_BLANK)
+      }
+      return
+    }
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
     res.end(PAGE)
   })
@@ -66,6 +87,7 @@ describe('PlaywrightFetchProvider integration', () => {
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
     }))
@@ -89,6 +111,7 @@ describe('PlaywrightFetchProvider integration', () => {
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      shareBrowserContext: true,
       denoise: false,
       maxConcurrency: 4,
     }))
@@ -106,6 +129,7 @@ describe('PlaywrightFetchProvider integration', () => {
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
     }))
@@ -170,6 +194,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: endpoint,
+      shareBrowserContext: false, // isolated: preserves this suite's original stance
       denoise: true,
     }))
     const result = await provider.fetch({ url: baseUrl })
@@ -190,12 +215,59 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: endpoint,
+      shareBrowserContext: false, // isolated: preserves this suite's original stance
       denoise: true,
     }))
     const results = await Promise.allSettled(Array.from({ length: 12 }, (_, i) =>
       provider.fetch({ url: `${baseUrl}?tab=${String(i)}` })))
     const ok = results.filter(entry => entry.status === 'fulfilled').length
     expect(ok).toBe(12)
+    await provider.dispose()
+  })
+
+  // The two cases below prove the context-mode semantics end to end against
+  // a real remote browser: profile fetches share its cookie jar (the tab a
+  // cookie was set in is gone, the jar is not), isolated ones never do.
+  it('profile mode: fetches share the remote browser cookie jar and the browser survives', { timeout: 120_000 }, async () => {
+    if (!browserAvailable || debugBrowser === undefined) {
+      console.warn('skipping CDP smoke (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'cdp',
+      playwrightPath: '',
+      cdpEndpoint: endpoint,
+      shareBrowserContext: true,
+      denoise: true,
+    }))
+    const first = await provider.fetch({ url: `${baseUrl}cookie` })
+    const second = await provider.fetch({ url: `${baseUrl}cookie` })
+    expect(first.statusCode).toBe(200)
+    const firstText = first.body.kind === 'text' ? first.body.content : ''
+    const secondText = second.body.kind === 'text' ? second.body.content : ''
+    expect(firstText).not.toContain('COOKIE-SEEN') // the jar started empty
+    expect(secondText).toContain('COOKIE-SEEN') // ...and kept the first tab's cookie
+    await provider.dispose()
+    // Disconnecting the shared connection never touches the remote browser.
+    expect(debugBrowser.isConnected()).toBe(true)
+  })
+
+  it('isolated mode: every fetch gets a fresh jar, no cookie crosses fetches', { timeout: 120_000 }, async () => {
+    if (!browserAvailable || debugBrowser === undefined) {
+      console.warn('skipping CDP smoke (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'cdp',
+      playwrightPath: '',
+      cdpEndpoint: endpoint,
+      shareBrowserContext: false,
+      denoise: true,
+    }))
+    await provider.fetch({ url: `${baseUrl}cookie` }) // sets a cookie — then dies with its context
+    const second = await provider.fetch({ url: `${baseUrl}cookie` })
+    const secondText = second.body.kind === 'text' ? second.body.content : ''
+    expect(secondText).not.toContain('COOKIE-SEEN')
     await provider.dispose()
   })
 })

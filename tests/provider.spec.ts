@@ -1,8 +1,10 @@
 /**
- * The provider over a fake browser session: URL hygiene, content-type
+ * The provider over fake browser sessions: URL hygiene, content-type
  * branching, the denoise toggle, body caps, error taxonomy, the concurrency
- * queue (gated sessions), plus one real-socket case for the CDP connect
- * failure path.
+ * queue (gated sessions), the CDP context modes (profile closing only its
+ * tab, isolated closing page + context, abort leaving the shared default
+ * context intact, the popup guard), plus one real-socket case for the CDP
+ * connect failure path.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WebError } from '@deepseek-ai/dsh-web'
@@ -21,6 +23,8 @@ interface FakePageSpec {
   textBody?: string
   gotoError?: Error
   networkIdleError?: boolean
+  /** Never settle `goto` on its own — it rejects when the page closes. */
+  hangGoto?: boolean
 }
 
 const ARTICLE_HTML = `<!doctype html><html><head><title>Fake page</title></head><body>
@@ -38,20 +42,38 @@ function fakeResponse(spec: FakePageSpec): PlaywrightResponse | null {
   }
 }
 
-function fakeSession(spec: FakePageSpec): BrowserSession {
-  const closed = { context: false, browser: false }
-  const page: PlaywrightPage = {
-    goto: async () => {
-      if (spec.gotoError !== undefined) throw spec.gotoError
-      return fakeResponse(spec)
+/** Shared page behavior: the members the provider touches, close tracking. */
+function makeFakePage(spec: FakePageSpec, state: { pageClosed: boolean }, popupListeners: Array<(page: PlaywrightPage) => void> = []): PlaywrightPage {
+  const gotoRejecters: Array<(error: Error) => void> = []
+  return {
+    goto: (): Promise<PlaywrightResponse | null> => {
+      // A closed page rejects navigation, like a real Playwright page.
+      if (state.pageClosed) return Promise.reject(new Error('Target closed'))
+      if (spec.gotoError !== undefined) return Promise.reject(spec.gotoError)
+      if (spec.hangGoto === true) {
+        return new Promise((_resolve, reject) => { gotoRejecters.push(reject) })
+      }
+      return Promise.resolve(fakeResponse(spec))
     },
     waitForLoadState: async () => {
       if (spec.networkIdleError === true) throw new Error('networkidle timeout')
     },
     url: () => spec.finalUrl ?? 'https://final.example.com/docs',
     content: async () => spec.html ?? ARTICLE_HTML,
-    close: async () => {},
+    close: async () => {
+      state.pageClosed = true
+      for (const reject of gotoRejecters.splice(0)) reject(new Error('Target closed'))
+    },
+    route: async () => {},
+    on: (event: 'popup', listener: (page: PlaywrightPage) => void) => {
+      if (event === 'popup') popupListeners.push(listener)
+    },
   }
+}
+
+function fakeSession(spec: FakePageSpec): BrowserSession {
+  const closed = { pageClosed: false, context: false, browser: false }
+  const page = makeFakePage(spec, closed)
   const context: PlaywrightContext = {
     newPage: async () => page,
     route: async () => {},
@@ -61,16 +83,20 @@ function fakeSession(spec: FakePageSpec): BrowserSession {
     newContext: async () => context,
     close: async () => { closed.browser = true },
   }
-  return { browser, context, closed } as unknown as BrowserSession & typeof closed
+  return { browser, context, page, closed } as unknown as BrowserSession & typeof closed
 }
 
 /** The provider under test: a fixed config and an injected fake session. */
 class FakeProvider extends PlaywrightFetchProvider {
+  /** The session the last fetch ran in (closed flags ride on it). */
+  lastSession: BrowserSession | undefined
+
   constructor(config: Partial<ResolvedConfig> = {}, private readonly spec: FakePageSpec = {}) {
     super(() => ({
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
       ...config,
@@ -78,7 +104,8 @@ class FakeProvider extends PlaywrightFetchProvider {
   }
 
   protected async openSession(): Promise<BrowserSession> {
-    return fakeSession(this.spec)
+    this.lastSession = fakeSession(this.spec)
+    return this.lastSession
   }
 }
 
@@ -96,6 +123,7 @@ class GatedProvider extends PlaywrightFetchProvider {
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
       ...config,
@@ -116,31 +144,60 @@ class GatedProvider extends PlaywrightFetchProvider {
 
 /**
  * A fake shared CDP connection for provider-level tests: every fetch leases
- * its own context (tab) over ONE browser, whose connect/close counts are
- * tracked for assertions.
+ * a page (tab) over ONE browser — from its default context (profile mode)
+ * or a throwaway context (isolated mode) — whose open/close counts are
+ * tracked for assertions. The default context records (and tests assert it
+ * never receives) a close.
  */
 function fakeCdpConnection(spec: FakePageSpec = {}) {
-  const state = { connects: 0, contextsOpened: 0, contextsClosed: 0, browserClosed: false }
-  const page: PlaywrightPage = {
-    goto: async () => {
-      if (spec.gotoError !== undefined) throw spec.gotoError
-      return fakeResponse(spec)
+  const state = {
+    connects: 0,
+    isolatedContextsOpened: 0,
+    isolatedContextsClosed: 0,
+    /** Tabs opened in the default context (profile mode). */
+    defaultPagesOpened: 0,
+    /** close() calls on the default context — profile mode must keep at 0. */
+    defaultContextClosed: 0,
+    /** Every page any mode opened / fully closed (closes are idempotent). */
+    pagesOpened: 0,
+    pagesClosed: 0,
+    browserClosed: false,
+    /** Popup listeners the guard registered on the leased pages. */
+    popupListeners: [] as Array<(page: PlaywrightPage) => void>,
+  }
+  const makePage = (): PlaywrightPage => {
+    state.pagesOpened++
+    const pageState = { pageClosed: false }
+    const page = makeFakePage(spec, pageState, state.popupListeners)
+    const base = page.close.bind(page)
+    return {
+      ...page,
+      close: async () => {
+        if (pageState.pageClosed) return // a real page's second close is a no-op
+        state.pagesClosed++
+        await base()
+      },
+    }
+  }
+  const defaultContext: PlaywrightContext = {
+    newPage: async () => {
+      state.defaultPagesOpened++
+      return makePage()
     },
-    waitForLoadState: async () => {},
-    url: () => spec.finalUrl ?? 'https://final.example.com/docs',
-    content: async () => spec.html ?? ARTICLE_HTML,
-    close: async () => {},
+    route: async () => {},
+    close: async () => { state.defaultContextClosed++ },
   }
   const browser: PlaywrightBrowser = {
     newContext: async () => {
-      state.contextsOpened++
+      state.isolatedContextsOpened++
       const context: PlaywrightContext = {
-        newPage: async () => page,
+        newPage: async () => makePage(),
         route: async () => {},
-        close: async () => { state.contextsClosed++ },
+        close: async () => { state.isolatedContextsClosed++ },
       }
       return context
     },
+    contexts: () => [defaultContext],
     close: async () => { state.browserClosed = true },
   }
   return {
@@ -321,12 +378,13 @@ describe('PlaywrightFetchProvider concurrency queue', () => {
 })
 
 describe('PlaywrightFetchProvider CDP backend', () => {
-  it('rides one shared connection; each fetch closes only its tab context', async () => {
+  it('isolated mode (checkbox off): one shared connection, each fetch a throwaway context it closes', async () => {
     const { state, pool } = fakeCdpConnection()
     const provider = new PlaywrightFetchProvider(() => ({
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: '',
+      shareBrowserContext: false,
       denoise: true,
     }), pool)
 
@@ -335,10 +393,12 @@ describe('PlaywrightFetchProvider CDP backend', () => {
     expect(first.statusCode).toBe(200)
     expect(second.statusCode).toBe(200)
 
-    // Two fetches, two isolated tabs, ONE connection — never closed per fetch.
+    // Two fetches, two isolated tabs (page + context each), ONE connection.
     expect(state.connects).toBe(1)
-    expect(state.contextsOpened).toBe(2)
-    expect(state.contextsClosed).toBe(2)
+    expect(state.isolatedContextsOpened).toBe(2)
+    expect(state.isolatedContextsClosed).toBe(2)
+    expect(state.pagesClosed).toBe(2)
+    expect(state.defaultPagesOpened).toBe(0)
     expect(state.browserClosed).toBe(false)
 
     // Teardown (plugin unload) is what drops the shared connection.
@@ -346,12 +406,13 @@ describe('PlaywrightFetchProvider CDP backend', () => {
     expect(state.browserClosed).toBe(true)
   })
 
-  it('runs many concurrent CDP fetches as tabs without queueing', async () => {
+  it('runs many concurrent isolated CDP fetches as tabs without queueing', async () => {
     const { state, pool } = fakeCdpConnection()
     const provider = new PlaywrightFetchProvider(() => ({
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: '',
+      shareBrowserContext: false,
       denoise: true,
     }), pool)
 
@@ -361,8 +422,110 @@ describe('PlaywrightFetchProvider CDP backend', () => {
     // All fifty rode the single connection as concurrent tabs — the CDP
     // default concurrency is high enough that none queued.
     expect(state.connects).toBe(1)
-    expect(state.contextsOpened).toBe(50)
-    expect(state.contextsClosed).toBe(50)
+    expect(state.isolatedContextsOpened).toBe(50)
+    expect(state.isolatedContextsClosed).toBe(50)
+  })
+
+  it('profile mode: each fetch is a tab of the shared default context, closed when done', async () => {
+    const { state, pool } = fakeCdpConnection()
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'cdp',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      shareBrowserContext: true,
+      denoise: true,
+    }), pool)
+
+    const first = await provider.fetch({ url: 'https://example.com/a' })
+    const second = await provider.fetch({ url: 'https://example.com/b' })
+    expect(first.statusCode).toBe(200)
+    expect(second.statusCode).toBe(200)
+
+    // Two tabs of the ONE default context; both closed; the context and
+    // the connection itself never closed.
+    expect(state.connects).toBe(1)
+    expect(state.defaultPagesOpened).toBe(2)
+    expect(state.pagesOpened).toBe(2)
+    expect(state.pagesClosed).toBe(2)
+    expect(state.isolatedContextsOpened).toBe(0)
+    expect(state.defaultContextClosed).toBe(0)
+    expect(state.browserClosed).toBe(false)
+
+    // Even plugin teardown only disconnects (the remote browser survives).
+    await provider.dispose()
+    expect(state.defaultContextClosed).toBe(0)
+  })
+
+  it('profile mode serves a concurrent burst as tabs of the one default context', async () => {
+    const { state, pool } = fakeCdpConnection()
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'cdp',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      shareBrowserContext: true,
+      denoise: true,
+    }), pool)
+
+    const results = await Promise.all(Array.from({ length: 12 }, (_, i) =>
+      provider.fetch({ url: `https://example.com/tab-${String(i)}` })))
+    expect(results.every(result => result.statusCode === 200)).toBe(true)
+    expect(state.connects).toBe(1)
+    expect(state.pagesOpened).toBe(12)
+    expect(state.pagesClosed).toBe(12)
+    expect(state.defaultContextClosed).toBe(0)
+  })
+
+  it('an aborted profile fetch closes only its tab — the shared default context survives', async () => {
+    const { state, pool } = fakeCdpConnection({ hangGoto: true })
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'cdp',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      shareBrowserContext: true,
+      denoise: true,
+    }), pool)
+
+    const controller = new AbortController()
+    const pending = provider.fetch({ url: 'https://example.com/slow' }, controller.signal)
+      .then(() => { throw new Error('expected rejection') }, (error: unknown) => error)
+    await new Promise(resolve => { setImmediate(resolve) }) // reaches goto
+    expect(state.pagesOpened).toBe(1)
+    controller.abort()
+    const error = await pending
+
+    expect(error).toBeInstanceOf(WebError)
+    expect((error as WebError).code).toBe('WEB_ABORTED')
+    expect(state.pagesClosed).toBe(1)
+    expect(state.defaultContextClosed).toBe(0) // other tabs of the profile unaffected
+    expect(state.browserClosed).toBe(false)
+  })
+
+  it('closes popups a fetched page spawns so no tab outlives the fetch', async () => {
+    const { state, pool } = fakeCdpConnection()
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'cdp',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      shareBrowserContext: true,
+      denoise: true,
+    }), pool)
+
+    await provider.fetch({ url: 'https://example.com/popup-spawner' })
+    expect(state.popupListeners.length).toBeGreaterThan(0) // the guard attached
+
+    const popupState = { pageClosed: false }
+    const popup = makeFakePage({}, popupState)
+    for (const listener of state.popupListeners) listener(popup) // page spawned a popup
+    expect(popupState.pageClosed).toBe(true)
+  })
+
+  it('closes a local session explicitly: page, context, then browser', async () => {
+    const provider = new FakeProvider()
+    await provider.fetch({ url: 'https://example.com/docs' })
+    const closed = (provider.lastSession as unknown as { closed: { pageClosed: boolean; context: boolean; browser: boolean } }).closed
+    expect(closed.pageClosed).toBe(true)
+    expect(closed.context).toBe(true)
+    expect(closed.browser).toBe(true)
   })
 
   it('wraps a dead CDP endpoint as WEB_PROVIDER_ERROR naming the endpoint', { timeout: 30_000 }, async () => {
@@ -370,6 +533,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: '127.0.0.1:1',
+      shareBrowserContext: true,
       denoise: true,
     }))
     // Real bundled playwright-core; port 1 refuses connections immediately.

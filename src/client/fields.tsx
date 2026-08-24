@@ -143,7 +143,11 @@ export function RadioGroupField(props: {
   )
 }
 
-/** A staged checkbox: the denoise toggle. An absent stored value defaults to on. */
+/**
+ * A staged checkbox: the denoise toggle and the CDP shared-context toggle.
+ * An absent stored value formats as '' — callers render the schema default
+ * (denoise on, context shared).
+ */
 export function CheckboxField(props: {
   id: string
   label: string
@@ -155,9 +159,11 @@ export function CheckboxField(props: {
   disabled: boolean
   onEdit: (text: string) => void
   onReset: () => void
+  /** Render inside a radio option: no card-level chrome, hint under the label. */
+  embedded?: boolean
 }) {
   return (
-    <div className={css.field}>
+    <div className={props.embedded ? css.fieldEmbedded : css.field}>
       <div className={css.checkboxRow}>
         <input
           id={props.id}
@@ -183,7 +189,7 @@ export function CheckboxField(props: {
           )
           : null}
       </div>
-      <p className={css.hint}>{props.hint}</p>
+      <p className={props.embedded ? `${css.hint} ${css.hintIndented}` : css.hint}>{props.hint}</p>
     </div>
   )
 }

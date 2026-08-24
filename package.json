@@ -1,6 +1,6 @@
 {
   "name": "dsh-web-fetch-playwright",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Playwright/CDP web-fetch provider for DeepSeek Harness: renders pages in a real browser, denoises them (Readability + DOMPurify), and returns markdown.",
   "type": "module",
   "license": "MIT",
@@ -82,10 +82,11 @@
     "permissions": [
       "network:fetch (renders the URLs the user requests in a local browser)",
       "network:connect (user-configured CDP endpoint, default 127.0.0.1:9222)",
-      "fs:read (user-configured playwright/browser executable path)"
+      "fs:read (user-configured playwright/browser executable path)",
+      "network:fetch (CDP profile mode: renders the URLs the user requests WITH the remote browser's logged-in sessions)"
     ],
     "jurisdiction": [],
-    "retention": "none"
+    "retention": "none (profile mode: site data lands in the remote browser's own persistent user-data-dir, which this plugin never cleans)"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": ">=3.18.1-rc.1 <4",

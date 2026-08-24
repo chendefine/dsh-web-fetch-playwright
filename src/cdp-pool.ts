@@ -1,33 +1,48 @@
 /**
  * The CDP backend's shared connection: one `connectOverCDP` session reused by
- * every fetch, each fetch leasing an isolated context (a tab in the remote
- * browser) that it closes when done. The connection itself outlives fetches —
- * reconnecting per fetch would spend 100–500ms per call and open one socket
- * per concurrent tab for no benefit.
+ * every fetch, each fetch leasing a page (a tab in the remote browser) that
+ * it closes when done — in an isolated throwaway context (`isolated` mode),
+ * or in the remote browser's default context (`profile` mode, whose cookies
+ * and localStorage are the real profile's, so its persistent logins apply;
+ * that context is never closed, only the tab is). The connection itself
+ * outlives fetches — reconnecting per fetch would spend 100–500ms per call
+ * and open one socket per concurrent tab for no benefit.
  *
  * Liveness is handled three ways: `isConnected()` is checked before reuse, a
  * `disconnected` event (when the backend emits it) drops the reference
- * immediately, and a `newContext` failure against a dead connection triggers
+ * immediately, and an open-lease failure against a dead connection triggers
  * exactly one reconnect-and-retry before the error surfaces. A changed
  * endpoint (settings edit) replaces the connection.
  *
  * @module dsh-web-fetch-playwright/cdp-pool
  */
 
-import type { PlaywrightBrowser, PlaywrightContext } from './types.ts'
+import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage } from './types.ts'
 
 /** Opens the shared connection; injected so tests can substitute a fake. */
 export type CdpConnect = (endpoint: string, timeoutMs: number) => Promise<PlaywrightBrowser>
 
-/** One fetch's lease: the shared browser plus a context it owns. */
+/** How a lease scopes its fetch: throwaway context or the remote profile. */
+export type CdpAcquireMode = 'isolated' | 'profile'
+
+/** One fetch's lease: the shared browser, a context, and the tab it owns. */
 export interface CdpLease {
   /** The shared connection — close only what the lease owns, never this. */
   browser: PlaywrightBrowser
-  /** The fetch-owned isolated context; {@link CdpConnectionPool.release} closes it. */
+  /**
+   * The context the page lives in: fetch-owned (`isolated`) or the remote
+   * browser's default context (`profile`). NEVER close the latter — closing
+   * it tears down the whole shared connection (playwright-core maps a
+   * default-context close to "close browser" for this connection).
+   */
   context: PlaywrightContext
+  /** The fetch-owned tab; {@link CdpConnectionPool.release} always closes it. */
+  page: PlaywrightPage
+  /** True when `context` is the remote default context: release must not close it. */
+  persistent: boolean
 }
 
-/** A reusable `connectOverCDP` session handing out per-fetch contexts. */
+/** A reusable `connectOverCDP` session handing out per-fetch pages. */
 export class CdpConnectionPool {
   private browser: PlaywrightBrowser | undefined
   private endpoint = ''
@@ -43,37 +58,74 @@ export class CdpConnectionPool {
   constructor(private readonly connect: CdpConnect) {}
 
   /**
-   * Lease a fresh isolated context on the shared connection, connecting (or
+   * Lease a fetch's page on the shared connection, connecting (or
    * reconnecting) first if needed. Concurrent first fetches share one
    * connect attempt.
    *
    * @param endpoint - normalized CDP endpoint URL.
    * @param timeoutMs - connect timeout budget.
-   * @returns the shared browser and a context the caller must release.
+   * @param mode - `isolated` (default): a fresh throwaway context plus a page
+   *   in it; `profile`: a page in the remote browser's default context — the
+   *   real profile — which is never closed, only the page is.
+   * @returns the shared browser, the page's context, and the page the caller
+   *   must release.
    * @throws whatever the connect function throws when no connection can be
-   * established (the provider wraps it in a structured WebError).
+   *   established (the provider wraps it in a structured WebError), or a
+   *   diagnostic error when `profile` mode finds no default context.
    */
-  async acquire(endpoint: string, timeoutMs: number): Promise<CdpLease> {
+  async acquire(endpoint: string, timeoutMs: number, mode: CdpAcquireMode = 'isolated'): Promise<CdpLease> {
     const browser = await this.ensure(endpoint, timeoutMs)
     try {
-      return { browser, context: await browser.newContext() }
+      return await this.openLease(browser, mode)
     } catch (error: unknown) {
-      // The connection may have died between ensure() and newContext(); one
-      // fresh connection attempt, then the error propagates as-is.
+      // The connection may have died between ensure() and opening the lease;
+      // one fresh connection attempt, then the error propagates as-is.
       if (this.isLive(browser)) throw error
       this.drop(browser)
       const fresh = await this.ensure(endpoint, timeoutMs)
-      return { browser: fresh, context: await fresh.newContext() }
+      return await this.openLease(fresh, mode)
     }
   }
 
   /**
-   * Close a fetch-owned context. The shared connection stays open for the
-   * next fetch.
-   * @param lease - the lease whose context goes away.
+   * Open one lease's page on a live connection. The profile-mode handle is
+   * taken fresh every call (never cached across connections): a reconnect
+   * yields a new Browser object whose `contexts()[0]` must be re-read.
+   */
+  private async openLease(browser: PlaywrightBrowser, mode: CdpAcquireMode): Promise<CdpLease> {
+    if (mode === 'profile') {
+      // [0] is the default context: playwright-core's BrowserDispatcher
+      // always dispatches it first, and contexts created outside this
+      // connection never appear here — so the pick is deterministic.
+      const context = browser.contexts?.()[0]
+      if (context === undefined) {
+        throw new Error('the CDP endpoint exposed no default browser context (profile mode requires a real browser profile)')
+      }
+      // A failed newPage leaves nothing behind (the default context is not
+      // ours to clean), so the acquire-level retry can simply try again.
+      return { browser, context, page: await context.newPage(), persistent: true }
+    }
+    const context = await browser.newContext()
+    try {
+      return { browser, context, page: await context.newPage(), persistent: false }
+    } catch (error: unknown) {
+      // The context exists but its page does not: close it now, or a
+      // transient newPage failure on a live connection strands the context
+      // until the whole connection goes away.
+      await context.close().catch(() => {})
+      throw error
+    }
+  }
+
+  /**
+   * Close a fetch-owned page, plus its context when the lease owns one. The
+   * remote default context (persistent leases) and the shared connection
+   * stay for the next fetch.
+   * @param lease - the lease whose page (and, when isolated, context) goes away.
    */
   async release(lease: CdpLease): Promise<void> {
-    await lease.context.close().catch(() => {})
+    await lease.page.close().catch(() => {})
+    if (!lease.persistent) await lease.context.close().catch(() => {})
   }
 
   /**

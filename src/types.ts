@@ -22,9 +22,20 @@ export interface PlaywrightPage {
   url(): string
   content(): Promise<string>
   close(): Promise<void>
+  /**
+   * Resource-filter interception at page level — installed on the page (not
+   * its context) so profile mode never intercepts tabs it does not own.
+   */
+  route(glob: string, handler: (route: PlaywrightRoute) => Promise<void>): Promise<void>
+  /** Popup notification; the fetch closes whatever its page spawns. */
+  on?(event: 'popup', listener: (page: PlaywrightPage) => void): unknown
 }
 
-/** An isolated browser context (the CDP backend gets a fresh one per fetch). */
+/**
+ * A browser context: fetch-owned and isolated (local backend, or CDP
+ * `isolated` mode), or the remote browser's default context carrying its
+ * real profile (CDP `profile` mode — never closed by a fetch).
+ */
 export interface PlaywrightContext {
   newPage(): Promise<PlaywrightPage>
   route(glob: string, handler: (route: PlaywrightRoute) => Promise<void>): Promise<void>
@@ -42,6 +53,12 @@ export interface PlaywrightRoute {
 export interface PlaywrightBrowser {
   newContext(): Promise<PlaywrightContext>
   close(): Promise<void>
+  /**
+   * Contexts visible to this connection. Over CDP the default context — the
+   * remote browser's real profile — is always dispatched first, so `[0]` is
+   * it; absent on minimal fakes (isolated mode never calls this).
+   */
+  contexts?(): PlaywrightContext[]
   /** Liveness probe; absent on minimal fakes (assumed live). */
   isConnected?(): boolean
   /** Optional disconnect notification used to drop a stale shared CDP connection. */

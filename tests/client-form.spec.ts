@@ -55,11 +55,12 @@ class FakeScope implements SettingsScope<Record<string, unknown>> {
   }
 }
 
-/** The card's field set: backend radio, two text inputs, one checkbox, one number. */
+/** The card's field set: backend radio, two text inputs, two checkboxes, one number. */
 function makeForm(scope: SettingsScope<Record<string, unknown>>) {
   return new CardForm(scope, [
     radioField('backend', ['local', 'cdp']),
     textField('playwrightPath'),
+    checkboxField('shareBrowserContext'),
     checkboxField('denoise'),
     numberField('maxConcurrency', 1, 8),
   ])
@@ -144,6 +145,27 @@ describe('CardForm', () => {
     await form.save()
     expect(scope.writes).toEqual([{ field: 'denoise', op: 'set', value: false }])
     expect(form.field('denoise').text).toBe('false')
+  })
+
+  it('the shared-context checkbox seeds absent as empty (card renders the on default)', async () => {
+    const scope = new FakeScope({ backend: 'cdp' })
+    const form = makeForm(scope)
+    // Absent stored value formats as '': the checkbox control falls back to
+    // its schema default (checked) while nothing is staged.
+    expect(form.field('shareBrowserContext').text).toBe('')
+    expect(form.field('shareBrowserContext').overridden).toBe(false)
+    expect(form.shell().dirty).toBe(false)
+
+    form.actions().edit('shareBrowserContext', 'false') // the user unchecks
+    await form.save()
+    expect(scope.writes).toEqual([{ field: 'shareBrowserContext', op: 'set', value: false }])
+    expect(form.field('shareBrowserContext').text).toBe('false')
+    expect(form.field('shareBrowserContext').overridden).toBe(true)
+
+    form.actions().resetField('shareBrowserContext') // back to the default
+    await form.save()
+    expect(scope.writes[scope.writes.length - 1]).toEqual({ field: 'shareBrowserContext', op: 'unset' })
+    expect(form.field('shareBrowserContext').text).toBe('')
   })
 
   it('numberField round-trips in-range integers and clears on empty', async () => {

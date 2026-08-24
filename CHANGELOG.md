@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-24
+
+### Added
+
+- CDP context modes: a new `shareBrowserContext` setting (checkbox *Share the browser context (profile logins)* nested under the Remote CDP option in the plugin-configuration card, default **on**) selects how each CDP fetch is scoped. **Profile mode** (default): each fetch is a tab in the remote browser's default context — its real profile — so cookies/localStorage are shared and the browser's persistent logins apply; the tab closes when the fetch ends, the shared context never closes. **Isolated mode** (unchecked): the previous behavior — a fresh incognito-like context per fetch.
+- `effectiveContextMode(config)` and the exported `CdpContextMode` / `CdpAcquireMode` types.
+- Popup guard: popups a fetched page spawns (`window.open`) are closed so no tab outlives its fetch in the remote browser.
+
+### Changed
+
+- The fetch lease is now page-scoped: `CdpLease` carries `page` + `persistent`, `CdpConnectionPool.acquire` takes a mode, and `release` closes only what the lease owns (page always; context unless it is the remote default context). The connection-management core (ensure/connect/watch/drop/dispose) is unchanged — a `browser.close()` on a CDP handle only disconnects, so the remote browser always survives.
+- Resource-subrequest filtering moved from context level to **page level**, so profile mode never intercepts tabs it does not own (an operator's manual tabs in the same context).
+- Local-backend pages are closed explicitly on teardown (previously the page relied on its context's close to take it down).
+
+### Fixed
+
+- Local sessions now close in a defined order — page, context, browser — each grace-bounded, instead of leaving the page to the context-close side effect.
+- Partial-failure leaks: an isolated lease whose `newPage()` fails on a live connection now closes the context it just created (it previously stayed open until the whole connection went away), and the local backend closes its launched browser when `newContext()`/`newPage()` fail after a successful launch (a whole Chromium previously stayed running).
+
+### Security
+
+- Profile mode is a semantic upgrade: fetched pages see the remote browser's logged-in identity, and requests they goad the agent into carry its session cookies. README (en/zh) documents the risk notes and the persistent-`user-data-dir` browser setup; the disclosure adds a credentialed-fetch permission entry.
+
 ## [0.2.1] - 2026-08-23
 
 ### Fixed

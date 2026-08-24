@@ -132,6 +132,12 @@
   color: var(--dsw-alias-label-tertiary);
 }
 
+/* Embedded fields (inside a radio option): align the hint under the label
+   text column (checkbox 16px + 10px gap) rather than the box. */
+.hintIndented {
+  margin-left: 26px;
+}
+
 /* ── radio group ──────────────────────────────────────────────────────── */
 
 .radioGroup {
@@ -200,6 +206,12 @@
    14px + 10px gap). */
 .radioContent {
   margin-left: 24px;
+}
+
+/* Stacked nested fields (endpoint input + shared-context checkbox) keep the
+   card's field rhythm between them. */
+.radioContent > * + * {
+  margin-top: 12px;
 }
 
 .radioContent input[type='text']:enabled {
