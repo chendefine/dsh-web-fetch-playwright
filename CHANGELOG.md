@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-08-25
+
+### Fixed
+
+- Denoise now elides inline `data:` image payloads (`data:image/png;base64,...`) to size placeholders like `![alt](data:image/png;base64,...8.9KB)`. Build tools (Docusaurus/webpack) inline images above a size cutoff straight into the HTML; they survived Readability, DOMPurify, and Turndown as raw base64 — on the onlyoffice.com docs events page that was **65% of the returned body** (100k chars, truncated at the cap). With the placeholder the same page returns 41.8k chars complete. The elision happens in the DOM before extraction, so both the article and whole-document fallback paths apply it; it runs under the denoise toggle only (raw-HTML mode is untouched) and keeps alt text, MIME type, and the approximate size.
+- `dsh.plugin.json` version had drifted (still 0.2.2 after the 0.2.3 release); both manifests now move in lockstep at 0.2.4.
+
 ## [0.2.3] - 2026-08-24
 
 ### Fixed

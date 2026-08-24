@@ -9,7 +9,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plug
 ## Features
 
 - **Real browser rendering** — loads the page the way a user sees it, so client-side rendered (SPA) content is captured, not just the raw HTML.
-- **Denoise pipeline** — Mozilla Readability extracts the article, DOMPurify removes layout/noise tags (nav, sidebar, footer, ads, forms), and Turndown with the GFM plugin converts to Markdown with the same style options as the shipped `tool-web` renderer.
+- **Denoise pipeline** — Mozilla Readability extracts the article, DOMPurify removes layout/noise tags (nav, sidebar, footer, ads, forms), and Turndown with the GFM plugin converts to Markdown with the same style options as the shipped `tool-web` renderer. Inline `data:` images (build tools like Docusaurus embed screenshots as base64) are elided to size placeholders such as `![alt](data:image/png;base64,...8.9KB)` so they cannot flood the body.
 - **Two backends** — launch a local Playwright browser, or drive an already-running browser over its DevTools Protocol (CDP) endpoint.
 - **Browser resolution** — a configured path, a `playwright` CLI on `$PATH`, or the bundled `playwright-core`; CDP needs no local browser at all.
 - **Isolated or profile sessions (CDP)** — every fetch is scoped to exactly one tab. Local launches close their browser per fetch; the CDP backend keeps **one shared connection** to the remote browser and each fetch opens a tab inside it, closed when done. By default that tab lives in the remote browser's **real profile** (its cookies, localStorage, and persistent logins apply — like `playwright-cli open`); unchecking *Share the browser context* switches to a throwaway isolated context per fetch.
@@ -29,7 +29,7 @@ web_fetch (tool-web)
         ├─ local: resolve (path → $PATH → bundled playwright-core) → chromium.launch
         ├─ cdp:   connectOverCDP(endpoint)
         ├─ page.goto → settle (networkidle, best-effort) → page.content()
-        ├─ denoise: jsdom → Readability → DOMPurify → Turndown(GFM)
+        ├─ denoise: jsdom → elide data-URI images → Readability → DOMPurify → Turndown(GFM)
         └─ Markdown (or raw HTML when denoise is off)
 ```
 

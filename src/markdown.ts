@@ -2,6 +2,8 @@
  * The denoise pipeline: rendered HTML → sanitized article HTML → markdown.
  *
  * The classic stack, in order: jsdom parses the page Playwright rendered;
+ * inline `data:` image payloads are elided to size placeholders (build
+ * tools inline images as base64, which would otherwise dominate the body);
  * Mozilla Readability extracts the article (dropping nav bars, sidebars,
  * footers, and ad chrome by scoring link density and text mass); DOMPurify
  * sanitizes whatever HTML remains and forbids the layout tags noise lives in;
@@ -29,6 +31,52 @@ const FORBID_TAGS = [
 
 /** Attributes stripped from sanitized output (styling survives as noise). */
 const FORBID_ATTR = ['style', 'class', 'id', 'hidden', 'aria-hidden', 'role']
+
+/**
+ * Elide inline `data:` image payloads to `data:<mime>;base64,...<size>`.
+ *
+ * Build tools (Docusaurus/webpack, Hugo) inline images above a size cutoff
+ * straight into the HTML as data URIs — measured on an onlyoffice.com docs
+ * page, 12 inline PNGs were 21.6% of the HTML and, surviving Readability
+ * (they are content), DOMPurify (img+data: is on its DATA_URI_TAGS
+ * allowlist), and Turndown's default image rule, ended up **65% of the
+ * returned markdown body**. Network-level filtering cannot touch them: a
+ * data URI is never fetched, so the provider's subrequest abort misses it.
+ * The placeholder keeps alt text, MIME type, and the approximate size, so
+ * the model still knows an inline image existed. The marker is pure ASCII
+ * because Readability re-resolves image srcs through `new URL()`, which
+ * would percent-encode anything else.
+ */
+function elideDataUriImages(document: Document): void {
+  for (const img of Array.from(document.querySelectorAll('img'))) {
+    const src = img.getAttribute('src')
+    if (src === null || !src.startsWith('data:')) continue
+    img.setAttribute('src', dataUriPlaceholder(src))
+  }
+}
+
+/**
+ * Shorten one data URI to its header plus a size marker.
+ * @param src - the original `data:` URI.
+ * @returns e.g. `data:image/png;base64,...8.9KB` (base64 sizes are decoded
+ * bytes; non-base64 payloads report their character count).
+ */
+function dataUriPlaceholder(src: string): string {
+  const commaIndex = src.indexOf(',')
+  const header = commaIndex === -1 ? src : src.slice(0, commaIndex + 1)
+  const payload = commaIndex === -1 ? '' : src.slice(commaIndex + 1)
+  const size = /;base64$/i.test(header.slice(5, -1))
+    ? Math.max(0, Math.floor(payload.length / 4) * 3 - (payload.match(/=+$/)?.[0].length ?? 0))
+    : payload.length
+  return `${header}...${humanSize(size)}`
+}
+
+/** Render a byte count as `123B` / `8.9KB` / `1.2MB`. */
+function humanSize(bytes: number): string {
+  if (bytes < 1024) return `${String(bytes)}B`
+  if (bytes < 1_048_576) return `${(bytes / 1024).toFixed(1)}KB`
+  return `${(bytes / 1_048_576).toFixed(1)}MB`
+}
 
 /** The shared converter: same style options as `dsh-tool-web`'s renderer. */
 const turndown = new TurndownService({
@@ -114,6 +162,13 @@ export function htmlToMarkdown(html: string, url: string): DenoiseResult {
   const dom = new JSDOM(html, { url, virtualConsole: new VirtualConsole() })
   const purify = createDOMPurify(dom.window)
   const document = dom.window.document
+
+  // Before anything downstream reads the DOM: shrink inline data-URI image
+  // payloads to size placeholders. Mutating the live document here covers
+  // both paths — the Readability clone below, and the document.body fallback
+  // (innerHTML reflects the rewritten src) — while Turndown's default image
+  // rule keeps handling alt/title escaping on the already-short src.
+  elideDataUriImages(document)
 
   let source: string | null = null
   let title: string | undefined

@@ -53,6 +53,23 @@ const NON_ARTICLE_PAGE = `<!doctype html>
 <footer>footer noise</footer>
 </body></html>`
 
+/** A build-tool-inlined data URI payload (4096 base64 chars = 3072 bytes). */
+const DATA_URI_3KB = `data:image/png;base64,${'A'.repeat(4096)}`
+
+/** A docs article whose build tool inlined its screenshots as data URIs. */
+const INLINE_IMAGE_PAGE = `<!doctype html>
+<html><head><title>Inline images</title></head><body>
+<nav>nav noise</nav>
+<main><article>
+<h1>Guide</h1>
+<p>Intro paragraph with enough text for extraction to latch onto the article region.</p>
+<p><img decoding=async loading=lazy alt="tiny chart" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="></p>
+<p><img alt="big screenshot" title="The screenshot" src="${DATA_URI_3KB}"></p>
+<p><img alt="remote photo" src="https://example.com/photo.png"></p>
+</article></main>
+<footer>footer noise</footer>
+</body></html>`
+
 describe('htmlToMarkdown', () => {
   it('extracts the article and drops nav/sidebar/footer/ad chrome', () => {
     const { markdown, mode } = htmlToMarkdown(ARTICLE_PAGE, 'https://example.com/guide')
@@ -103,6 +120,32 @@ describe('htmlToMarkdown', () => {
     const { mode } = htmlToMarkdown('<html><body></body></html>', 'https://example.com/e')
     expect(mode).toBe('document')
     expect(htmlToMarkdown(page, 'https://example.com/p').markdown).toContain('plain line of body text')
+  })
+
+  it('elides inline data-URI image payloads to size placeholders', () => {
+    const { markdown, mode } = htmlToMarkdown(INLINE_IMAGE_PAGE, 'https://example.com/guide')
+    expect(mode).toBe('article')
+    // The base64 payloads are gone entirely...
+    expect(markdown).not.toContain('iVBORw0KGgo')
+    expect(markdown).not.toContain('A'.repeat(64))
+    // ...replaced by alt-bearing, MIME-and-size-marked placeholders; the
+    // default image rule's title handling still applies to the short src.
+    expect(markdown).toMatch(/!\[tiny chart\]\(data:image\/png;base64,...\d+B\)/)
+    expect(markdown).toContain('![big screenshot](data:image/png;base64,...3.0KB "The screenshot")')
+    // Remote images are untouched.
+    expect(markdown).toContain('![remote photo](https://example.com/photo.png)')
+  })
+
+  it('elides data-URI images on the whole-document fallback path too', () => {
+    const page = `<!doctype html><html><head><title>Sparse</title></head><body>
+<img alt="inline diagram" src="${DATA_URI_3KB}">
+</body></html>`
+    const { markdown, mode } = htmlToMarkdown(page, 'https://example.com/sparse')
+    // An image-only body gives Readability nothing to extract: the fallback
+    // path must apply the same elision the article path does.
+    expect(mode).toBe('document')
+    expect(markdown).toContain('![inline diagram](data:image/png;base64,...3.0KB)')
+    expect(markdown).not.toContain('A'.repeat(64))
   })
 
   it('survives pathological input without throwing', () => {
