@@ -1,9 +1,15 @@
 # dsh-web-fetch-playwright bundle layer.
 #
 # 1. Pin the web seam's fetch provider to this plugin's provider (id
-#    'playwright'). A patch replaces the targeted row's WHOLE config, so the
-#    shipped search selection is restated verbatim — losing it would break
-#    web_search.
+#    'playwright'). A patch replaces the targeted row's WHOLE config, so every
+#    key written here is deliberate. `searchProvider` is intentionally omitted:
+#    this bundle owns fetch, not search. Omitted means auto-select when exactly
+#    one search provider is usable (the base bundle registers only
+#    'deepseek-official', so the default composition is unchanged), while any
+#    later layer — the user's own search bundle, the profile/home
+#    cordis.patch.yml, or $DSH_WEB_SEARCH_PROVIDER — stays free to pin search
+#    without this layer out-ranking it. Two usable search providers with no
+#    explicit selection fail loud (WEB_PROVIDER_AMBIGUOUS) instead of guessing.
 # 2. Enable the model-facing web_fetch tool with a browser-realistic budget
 #    (launch + render + denoise takes longer than a plain HTTP GET; 60s
 #    matches the deployment's search budget). `disabled: false` re-enables
@@ -16,7 +22,6 @@
 # ('web-fetch-playwright') layering over the row config is hot-reloaded.
 - id: web
   config:
-    searchProvider: deepseek-official
     fetchProvider: playwright
 
 - id: tool-web
