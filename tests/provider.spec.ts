@@ -4,13 +4,15 @@
  * queue (gated sessions), the CDP context modes (profile closing only its
  * tab, isolated closing page + context, abort leaving the shared default
  * context intact, the popup guard), plus one real-socket case for the CDP
- * connect failure path.
+ * connect failure path — and the bounded Cloudflare-challenge wait (A/B
+ * baseline vs feature on, SPA clears, same-page retries, hard blocks,
+ * aborts).
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WebError } from '@deepseek-ai/dsh-web'
 import type { ResolvedConfig } from '../src/config.ts'
 import { CdpConnectionPool } from '../src/cdp-pool.ts'
-import { PlaywrightFetchProvider } from '../src/provider.ts'
+import { PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE } from '../src/provider.ts'
 import type { BrowserSession } from '../src/provider.ts'
 import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage, PlaywrightResponse } from '../src/types.ts'
 
@@ -25,6 +27,24 @@ interface FakePageSpec {
   networkIdleError?: boolean
   /** Never settle `goto` on its own — it rejects when the page closes. */
   hangGoto?: boolean
+  /**
+   * Single-shot challenge goto: 403 + `cf-mitigated: challenge` + the
+   * interstitial HTML, cleared only by the scripted probe behavior below.
+   */
+  challenge?: boolean
+  /**
+   * Ordered goto results — the first `goto` uses [0], later ones repeat the
+   * last entry; a `challenge: true` entry serves the interstitial.
+   */
+  gotoScript?: Array<{ status?: number; contentType?: string; html?: string; textBody?: string; challenge?: boolean }>
+  /** The fake clears its challenge on the Nth probe (evaluate/content read). */
+  clearAfterProbes?: number
+  /** The fake never clears — a challenge only a human (or nothing) passes. */
+  neverClears?: boolean
+  /** A main-frame response emitted through 'response' listeners at clear time. */
+  emitOnClear?: { status?: number; contentType?: string }
+  /** Omit `evaluate` so the provider's probe falls back to content polling. */
+  noEvaluate?: boolean
 }
 
 const ARTICLE_HTML = `<!doctype html><html><head><title>Fake page</title></head><body>
@@ -33,19 +53,85 @@ const ARTICLE_HTML = `<!doctype html><html><head><title>Fake page</title></head>
 <footer>footer noise</footer>
 </body></html>`
 
-function fakeResponse(spec: FakePageSpec): PlaywrightResponse | null {
+/** The interstitial a challenged navigation serves (markers must classify). */
+const CHALLENGE_HTML = `<!doctype html><html lang="en"><head><title>Just a moment...</title></head><body>
+<div class="main-wrapper"><div class="main-content">
+<div id="challenge-stage"><div id="challenge-running">Verifying you are human. This may take a few seconds.</div></div>
+<div class="footer"><div class="footer-inner"><span class="ray-id">Ray ID: FAKE0123456789</span></div></div>
+</div>
+<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1/fake" async></script>
+<script>window._cf_chl_opt = { cvId: 3 };</script>
+</body></html>`
+
+/** Identity token shared by the page's mainFrame and its responses' requests. */
+const mainFrameToken = Symbol('fake-main-frame')
+
+/** A fake page's shared, observable lifecycle state. */
+interface FakePageState {
+  pageClosed: boolean
+  /** How many `goto` calls the page served. */
+  gotos: number
+}
+
+function fakeResponse(spec: FakePageSpec, entry?: NonNullable<FakePageSpec['gotoScript']>[number]): PlaywrightResponse | null {
   if (spec.gotoError !== undefined) return null
+  const challenge = entry?.challenge === true || (entry === undefined && spec.challenge === true)
+  const headers: Record<string, string> = { 'content-type': entry?.contentType ?? spec.contentType ?? 'text/html; charset=utf-8' }
+  if (challenge) headers['cf-mitigated'] = 'challenge'
   return {
-    status: () => spec.status ?? 200,
-    headers: () => ({ 'content-type': spec.contentType ?? 'text/html; charset=utf-8' }),
-    text: async () => spec.textBody ?? '',
+    status: () => entry?.status ?? spec.status ?? (challenge ? 403 : 200),
+    headers: () => headers,
+    text: async () => entry?.textBody ?? spec.textBody ?? '',
+    url: () => spec.finalUrl ?? 'https://final.example.com/docs',
+    request: () => ({
+      isNavigationRequest: () => true,
+      resourceType: () => 'document',
+      frame: () => mainFrameToken,
+    }),
   }
 }
 
 /** Shared page behavior: the members the provider touches, close tracking. */
-function makeFakePage(spec: FakePageSpec, state: { pageClosed: boolean }, popupListeners: Array<(page: PlaywrightPage) => void> = []): PlaywrightPage {
+function makeFakePage(spec: FakePageSpec, state: FakePageState, popupListeners: Array<(page: PlaywrightPage) => void> = []): PlaywrightPage {
   const gotoRejecters: Array<(error: Error) => void> = []
-  return {
+  const responseListeners: Array<(response: PlaywrightResponse) => void> = []
+  const scripted = spec.gotoScript ?? []
+  let reads = 0
+  let cleared = false
+
+  const entryAt = (index: number): NonNullable<FakePageSpec['gotoScript']>[number] | undefined =>
+    scripted.length === 0 ? undefined : scripted[Math.min(index, scripted.length - 1)]
+  const currentEntry = (): NonNullable<FakePageSpec['gotoScript']>[number] | undefined =>
+    entryAt(Math.max(0, state.gotos - 1))
+  const onChallenge = (): boolean => {
+    if (cleared) return false
+    if (spec.neverClears === true) return true
+    const entry = currentEntry()
+    if (entry !== undefined) return entry.challenge === true
+    return spec.challenge === true
+  }
+  /** One probe read of the challenged document; the fake clears at the Nth. */
+  const noteRead = (): void => {
+    if (cleared || !onChallenge() || spec.clearAfterProbes === undefined) return
+    reads++
+    if (reads >= spec.clearAfterProbes) {
+      cleared = true
+      if (spec.emitOnClear !== undefined) {
+        const emit = spec.emitOnClear
+        const headers = { 'content-type': emit.contentType ?? 'text/html; charset=utf-8' }
+        const response: PlaywrightResponse = {
+          status: () => emit.status ?? 200,
+          headers: () => headers,
+          text: async () => '',
+          url: () => spec.finalUrl ?? 'https://final.example.com/docs',
+          request: () => ({ isNavigationRequest: () => true, resourceType: () => 'document', frame: () => mainFrameToken }),
+        }
+        for (const listener of [...responseListeners]) listener(response)
+      }
+    }
+  }
+
+  const page: PlaywrightPage = {
     goto: (): Promise<PlaywrightResponse | null> => {
       // A closed page rejects navigation, like a real Playwright page.
       if (state.pageClosed) return Promise.reject(new Error('Target closed'))
@@ -53,27 +139,43 @@ function makeFakePage(spec: FakePageSpec, state: { pageClosed: boolean }, popupL
       if (spec.hangGoto === true) {
         return new Promise((_resolve, reject) => { gotoRejecters.push(reject) })
       }
-      return Promise.resolve(fakeResponse(spec))
+      const entry = entryAt(state.gotos)
+      state.gotos++
+      return Promise.resolve(fakeResponse(spec, entry))
     },
     waitForLoadState: async () => {
       if (spec.networkIdleError === true) throw new Error('networkidle timeout')
     },
     url: () => spec.finalUrl ?? 'https://final.example.com/docs',
-    content: async () => spec.html ?? ARTICLE_HTML,
+    content: async () => {
+      noteRead()
+      if (onChallenge()) return CHALLENGE_HTML
+      return currentEntry()?.html ?? spec.html ?? ARTICLE_HTML
+    },
     close: async () => {
       state.pageClosed = true
       for (const reject of gotoRejecters.splice(0)) reject(new Error('Target closed'))
     },
     route: async () => {},
-    on: (event: 'popup', listener: (page: PlaywrightPage) => void) => {
-      if (event === 'popup') popupListeners.push(listener)
+    on: (event: 'popup' | 'response', listener: ((page: PlaywrightPage) => void) | ((response: PlaywrightResponse) => void)) => {
+      if (event === 'popup') popupListeners.push(listener as (page: PlaywrightPage) => void)
+      else responseListeners.push(listener as (response: PlaywrightResponse) => void)
     },
+    ...(spec.noEvaluate === true ? {} : {
+      evaluate: async (): Promise<unknown> => {
+        noteRead()
+        return onChallenge()
+      },
+    }),
+    mainFrame: () => mainFrameToken,
   }
+  return page
 }
 
 function fakeSession(spec: FakePageSpec): BrowserSession {
-  const closed = { pageClosed: false, context: false, browser: false }
-  const page = makeFakePage(spec, closed)
+  const pageState: FakePageState = { pageClosed: false, gotos: 0 }
+  const closed = { context: false, browser: false }
+  const page = makeFakePage(spec, pageState)
   const context: PlaywrightContext = {
     newPage: async () => page,
     route: async () => {},
@@ -83,12 +185,22 @@ function fakeSession(spec: FakePageSpec): BrowserSession {
     newContext: async () => context,
     close: async () => { closed.browser = true },
   }
-  return { browser, context, page, closed } as unknown as BrowserSession & typeof closed
+  return {
+    browser,
+    context,
+    page,
+    closed: {
+      get pageClosed() { return pageState.pageClosed },
+      get gotos() { return pageState.gotos },
+      get context() { return closed.context },
+      get browser() { return closed.browser },
+    },
+  } as unknown as BrowserSession & { closed: { pageClosed: boolean; context: boolean; browser: boolean; gotos: number } }
 }
 
 /** The provider under test: a fixed config and an injected fake session. */
 class FakeProvider extends PlaywrightFetchProvider {
-  /** The session the last fetch ran in (closed flags ride on it). */
+  /** The session the last fetch ran in (counters ride on it). */
   lastSession: BrowserSession | undefined
 
   constructor(config: Partial<ResolvedConfig> = {}, private readonly spec: FakePageSpec = {}) {
@@ -99,6 +211,9 @@ class FakeProvider extends PlaywrightFetchProvider {
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      // Legacy default: the challenge path stays off unless a test opts in.
+      challengeWaitMs: 0,
+      challengeRetries: 0,
       ...config,
     }))
   }
@@ -126,6 +241,8 @@ class GatedProvider extends PlaywrightFetchProvider {
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
       ...config,
     }))
   }
@@ -167,7 +284,7 @@ function fakeCdpConnection(spec: FakePageSpec = {}) {
   }
   const makePage = (): PlaywrightPage => {
     state.pagesOpened++
-    const pageState = { pageClosed: false }
+    const pageState = { pageClosed: false, gotos: 0 }
     const page = makeFakePage(spec, pageState, state.popupListeners)
     const base = page.close.bind(page)
     return {
@@ -386,6 +503,8 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       cdpEndpoint: '',
       shareBrowserContext: false,
       denoise: true,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
     }), pool)
 
     const first = await provider.fetch({ url: 'https://example.com/a' })
@@ -414,6 +533,8 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       cdpEndpoint: '',
       shareBrowserContext: false,
       denoise: true,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
     }), pool)
 
     const results = await Promise.all(Array.from({ length: 50 }, (_, i) =>
@@ -434,6 +555,8 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       cdpEndpoint: '',
       shareBrowserContext: true,
       denoise: true,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
     }), pool)
 
     const first = await provider.fetch({ url: 'https://example.com/a' })
@@ -464,6 +587,8 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       cdpEndpoint: '',
       shareBrowserContext: true,
       denoise: true,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
     }), pool)
 
     const results = await Promise.all(Array.from({ length: 12 }, (_, i) =>
@@ -483,6 +608,8 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       cdpEndpoint: '',
       shareBrowserContext: true,
       denoise: true,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
     }), pool)
 
     const controller = new AbortController()
@@ -508,12 +635,14 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       cdpEndpoint: '',
       shareBrowserContext: true,
       denoise: true,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
     }), pool)
 
     await provider.fetch({ url: 'https://example.com/popup-spawner' })
     expect(state.popupListeners.length).toBeGreaterThan(0) // the guard attached
 
-    const popupState = { pageClosed: false }
+    const popupState = { pageClosed: false, gotos: 0 }
     const popup = makeFakePage({}, popupState)
     for (const listener of state.popupListeners) listener(popup) // page spawned a popup
     expect(popupState.pageClosed).toBe(true)
@@ -535,11 +664,152 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       cdpEndpoint: '127.0.0.1:1',
       shareBrowserContext: true,
       denoise: true,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
     }))
     // Real bundled playwright-core; port 1 refuses connections immediately.
     const error = await provider.fetch({ url: 'https://example.com/x' }).then(() => { throw new Error('expected rejection') }, (e: unknown) => e)
     expect(error).toBeInstanceOf(WebError)
     expect((error as WebError).code).toBe('WEB_PROVIDER_ERROR')
     expect((error as WebError).message).toContain('127.0.0.1:1')
+  })
+})
+
+/** The bounded Cloudflare-challenge wait, end to end over the fake page. */
+describe('PlaywrightFetchProvider cloudflare challenge wait', () => {
+  /** Read the page-under-test's lifecycle counters off the last session. */
+  function counters(provider: FakeProvider): { pageClosed: boolean; gotos: number } {
+    return (provider.lastSession as unknown as { closed: { pageClosed: boolean; gotos: number } }).closed
+  }
+
+  function bodyOf(result: { body: { kind: string; content: string } }): string {
+    return result.body.content
+  }
+
+  it('A1 baseline (challengeWaitMs 0): the interstitial comes back as content — the 0.2.4 behavior', async () => {
+    const provider = new FakeProvider({ challengeWaitMs: 0 }, { challenge: true, neverClears: true })
+    const result = await provider.fetch({ url: 'https://example.com/guarded' })
+    expect(result.statusCode).toBe(403)
+    expect(bodyOf(result)).toMatch(/just a moment/i)
+    expect(bodyOf(result)).not.toContain('World')
+    expect(counters(provider).gotos).toBe(1)
+  })
+
+  it('A2 feature on: waits past the clear, reads the reloaded document, and reports the tracked response status', async () => {
+    const provider = new FakeProvider({ challengeWaitMs: 3_000 }, {
+      challenge: true,
+      clearAfterProbes: 3,
+      // The natural verification reloads the same URL — the tracker must
+      // hand the provider THIS response, not the 403 it started from.
+      emitOnClear: { status: 200 },
+    })
+    const result = await provider.fetch({ url: 'https://example.com/guarded' })
+    expect(result.statusCode).toBe(200)
+    expect(result.body.kind).toBe('text')
+    expect(bodyOf(result)).toMatch(/^# (Fake page|Hello)\b/m)
+    expect(bodyOf(result)).toContain('World')
+    expect(counters(provider).gotos).toBe(1) // same page the whole time
+  })
+
+  it('A3 never clears: fails as WEB_FETCH_CHALLENGE within the bounded window, no slot leak', async () => {
+    const provider = new FakeProvider({ challengeWaitMs: 60, challengeRetries: 0 }, { challenge: true, neverClears: true })
+    const started = Date.now()
+    const error = await provider.fetch({ url: 'https://example.com/hard' }).then(() => { throw new Error('expected rejection') }, (e: unknown) => e)
+    expect(error).toBeInstanceOf(WebError)
+    expect((error as WebError).code).toBe(WEB_FETCH_CHALLENGE_CODE)
+    expect((error as WebError).message).toContain('Cloudflare')
+    // Bounded: one wait window, far short of the fetch deadline.
+    expect(Date.now() - started).toBeLessThan(5_000)
+    // The session still closed — the concurrency slot is not held hostage.
+    expect(counters(provider).pageClosed).toBe(true)
+  })
+
+  it('A4 first window runs out, one same-page retry lands on the cleared document', async () => {
+    const provider = new FakeProvider({ challengeWaitMs: 80, challengeRetries: 1 }, {
+      gotoScript: [{ challenge: true }, { status: 200 }],
+    })
+    const result = await provider.fetch({ url: 'https://example.com/guarded' })
+    expect(result.statusCode).toBe(200)
+    expect(bodyOf(result)).toContain('World')
+    // The retry re-navigated the SAME page (only one page ever existed).
+    expect(counters(provider).gotos).toBe(2)
+  })
+
+  it('A5 a hard block fails immediately with WEB_FETCH_CHALLENGE instead of burning the wait', async () => {
+    // Real hard blocks ship 403 from the Cloudflare edge (no cf-mitigated —
+    // that header marks challenges, not blocks), which is what opens the
+    // suspicion gate for the content-level blocked-page classification.
+    const provider = new FakeProvider({ challengeWaitMs: 10_000 }, {
+      status: 403,
+      html: '<!doctype html><html><head><title>Attention Required! | Cloudflare</title></head><body><h1 class="cf-headline">Sorry, you have been blocked</h1></body></html>',
+    })
+    const started = Date.now()
+    const error = await provider.fetch({ url: 'https://example.com/blocked' }).then(() => { throw new Error('expected rejection') }, (e: unknown) => e)
+    expect(error).toBeInstanceOf(WebError)
+    expect((error as WebError).code).toBe(WEB_FETCH_CHALLENGE_CODE)
+    expect((error as WebError).message).toContain('hard-blocked')
+    expect(Date.now() - started).toBeLessThan(2_000)
+  })
+
+  it('A6 an outer abort during the wait maps to WEB_ABORTED and closes the page', async () => {
+    const provider = new FakeProvider({ challengeWaitMs: 10_000 }, { challenge: true, neverClears: true })
+    const controller = new AbortController()
+    const pending = provider.fetch({ url: 'https://example.com/guarded' }, controller.signal)
+      .then(() => { throw new Error('expected rejection') }, (error: unknown) => error)
+    await new Promise(resolve => { setImmediate(resolve) }) // reaches the wait loop
+    controller.abort()
+    const error = await pending
+    expect(error).toBeInstanceOf(WebError)
+    expect((error as WebError).code).toBe('WEB_ABORTED')
+    expect(counters(provider).pageClosed).toBe(true)
+  })
+
+  it('A7 SPA clear (no navigation, no new response): the DOM probe sees the swap and the result reads 200', async () => {
+    const provider = new FakeProvider({ challengeWaitMs: 3_000 }, { challenge: true, clearAfterProbes: 3 })
+    const result = await provider.fetch({ url: 'https://example.com/spa-guarded' })
+    expect(result.statusCode).toBe(200)
+    expect(bodyOf(result)).toContain('World')
+    expect(counters(provider).gotos).toBe(1)
+  })
+
+  it('A8 no evaluate on the page: the probe falls back to content polling and still clears', async () => {
+    const provider = new FakeProvider({ challengeWaitMs: 3_000 }, { challenge: true, clearAfterProbes: 3, noEvaluate: true })
+    const result = await provider.fetch({ url: 'https://example.com/guarded' })
+    expect(result.statusCode).toBe(200)
+    expect(bodyOf(result)).toContain('World')
+  })
+
+  it('A9 no false kill: a plain-200 article that merely looks challenge-ish is returned untouched', async () => {
+    // The suspicion gate: content markers only run on challenge-compatible
+    // responses (403/429/503 or a Cloudflare edge), so an ordinary 200
+    // article — even one whose TITLE reads "Just a moment" — never enters
+    // the challenge path, waits nothing, and fails nothing.
+    const provider = new FakeProvider({ challengeWaitMs: 5_000 }, {
+      status: 200,
+      html: `<!doctype html><html><head><title>Just a moment</title></head><body>
+<main><article><h1>Not a challenge</h1><p>An essay about waiting screens; enough words for the article scorer to lock onto the main region here.</p><p>A second paragraph.</p></article></main>
+</body></html>`,
+    })
+    const result = await provider.fetch({ url: 'https://example.com/blog-about-waiting' })
+    expect(result.statusCode).toBe(200)
+    expect(bodyOf(result)).toContain('Not a challenge')
+    expect(counters(provider).gotos).toBe(1)
+  })
+
+  it('A10 chained rounds: a clear that lands on another interstitial consumes a retry and still lands the article', async () => {
+    // Round 1 "clears" into a second interstitial (JS test → Turnstile
+    // interstitial chains); the settled-DOM recheck catches it, the
+    // same-page retry (with its earned cookies) then gets the document.
+    const provider = new FakeProvider({ challengeWaitMs: 3_000, challengeRetries: 1 }, {
+      clearAfterProbes: 2,
+      gotoScript: [
+        { challenge: true, html: CHALLENGE_HTML }, // after the probe clears, the DOM still shows a challenge
+        { status: 200 },
+      ],
+    })
+    const result = await provider.fetch({ url: 'https://example.com/chained' })
+    expect(result.statusCode).toBe(200)
+    expect(bodyOf(result)).toContain('World')
+    expect(counters(provider).gotos).toBe(2)
   })
 })

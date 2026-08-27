@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-08-25
+
+### Added
+
+- **Bounded Cloudflare-challenge wait** (issue #2): when a navigation lands on a challenge interstitial, the fetch now keeps the **same page and browser context** and waits for the browser's own verification to clear it, instead of returning the interstitial as content (the behavior before this release — with a strict site that meant "Just a moment…" as markdown within ~1s, the real article never captured even though the browser would have passed the check seconds later).
+  - Detection is layered with a suspicion gate: the documented `cf-mitigated: challenge` response header (set on every challenge page type), then 403/503 HTML from a `server: cloudflare` edge, then content-level markers — the localized interstitial title family ("Just a moment...", "请稍候…", "Минутку…", …) plus structural markers (`/cdn-cgi/challenge-platform/` scripts, `#challenge-*` elements, `cf-chl-widget-` frames, `window._cf_chl_opt`, the `.footer .footer-inner .ray-id` footer). Markers are attribute/assignment-shaped so an article that merely quotes them stays clean, and the content tier only runs on challenge-compatible responses (`isChallengeCompatibleResponse`: 403/429/503, or `server: cloudflare` / `cf-ray` present) — interstitials never ship a plain 200, so a normal article cannot be misread as a challenge (and normal fetches skip the extra content read entirely). Hard-block pages ("Attention Required!", "you have been blocked" + a `cf-headline`/`cf-error-details` layout) classify separately and fail immediately.
+  - During the wait the provider tracks the **last main-frame navigation response** (the real page reloads in after the clear) and probes the live DOM every 500ms, so SPA-style clears (content swapped with no navigation) are captured too; a probe that throws mid-navigation (context destroyed) counts as "still challenged". A clear that lands on a *chained* round (JS test → Turnstile interstitial) is caught by a settled-DOM recheck — content-level, deliberately, so SPA clears whose response stays 403 forever still pass — and consumes one of the retries.
+  - Knobs: `challengeWaitMs` (0–60000, default 15000; **0 disables the whole path and restores the exact pre-0.2.5 behavior**) and `challengeRetries` (0–3, default 1 — a same-tab re-navigation whose context keeps any clearance cookies the browser earned). Everything stays inside the 45s per-fetch deadline with a finish reserve; on exhaustion the fetch fails with the new provider-specific `WEB_FETCH_CHALLENGE` code (the web seam's open-string `code` tolerates provider codes) naming the site, budget, and last challenge status.
+  - Cookie lifecycle is unchanged by design: isolated fetches' clearance dies with their context (verified: a second isolated fetch is challenged again), profile-mode clearance stays in the remote browser's own profile (verified: a second profile fetch skips the challenge); nothing is exported, copied, or manufactured. No clicking, no CAPTCHA answers, no fingerprint spoofing.
+  - Settings card gains a *Cloudflare challenge wait (ms)* number field; `scripts/challenge-demo.mjs` runs a local simulated strict edge through the baseline and the feature for a before/after printout.
+- New exports: `classifyChallengeResponse`, `classifyChallengeHtml`, `isChallengeCompatibleResponse`, `CHALLENGE_DOM_PROBE`, `CHALLENGE_TITLE_RE`, `CHALLENGE_POLL_INTERVAL_MS`, `CHALLENGE_FINISH_RESERVE_MS`, `WEB_FETCH_CHALLENGE_CODE`, `DEFAULT_CHALLENGE_WAIT_MS`, `DEFAULT_CHALLENGE_RETRIES`, `effectiveChallengeWaitMs`, `effectiveChallengeRetries`, and the `ChallengeVerdict` type.
+
 ## [0.2.4] - 2026-08-25
 
 ### Fixed

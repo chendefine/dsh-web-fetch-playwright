@@ -22,20 +22,43 @@
  * browser can reach. Profile mode additionally acts WITH the remote
  * browser's logged-in sessions (see the README's risk notes).
  *
+ * Cloudflare challenges (issue #2): when a navigation lands on a challenge
+ * interstitial, the fetch waits — on the SAME page and in the SAME browser
+ * context, so the browser's natural verification and any clearance cookies
+ * it earns apply — for a bounded, configurable window
+ * (`challengeWaitMs`, default 15s; 0 restores the legacy first-response
+ * behavior). The wait tracks the LAST main-frame navigation response (the
+ * real page reloads in after the challenge clears) and watches the live DOM
+ * so SPA-style clears are caught too. It never clicks, never injects
+ * answers, never touches cookies itself; when the budget runs out the fetch
+ * fails with {@link WEB_FETCH_CHALLENGE_CODE} instead of returning the
+ * interstitial as content.
+ *
  * @module dsh-web-fetch-playwright/provider
  */
 
 import { WebError } from '@deepseek-ai/dsh-web'
 import type { WebFetchProvider, WebFetchRequest, WebFetchResult } from '@deepseek-ai/dsh-web'
-import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, effectiveContextMode, effectiveMaxConcurrency, normalizeCdpEndpoint } from './config.ts'
+import { CHALLENGE_DOM_PROBE, CHALLENGE_FINISH_RESERVE_MS, CHALLENGE_POLL_INTERVAL_MS, classifyChallengeHtml, classifyChallengeResponse, isChallengeCompatibleResponse } from './challenge.ts'
+import type { ChallengeVerdict } from './challenge.ts'
+import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveMaxConcurrency, normalizeCdpEndpoint } from './config.ts'
 import type { ResolvedConfig } from './config.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
 import { htmlToMarkdown } from './markdown.ts'
 import { resolveCdpBackend, resolvePlaywrightBackend } from './playwright-resolve.ts'
-import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage, PlaywrightRoute } from './types.ts'
+import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage, PlaywrightResponse, PlaywrightRoute } from './types.ts'
 
 /** Stable id this provider registers under (the bundle patch pins it). */
 export const PLAYWRIGHT_FETCH_PROVIDER_ID = 'playwright'
+
+/**
+ * Error code for a Cloudflare challenge the bounded natural wait could not
+ * clear. Provider-specific by design — the web seam's `code` is an open
+ * string and consumers must tolerate provider-specific codes — so callers
+ * can tell "the site challenged us and the browser did not pass" apart from
+ * a transport timeout or a provider bug.
+ */
+export const WEB_FETCH_CHALLENGE_CODE = 'WEB_FETCH_CHALLENGE'
 
 /** Maximum accepted request URL length (http-provider parity). */
 const MAX_URL_LENGTH = 2048
@@ -378,7 +401,11 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     }
   }
 
-  /** Navigate, settle, and decode one URL inside an open session's tab. */
+  /**
+   * Navigate, settle, and decode one URL inside an open session's tab —
+   * waiting out any Cloudflare interstitial within the bounded challenge
+   * budget before the final document is read (see the class docs).
+   */
   private async retrieve(
     session: BrowserSession,
     url: URL,
@@ -386,18 +413,70 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     deadline: Deadline,
   ): Promise<WebFetchResult> {
     const page = session.page
-    const response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: deadline.remainingMs() })
+    const challengeWaitMs = effectiveChallengeWaitMs(config)
+    // Feature switch: 0 keeps the exact legacy (pre-0.2.5) behavior — the
+    // first response decides, no waiting — an escape hatch and the A/B
+    // baseline every test proves the bug against.
+    const tracker = challengeWaitMs > 0 ? trackMainFrameResponses(page) : undefined
+    let response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: deadline.remainingMs() })
+    tracker?.seed(response)
 
-    const kind = classifyContentType(response?.headers()['content-type'])
+    let challengeEntryResponse: PlaywrightResponse | null = null
+    if (challengeWaitMs > 0) {
+      let attemptsLeft = effectiveChallengeRetries(config) + 1
+      for (;;) {
+        const verdict = await this.verdictAfterLoad(page, tracker?.last() ?? response)
+        if (verdict === 'blocked') {
+          throw new WebError(
+            `the site hard-blocked this fetch at its Cloudflare edge (waiting cannot clear it): ${page.url()}`,
+            WEB_FETCH_CHALLENGE_CODE,
+          )
+        }
+        if (verdict !== 'challenge') break
+        challengeEntryResponse = tracker?.last() ?? response
+        const cleared = await this.waitForChallengeClear(page, deadline, challengeWaitMs)
+        if (cleared) {
+          // The settled document may be the next round of a CHAINED
+          // challenge (JS test → Turnstile interstitial): the probe can
+          // clear in the gap between rounds, so confirm on the settled
+          // DOM. Deliberately content-level — an SPA clear keeps the 403
+          // challenge response forever and must still pass here.
+          let chained = false
+          try { chained = classifyChallengeHtml(await page.content()) === 'challenge' } catch { chained = false }
+          if (!chained) break
+        }
+        if (--attemptsLeft <= 0) {
+          const lastStatus = (tracker?.last() ?? response)?.status()
+          throw new WebError(
+            `the site kept serving a Cloudflare challenge (last status ${lastStatus === undefined ? 'unknown' : String(lastStatus)}) for up to ${String(challengeWaitMs)}ms across ${String(effectiveChallengeRetries(config) + 1)} attempt(s); the browser did not clear it naturally — retry later, raise challengeWaitMs, or use a profile whose browser already holds clearance`,
+            WEB_FETCH_CHALLENGE_CODE,
+          )
+        }
+        // Same page, same context — after an expired window OR a chained
+        // round: any clearance cookies already earned stay in the jar for
+        // this one retry, then everything is torn down as usual.
+        response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: deadline.remainingMs() })
+        tracker?.seed(response)
+      }
+    }
+
+    // Final document: the LAST main-frame response when the challenge wait
+    // ran (the real page reloads in), else the response goto returned.
+    const finalResponse = (challengeWaitMs > 0 ? tracker?.last() : undefined) ?? response
+    const kind = classifyContentType(finalResponse?.headers()['content-type'])
     if (kind === undefined) {
-      throw new WebError(`unsupported content type "${response?.headers()['content-type'] ?? 'unknown'}"`, 'WEB_UNSUPPORTED_CONTENT_TYPE')
+      throw new WebError(`unsupported content type "${finalResponse?.headers()['content-type'] ?? 'unknown'}"`, 'WEB_UNSUPPORTED_CONTENT_TYPE')
     }
     const finalUrl = page.url()
+    // An SPA-style clear swaps the document without navigating: no new
+    // response exists to report, so the cleared document reads as served.
+    const clearedWithoutNavigation = challengeEntryResponse !== null && finalResponse === challengeEntryResponse
+    const statusCode = finalResponse !== null && !clearedWithoutNavigation ? finalResponse.status() : 200
 
     // Non-HTML decodes straight from the response body; no denoise applies.
     if (kind === 'text') {
-      const text = response !== null ? await response.text() : await page.content()
-      return capResult(finalUrl, response?.status() ?? 200, { kind: 'text', content: text })
+      const text = finalResponse !== null ? await finalResponse.text() : await page.content()
+      return capResult(finalUrl, statusCode, { kind: 'text', content: text })
     }
 
     // Best-effort settle for client-rendered content; a timeout just keeps
@@ -408,14 +487,148 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     if (!config.denoise) {
       // The tool layer's own turndown renders raw HTML; the checkbox only
       // governs the Readability/DOMPurify stage this provider owns.
-      return capResult(finalUrl, response?.status() ?? 200, { kind: 'html', content: html })
+      return capResult(finalUrl, statusCode, { kind: 'html', content: html })
     }
     const bounded = html.length > MAX_PIPELINE_INPUT_CHARS ? html.slice(0, MAX_PIPELINE_INPUT_CHARS) : html
     const { markdown } = htmlToMarkdown(bounded, finalUrl)
-    const result = capResult(finalUrl, response?.status() ?? 200, { kind: 'text', content: markdown })
+    const result = capResult(finalUrl, statusCode, { kind: 'text', content: markdown })
     return bounded !== html
       ? { ...result, truncated: true }
       : result
+  }
+
+  /**
+   * Whether the freshly loaded document is a Cloudflare interstitial: the
+   * response-level signals first (the documented `cf-mitigated` header, then
+   * the 403/503 + cloudflare fallback), then — gated behind
+   * {@link isChallengeCompatibleResponse}, because interstitials never ship
+   * a plain 200 — the localized title family and structural markers, which
+   * also recognize the hard-block page waiting can never clear.
+   */
+  private async verdictAfterLoad(page: PlaywrightPage, response: PlaywrightResponse | null): Promise<ChallengeVerdict> {
+    if (response !== null && classifyChallengeResponse(response.status(), response.headers()) === 'challenge') return 'challenge'
+    // Suspicion gate: the content-level fallback only runs on a
+    // challenge-compatible response, so a normal article cannot be misread
+    // as a challenge no matter what it quotes. A response-less navigation
+    // keeps the check — its headers are simply unavailable.
+    if (response !== null && !isChallengeCompatibleResponse(response.status(), response.headers())) return 'none'
+    // Only HTML documents can be interstitials; classifyContentType already
+    // reads a missing content type as html (a response-less navigation).
+    if (response === null || classifyContentType(response.headers()['content-type']) === 'html') {
+      try {
+        return classifyChallengeHtml(await page.content())
+      } catch {
+        return 'none' // a document we cannot read is not a challenge we can wait on
+      }
+    }
+    return 'none'
+  }
+
+  /**
+   * The bounded natural wait: poll the live document for challenge markers
+   * until they are gone (the user's real browser passed the verification and
+   * reloaded into the real page, or swapped it in SPA-style), the per-fetch
+   * wait budget runs out, or the fetch's deadline aborts. No clicks, no
+   * injected answers — the browser either clears it on its own or it does not.
+   *
+   * @returns true when the challenge cleared; false when the budget ran out.
+   */
+  private async waitForChallengeClear(page: PlaywrightPage, deadline: Deadline, challengeWaitMs: number): Promise<boolean> {
+    // Keep the settle + decode tail inside the fetch budget: never spend the
+    // whole deadline waiting only to time out reading the cleared page.
+    const budget = Math.min(challengeWaitMs, deadline.remainingMs() - CHALLENGE_FINISH_RESERVE_MS)
+    if (budget <= 0) return false
+    const until = Date.now() + budget
+    for (;;) {
+      if (deadline.signal.aborted) throw new Error('challenge wait aborted')
+      if (await probeStillOnChallenge(page)) {
+        const remaining = until - Date.now()
+        if (remaining <= 0) return false
+        await sleep(Math.min(CHALLENGE_POLL_INTERVAL_MS, remaining))
+        continue
+      }
+      // Markers gone: let the fresh document reach domcontentloaded before
+      // the caller reads it (the reload may still be committing).
+      await page.waitForLoadState('domcontentloaded', { timeout: Math.min(deadline.remainingMs(), 2_000) }).catch(() => {})
+      return true
+    }
+  }
+}
+
+/** Resolve after `ms` — the bounded wait's inter-poll nap. */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => { setTimeout(resolve, ms) })
+}
+
+/**
+ * Whether a response event belongs to the page's main frame as a document
+ * navigation — the filter the challenge wait uses to keep the LAST such
+ * response (challenge pages reload the same URL into the real document).
+ * Structural members are optional; when the backend does not expose them the
+ * check degrades to "looks like a document" so fakes stay usable.
+ */
+function isMainFrameDocument(response: PlaywrightResponse, page: PlaywrightPage): boolean {
+  const request = response.request?.()
+  if (request === undefined) return true
+  if (typeof request.isNavigationRequest === 'function' && !request.isNavigationRequest()) return false
+  const resourceType = typeof request.resourceType === 'function' ? request.resourceType() : undefined
+  if (resourceType !== undefined && resourceType !== 'document') return false
+  if (typeof request.frame === 'function' && typeof page.mainFrame === 'function') {
+    return request.frame() === page.mainFrame()
+  }
+  return true
+}
+
+/** The running record of the last main-frame navigation response. */
+interface MainFrameTracker {
+  /** The most recent main-frame navigation response seen, if any. */
+  last(): PlaywrightResponse | null
+  /** Pin the tracker to a goto's return (it is that navigation's response). */
+  seed(response: PlaywrightResponse | null): void
+}
+
+/**
+ * Watch the page for main-frame navigation responses so a challenge that
+ * reloads into the real document hands the caller THAT response — status,
+ * headers — instead of the challenge's. Best-effort: a page without the
+ * listener falls back to SPA-style content polling only.
+ */
+function trackMainFrameResponses(page: PlaywrightPage): MainFrameTracker {
+  let last: PlaywrightResponse | null = null
+  try {
+    page.on?.('response', (response) => {
+      if (isMainFrameDocument(response, page)) last = response
+    })
+  } catch {
+    // keep going without response tracking
+  }
+  return {
+    last: () => last,
+    seed: (response) => { if (response !== null) last = response },
+  }
+}
+
+/**
+ * Probe the live document for challenge markers. Prefers the in-page probe
+ * (`page.evaluate`) — the only thing that can see SPA-style clears — and
+ * falls back to reading and classifying the serialized HTML when the backend
+ * does not expose evaluate. A probe that throws mid-navigation (execution
+ * context destroyed while the challenge reloads) counts as "still on the
+ * challenge": the next poll sees the fresh document.
+ */
+async function probeStillOnChallenge(page: PlaywrightPage): Promise<boolean> {
+  if (typeof page.evaluate === 'function') {
+    try {
+      const verdict = await page.evaluate(CHALLENGE_DOM_PROBE)
+      if (typeof verdict === 'boolean') return verdict
+    } catch {
+      // fall through to the content check
+    }
+  }
+  try {
+    return classifyChallengeHtml(await page.content()) !== 'none'
+  } catch {
+    return true
   }
 }
 

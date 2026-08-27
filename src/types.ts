@@ -13,6 +13,23 @@ export interface PlaywrightResponse {
   status(): number
   headers(): Record<string, string>
   text(): Promise<string>
+  /** This response's URL; absent on minimal fakes. */
+  url?(): string
+  /**
+   * The request this response answers — used to recognize main-frame
+   * navigation responses while the challenge wait runs. Absent on fakes.
+   */
+  request?(): PlaywrightRequest
+}
+
+/** The request side of a response, for main-frame filtering. */
+export interface PlaywrightRequest {
+  /** True for navigations (document loads and their redirect hops). */
+  isNavigationRequest?(): boolean
+  /** `'document'` for frame navigations; absent on minimal fakes. */
+  resourceType?(): string
+  /** The frame that issued the request; compare with `page.mainFrame()`. */
+  frame?(): unknown
 }
 
 /** A page inside a context. */
@@ -29,6 +46,19 @@ export interface PlaywrightPage {
   route(glob: string, handler: (route: PlaywrightRoute) => Promise<void>): Promise<void>
   /** Popup notification; the fetch closes whatever its page spawns. */
   on?(event: 'popup', listener: (page: PlaywrightPage) => void): unknown
+  /**
+   * Response notification — the challenge wait uses it to track the LAST
+   * main-frame navigation response (challenge pages reload into the real
+   * document). Absent on minimal fakes (content polling covers them).
+   */
+  on?(event: 'response', listener: (response: PlaywrightResponse) => void): unknown
+  /**
+   * Evaluate an expression in the page — the challenge probe's live-DOM
+   * path. Absent on minimal fakes (content polling covers them).
+   */
+  evaluate?(script: string, arg?: unknown): Promise<unknown>
+  /** The main frame handle; compare with `request.frame()` for filtering. */
+  mainFrame?(): unknown
 }
 
 /**

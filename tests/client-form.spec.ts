@@ -55,7 +55,7 @@ class FakeScope implements SettingsScope<Record<string, unknown>> {
   }
 }
 
-/** The card's field set: backend radio, two text inputs, two checkboxes, one number. */
+/** The card's field set: backend radio, two text inputs, two checkboxes, two numbers. */
 function makeForm(scope: SettingsScope<Record<string, unknown>>) {
   return new CardForm(scope, [
     radioField('backend', ['local', 'cdp']),
@@ -63,6 +63,7 @@ function makeForm(scope: SettingsScope<Record<string, unknown>>) {
     checkboxField('shareBrowserContext'),
     checkboxField('denoise'),
     numberField('maxConcurrency', 1, 8),
+    numberField('challengeWaitMs', 0, 60_000),
   ])
 }
 
@@ -188,6 +189,26 @@ describe('CardForm', () => {
       expect(form.field('maxConcurrency').invalid, bad).toBe(true)
       expect(form.shell().invalid, bad).toBe(true)
     }
+    form.actions().discard()
+  })
+
+  it('the challenge-wait field round-trips its millisecond range, 0 included', async () => {
+    const scope = new FakeScope({ challengeWaitMs: 15_000 })
+    const form = makeForm(scope)
+    expect(form.field('challengeWaitMs').text).toBe('15000')
+    form.actions().edit('challengeWaitMs', '20000')
+    expect(form.field('challengeWaitMs').invalid).toBe(false)
+    form.actions().edit('challengeWaitMs', '0') // 0 is the feature-off value, not invalid
+    expect(form.field('challengeWaitMs').invalid).toBe(false)
+    await form.save()
+    expect(scope.writes).toEqual([{ field: 'challengeWaitMs', op: 'set', value: 0 }])
+    form.actions().edit('challengeWaitMs', '')
+    await form.save()
+    expect(scope.writes[scope.writes.length - 1]).toEqual({ field: 'challengeWaitMs', op: 'unset' })
+    // Out of range blocks the save like any number field.
+    form.actions().edit('challengeWaitMs', '60001')
+    expect(form.field('challengeWaitMs').invalid).toBe(true)
+    expect(form.shell().invalid).toBe(true)
     form.actions().discard()
   })
 

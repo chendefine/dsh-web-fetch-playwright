@@ -1,14 +1,20 @@
 /**
- * Config schema defaults, the CDP endpoint normalizer, and the
- * backend-dependent concurrency resolution (pure, network-free).
+ * Config schema defaults, the CDP endpoint normalizer, the backend-dependent
+ * concurrency resolution, and the challenge-wait knobs (pure, network-free).
  */
 import { describe, expect, it } from 'vitest'
 import {
   Config,
   DEFAULT_CDP_ENDPOINT,
+  DEFAULT_CHALLENGE_RETRIES,
+  DEFAULT_CHALLENGE_WAIT_MS,
   DEFAULT_MAX_CONCURRENCY_CDP,
   DEFAULT_MAX_CONCURRENCY_LOCAL,
+  MAX_CHALLENGE_RETRIES,
+  MAX_CHALLENGE_WAIT_MS,
   MAX_CONCURRENCY_CEILING,
+  effectiveChallengeRetries,
+  effectiveChallengeWaitMs,
   effectiveContextMode,
   effectiveMaxConcurrency,
   normalizeCdpEndpoint,
@@ -23,11 +29,21 @@ describe('Config', () => {
       cdpEndpoint: '',
       shareBrowserContext: true,
       denoise: true,
+      challengeWaitMs: DEFAULT_CHALLENGE_WAIT_MS,
+      challengeRetries: DEFAULT_CHALLENGE_RETRIES,
     })
   })
 
   it('accepts a full CDP section unchanged', () => {
-    const resolved = Config({ backend: 'cdp', cdpEndpoint: 'browser.lan:9223', shareBrowserContext: false, denoise: false, maxConcurrency: 50 })
+    const resolved = Config({
+      backend: 'cdp',
+      cdpEndpoint: 'browser.lan:9223',
+      shareBrowserContext: false,
+      denoise: false,
+      maxConcurrency: 50,
+      challengeWaitMs: 30_000,
+      challengeRetries: 2,
+    })
     expect(resolved).toEqual({
       backend: 'cdp',
       playwrightPath: '',
@@ -35,6 +51,8 @@ describe('Config', () => {
       shareBrowserContext: false,
       denoise: false,
       maxConcurrency: 50,
+      challengeWaitMs: 30_000,
+      challengeRetries: 2,
     })
   })
 
@@ -44,6 +62,31 @@ describe('Config', () => {
     expect(() => Config({ maxConcurrency: 0 })).toThrow()
     expect(() => Config({ maxConcurrency: MAX_CONCURRENCY_CEILING + 1 })).toThrow()
     expect(() => Config({ maxConcurrency: 2.5 })).toThrow()
+  })
+
+  it('accepts the challenge knobs across their ranges, rejects outside them', () => {
+    expect(Config({ challengeWaitMs: 0 }).challengeWaitMs).toBe(0)
+    expect(Config({ challengeWaitMs: MAX_CHALLENGE_WAIT_MS }).challengeWaitMs).toBe(MAX_CHALLENGE_WAIT_MS)
+    expect(() => Config({ challengeWaitMs: -1 })).toThrow()
+    expect(() => Config({ challengeWaitMs: MAX_CHALLENGE_WAIT_MS + 1 })).toThrow()
+    expect(Config({ challengeRetries: 0 }).challengeRetries).toBe(0)
+    expect(Config({ challengeRetries: MAX_CHALLENGE_RETRIES }).challengeRetries).toBe(MAX_CHALLENGE_RETRIES)
+    expect(() => Config({ challengeRetries: -1 })).toThrow()
+    expect(() => Config({ challengeRetries: MAX_CHALLENGE_RETRIES + 1 })).toThrow()
+  })
+})
+
+describe('effective challenge knobs', () => {
+  it('an explicit wait wins; a missing one falls back to the schema default', () => {
+    expect(effectiveChallengeWaitMs({ challengeWaitMs: 0 })).toBe(0)
+    expect(effectiveChallengeWaitMs({ challengeWaitMs: 7_500 })).toBe(7_500)
+    expect(effectiveChallengeWaitMs({})).toBe(DEFAULT_CHALLENGE_WAIT_MS)
+  })
+
+  it('an explicit retry count wins; a missing one falls back to the schema default', () => {
+    expect(effectiveChallengeRetries({ challengeRetries: 0 })).toBe(0)
+    expect(effectiveChallengeRetries({ challengeRetries: 3 })).toBe(3)
+    expect(effectiveChallengeRetries({})).toBe(DEFAULT_CHALLENGE_RETRIES)
   })
 })
 

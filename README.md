@@ -15,6 +15,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plug
 - **Isolated or profile sessions (CDP)** — every fetch is scoped to exactly one tab. Local launches close their browser per fetch; the CDP backend keeps **one shared connection** to the remote browser and each fetch opens a tab inside it, closed when done. By default that tab lives in the remote browser's **real profile** (its cookies, localStorage, and persistent logins apply — like `playwright-cli open`); unchecking *Share the browser context* switches to a throwaway isolated context per fetch.
 - **Live configuration** — a settings card (设置 → 插件 → 插件配置) edits the backend, context mode, denoise toggle, and concurrency; changes apply to the next fetch without a restart.
 - **Budget-aware** — per-fetch deadline (45s); concurrency is backend-priced (`maxConcurrency`, default 4 local browsers / **50 CDP tabs**; queued fetches fail fast with a retry hint after 20s instead of hanging); image/font/media subrequests aborted; body capped at 100k chars.
+- **Bounded Cloudflare-challenge wait** — when a navigation lands on a challenge interstitial ("Just a moment…" and its localized siblings, recognized via the documented `cf-mitigated: challenge` response header plus structural page markers), the fetch keeps the **same tab and context** and waits for the browser's own verification to clear it — tracking the *last* main-frame response (the real page reloads in) and watching the live DOM so SPA-style clears are caught too. Bounded and configurable (`challengeWaitMs`, default 15s; 0 restores the legacy first-response behavior), with a bounded same-tab retry (`challengeRetries`, default 1). When the budget runs out, the fetch fails with the distinct `WEB_FETCH_CHALLENGE` error code instead of returning the interstitial as content. It never clicks, never injects CAPTCHA answers, never fakes browser state, and never exports or copies cookies.
 
 ## How it works
 
@@ -71,6 +72,8 @@ The settings card (设置 → 插件 → 插件配置 → *Playwright 网页爬�
 | `shareBrowserContext` | `true` | CDP backend only. **Checked (profile mode)**: each fetch is a tab in the remote browser's default context — its real profile — so cookies/localStorage are shared and its persistent logins apply; only the tab closes when the fetch ends. **Unchecked (isolated mode)**: a fresh incognito-like context per fetch, nothing shared. Local backend ignores this field. |
 | `denoise` | `true` | Run the denoise pipeline; off returns the full rendered HTML for the tool layer to convert. |
 | `maxConcurrency` | *(auto)* | How many fetches may render at once (1–200). Blank = backend default: **4** for local (each slot launches a browser) / **50** for CDP (each slot is just a tab in the already-running remote browser). Beyond the limit, fetches wait briefly; if no slot frees within 20s they fail with `WEB_FETCH_TIMEOUT` and a hint to retry or raise this setting, rather than hanging until the tool budget aborts. |
+| `challengeWaitMs` | `15000` | Bounded wait (ms, 0–60000) for a Cloudflare challenge to clear naturally in the same tab. `0` disables the whole challenge path — the first response is returned as-is (the pre-0.2.5 behavior). |
+| `challengeRetries` | `1` | Same-tab re-navigation attempts after a wait window runs out (0–3); any clearance cookies the browser earned stay in the context for the retry. Everything stays inside the 45s per-fetch deadline. |
 
 Local backend resolution order:
 
@@ -97,6 +100,19 @@ google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.config/chrome
 ```
 
 Headless server (pre-seed logins in a headful environment first): `chromium --headless=new --remote-debugging-port=9222 --user-data-dir=/data/chrome-dsh-profile`. Do **not** add `--incognito` or a throwaway user-data-dir — either defeats profile mode. Design notes and verified playwright-core facts live in [`docs/context-mode-profile.md`](./docs/context-mode-profile.md).
+
+### Cloudflare challenge handling (bounded natural wait)
+
+Some strict sites serve a Cloudflare interstitial before the real page. A real browser often passes the check on its own within a few seconds — but a fetch that only looks at the first response hands you the interstitial as if it were the page (the pre-0.2.5 behavior; reproduce it any time with `challengeWaitMs: 0`, or — from a repo checkout, after `pnpm build` — run `node scripts/challenge-demo.mjs` for a local simulated before/after, and `node scripts/challenge-online.mjs <url>` against a real site).
+
+With the wait on (default):
+
+1. **Detection** — a response carrying `cf-mitigated: challenge` (the documented signal for every challenge page type), or a 403/503 HTML document from a `server: cloudflare` edge, or the localized interstitial itself (title family like "Just a moment…", `请稍候…`, "Минутку…", plus structural markers: `/cdn-cgi/challenge-platform/` scripts, `#challenge-*` elements, `cf-chl-widget-` frames, `window._cf_chl_opt`). The content-level markers are the *fallback tier* and only run on challenge-compatible responses — 403/429/503 or a Cloudflare edge (`server: cloudflare` / `cf-ray`) — because interstitials never ship as a plain 200, so an ordinary article that merely quotes challenge text can never be mistaken for one. A hard block ("Sorry, you have been blocked") is classified separately and fails immediately.
+2. **Bounded wait, same tab and context** — the fetch polls the live DOM (500ms interval) for the challenge to disappear while the browser runs its own verification; the *last* main-frame navigation response is tracked so the reloaded real document's status and headers are the ones reported. SPA-style clears (content swapped without any navigation) are caught by the same DOM probe.
+3. **Bounded retry** — when a window runs out, the same tab re-navigates once (default; `challengeRetries`) with whatever clearance cookies the context already holds.
+4. **Clear failure** — `WEB_FETCH_CHALLENGE` (a provider-specific code the web seam's open-string `code` allows) naming the site, the budget spent, and the last challenge status.
+
+Security boundary (deliberate): no clicking through Turnstile, no CAPTCHA solving or token injection, no fingerprint/UA spoofing, no proxy rotation, and no cookie export — in isolated mode the clearance a fetch's browser earns dies with that fetch's context; in profile mode it stays in the remote browser's own profile, which this plugin never copies or cleans. The wait is always bounded by `challengeWaitMs` and the 45s per-fetch deadline; nothing blocks forever.
 
 ## Development
 

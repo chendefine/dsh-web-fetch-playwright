@@ -30,6 +30,23 @@ export const DEFAULT_MAX_CONCURRENCY_CDP = 50
 /** Ceiling the schema accepts for `maxConcurrency` (local slots are browsers). */
 export const MAX_CONCURRENCY_CEILING = 200
 
+/**
+ * Default bounded wait (ms) for a Cloudflare challenge to clear naturally —
+ * the user's real browser passes the verification on its own while the fetch
+ * holds the same page and context. Sized to fit the 45s per-fetch deadline
+ * with the settle/decode tail (and one retry) still inside it.
+ */
+export const DEFAULT_CHALLENGE_WAIT_MS = 15_000
+
+/** Ceiling the schema accepts for `challengeWaitMs`. */
+export const MAX_CHALLENGE_WAIT_MS = 60_000
+
+/** Default same-page re-navigation attempts after a challenge wait runs out. */
+export const DEFAULT_CHALLENGE_RETRIES = 1
+
+/** Ceiling the schema accepts for `challengeRetries`. */
+export const MAX_CHALLENGE_RETRIES = 3
+
 /** Which browser backend serves a fetch. */
 export type PlaywrightBackend = 'local' | 'cdp'
 
@@ -62,6 +79,19 @@ export interface Config {
   /** Whether the Readability + DOMPurify denoise pipeline runs before markdown. */
   denoise?: boolean
   /**
+   * Bounded wait (ms) for a Cloudflare challenge to clear naturally inside
+   * the same page/context. `0` (or any config leaving this at 0) restores the
+   * legacy behavior: the first response is final, no waiting — the A/B
+   * baseline. Schema default: {@link DEFAULT_CHALLENGE_WAIT_MS}.
+   */
+  challengeWaitMs?: number
+  /**
+   * Same-page re-navigation attempts after a challenge wait window runs out
+   * (any partial clearance cookies stay in the context for the retry).
+   * Schema default: {@link DEFAULT_CHALLENGE_RETRIES}.
+   */
+  challengeRetries?: number
+  /**
    * How many fetches may render at once. Blank = backend default (4 for
    * local — each slot launches a browser; 50 for CDP — each slot is a tab in
    * the already-running remote browser).
@@ -81,6 +111,9 @@ export const Config: z<Config> = z.object({
   // Optional on purpose: the effective default depends on `backend`, which a
   // static schema default cannot express.
   maxConcurrency: z.number().step(1).min(1).max(MAX_CONCURRENCY_CEILING),
+  // The bounded natural-wait knobs; 0 disables the whole challenge path.
+  challengeWaitMs: z.number().step(100).min(0).max(MAX_CHALLENGE_WAIT_MS).default(DEFAULT_CHALLENGE_WAIT_MS),
+  challengeRetries: z.number().step(1).min(0).max(MAX_CHALLENGE_RETRIES).default(DEFAULT_CHALLENGE_RETRIES),
 })
 
 /**
@@ -101,6 +134,30 @@ export type ResolvedConfig = Omit<Required<Config>, 'maxConcurrency'> & { maxCon
 export function effectiveMaxConcurrency(config: Pick<Config, 'backend' | 'maxConcurrency'>): number {
   if (typeof config.maxConcurrency === 'number') return config.maxConcurrency
   return config.backend === 'cdp' ? DEFAULT_MAX_CONCURRENCY_CDP : DEFAULT_MAX_CONCURRENCY_LOCAL
+}
+
+/**
+ * The challenge wait budget a fetch actually runs with: an explicit setting
+ * wins, else the schema default. `0` means the challenge path is off.
+ *
+ * @param config - the resolved settings section (or any partial of it).
+ * @returns the bounded wait in milliseconds.
+ */
+export function effectiveChallengeWaitMs(config: Pick<Config, 'challengeWaitMs'>): number {
+  if (typeof config.challengeWaitMs === 'number') return config.challengeWaitMs
+  return DEFAULT_CHALLENGE_WAIT_MS
+}
+
+/**
+ * The same-page retry count a challenge fetch actually runs with: an explicit
+ * setting wins, else the schema default.
+ *
+ * @param config - the resolved settings section (or any partial of it).
+ * @returns retries after a wait window runs out.
+ */
+export function effectiveChallengeRetries(config: Pick<Config, 'challengeRetries'>): number {
+  if (typeof config.challengeRetries === 'number') return config.challengeRetries
+  return DEFAULT_CHALLENGE_RETRIES
 }
 
 /**
