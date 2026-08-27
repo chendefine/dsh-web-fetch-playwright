@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-08-27
+
+### Fixed
+
+- **Windows `$PATH` discovery works** (issue #1): `findOnPath` split `process.env.PATH` on a literal `:`, but Windows joins PATH entries with `;` — the whole variable read as one bogus directory, so auto-discovering a `playwright` executable (blank `playwrightPath`) never found anything and silently fell through to the bundled `playwright-core`. It now splits on Node's `path.delimiter`, and a regression test scans a multi-directory PATH with the probe in a non-first entry (the case both Windows reproducers in the issue hit).
+- **`pnpm build` is cross-platform** (issue #1): the build script cleaned `lib/` with `rm -rf`, which does not exist on Windows PowerShell — `'rm' is not recognized` killed the build before TypeScript declarations or tsdown ever ran, and since `prepare` runs the same script, installing from a git checkout failed on Windows too. The clean step is now `node -e "require('node:fs').rmSync('lib',{recursive:true,force:true})"`, which works everywhere Node does (a follow-up `scripts/clean.mjs` was considered and dropped to keep the pipeline in one place; tsdown's own `clean` cannot replace it — it runs after `tsc` and would delete the declarations just emitted).
+- CI now runs the full check (install, typecheck, test, build) on `windows-latest` alongside `ubuntu-latest`, Node 22/24 — so the PATH-split and build-script regressions above cannot land again unnoticed. The tarball content verification stays Linux-only (`/tmp` + `tar`/`grep` piping); it checks npm packaging, not platform behavior.
+- Known Windows limitation, documented rather than fixed here: npm/pnpm global installs expose `playwright` as `.cmd`/`.ps1` shims whose upward walk cannot find the package root, so PATH auto-discovery may still land on the bundled core. Setting `playwrightPath` to the package root or a browser executable selects the intended installation; PATHEXT-aware probing is tracked as a follow-up.
+
 ## [0.2.5] - 2026-08-25
 
 ### Added

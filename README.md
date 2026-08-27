@@ -81,6 +81,8 @@ Local backend resolution order:
 2. A `playwright` executable on `$PATH` (its package knows that installation's browser registry).
 3. The bundled `playwright-core` — requires `PLAYWRIGHT_BROWSERS_PATH` or browsers in the default cache; otherwise the error suggests `playwright install chromium`.
 
+> **Windows note** — `$PATH` is scanned with the platform delimiter (`;`), but npm/pnpm global installs expose `playwright` as `.cmd`/`.ps1` shims whose location does not walk up to the package root, so discovery may still land on step 3 (the bundled core). To drive a specific installation's browser registry, point `playwrightPath` at the `playwright` package directory or a browser executable.
+
 CDP mode needs no local browser: the provider holds **one shared connection** for its lifetime (reconnecting automatically if it drops, and reconnecting to the new endpoint when the setting changes), and every fetch leases a tab in the remote browser that closes when the fetch completes. Concurrency therefore counts tabs, which is why the CDP default is high (50). Unloading the plugin drops the shared connection (the remote browser itself is never closed).
 
 ### The CDP context modes (share the browser's profile or not)

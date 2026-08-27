@@ -7,9 +7,10 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os: [ubuntu-latest, windows-latest]
         node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
@@ -35,5 +36,8 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # Tarball content check is platform-independent; /tmp + tar + grep
+      # piping assumes a POSIX shell, so it stays on the Linux runners.
       - name: Verify package contents
+        if: matrix.os == 'ubuntu-latest'
         run: pnpm pack --pack-destination /tmp/dsh-web-fetch-playwright-pack && tar -tzf /tmp/dsh-web-fetch-playwright-pack/*.tgz | grep -q '^package/lib/index.js$' || (echo 'lib/index.js missing from package' && exit 1)
