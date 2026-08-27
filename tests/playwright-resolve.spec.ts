@@ -4,7 +4,7 @@
  */
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { findOnPath, findPlaywrightPackageRoot, isNativeExecutable } from '../src/playwright-resolve.ts'
 
@@ -33,6 +33,27 @@ describe('findOnPath', () => {
     try {
       expect(findOnPath('my-probe')).toBe(join(dir, 'my-probe'))
       expect(findOnPath('absent-tool')).toBeUndefined()
+    } finally {
+      process.env.PATH = previous
+    }
+  })
+
+  // Regression guard for issue #1: PATH must be split on the platform
+  // delimiter, so a target in a NON-FIRST directory is found. The PATH is
+  // built with `delimiter` itself — on Windows that is `;`, where a literal
+  // `:` split turned the whole variable into one bogus directory and this
+  // case failed; on POSIX the delimiters coincide, so the Windows CI run of
+  // this test is the meaningful assertion.
+  it('scans every PATH directory, not just the first', () => {
+    const first = join(root, 'path-first')
+    const second = join(root, 'path-second')
+    mkdirSync(first, { recursive: true })
+    mkdirSync(second, { recursive: true })
+    writeExecutable(join(second, 'late-probe'), '#!/bin/sh\ntrue\n')
+    const previous = process.env.PATH
+    process.env.PATH = [first, second, ''].join(delimiter)
+    try {
+      expect(findOnPath('late-probe')).toBe(join(second, 'late-probe'))
     } finally {
       process.env.PATH = previous
     }

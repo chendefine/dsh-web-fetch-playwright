@@ -17,7 +17,7 @@
  */
 
 import { accessSync, constants, readFileSync, realpathSync, statSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { delimiter, dirname, join } from 'node:path'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import type { PlaywrightChromium } from './types.ts'
@@ -41,13 +41,15 @@ export interface ResolvedPlaywright {
 }
 
 /**
- * Find `name` as an executable file on `$PATH`.
+ * Find `name` as an executable file on `$PATH`, split on the platform
+ * delimiter (`;` on Windows, `:` elsewhere — issue #1: a literal `:` made
+ * Windows discovery always miss).
  * @param name - the executable basename.
  * @returns the first matching path, or undefined.
  */
 export function findOnPath(name: string): string | undefined {
   const pathValue = process.env.PATH ?? ''
-  for (const dir of pathValue.split(':')) {
+  for (const dir of pathValue.split(delimiter)) {
     if (dir === '') continue
     const candidate = join(dir, name)
     try {
