@@ -1,17 +1,23 @@
 /**
- * The client card form model against a fake settings scope: staging, dirty
- * tracking, save writes (set/clear), failed-save retention, discard, and the
- * radio/checkbox field kinds — no browser, no DOM.
+ * The client card form model against a fake plugin-entry configuration
+ * form: staging, dirty tracking, save writes (set/clear), failed-save
+ * retention, discard, and the radio/checkbox field kinds — no browser, no
+ * DOM.
  */
 import { describe, expect, it } from 'vitest'
-import type { SettingsScope, SettingsScopeSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SettingsPathOpView } from '@deepseek-ai/dsh-api-remotes/client'
+import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import { CardForm, checkboxField, numberField, radioField, textField } from '../src/client/form.ts'
 
-/** Minimal reactive scope double: a snapshot, a publish path, and a write log. */
-class FakeScope implements SettingsScope<Record<string, unknown>> {
-  snapshot: SettingsScopeSnapshot<Record<string, unknown>>
+/**
+ * Minimal reactive configuration-form double: a snapshot, a publish path,
+ * and a write log. Writes answer the shared form's boolean contract —
+ * `false` (with nothing applied) models a Host-refused write.
+ */
+class FakeScope implements ConfigForm<Record<string, unknown>> {
+  snapshot: ConfigFormSnapshot<Record<string, unknown>>
   readonly writes: Array<{ field: string; op: 'set' | 'unset'; value?: unknown }> = []
-  /** When true, writes settle WITHOUT applying (a rejected Host write). */
+  /** When true, writes are refused (the Host rejected the revision/value). */
   dropWrites = false
   private readonly listeners = new Set<() => void>()
 
@@ -23,7 +29,7 @@ class FakeScope implements SettingsScope<Record<string, unknown>> {
     this.snapshot = { status: 'ready', value, base, user, revision: 1, writable: true, mode: 'host' }
   }
 
-  getSnapshot(): SettingsScopeSnapshot<Record<string, unknown>> {
+  getSnapshot(): ConfigFormSnapshot<Record<string, unknown>> {
     return this.snapshot
   }
 
@@ -32,31 +38,47 @@ class FakeScope implements SettingsScope<Record<string, unknown>> {
     return () => { this.listeners.delete(listener) }
   }
 
-  async set(field: string, value: unknown): Promise<void> {
-    if (this.dropWrites) return
+  async set(field: string, value: unknown): Promise<boolean> {
+    if (this.dropWrites) return false
     this.writes.push({ field, op: 'set', value })
     const user = { ...(this.snapshot.user as Record<string, unknown>), [field]: value }
     this.publish({ value: { ...(this.snapshot.value as Record<string, unknown>), [field]: value }, user })
+    return true
   }
 
-  async unset(field: string): Promise<void> {
-    if (this.dropWrites) return
+  async unset(field: string): Promise<boolean> {
+    if (this.dropWrites) return false
     this.writes.push({ field, op: 'unset' })
     const user = { ...(this.snapshot.user as Record<string, unknown>) }
     const value = { ...(this.snapshot.value as Record<string, unknown>) }
     delete user[field]
     delete value[field]
     this.publish({ value, user })
+    return true
   }
 
-  private publish(partial: Partial<SettingsScopeSnapshot<Record<string, unknown>>>): void {
+  /** The card form never uses batched mutations; fold ops onto set/unset. */
+  async mutate(ops: readonly SettingsPathOpView[]): Promise<boolean> {
+    let landed = true
+    for (const op of ops) {
+      if (op.path.length !== 1) return false
+      const [field] = op.path
+      if (field === undefined) return false
+      landed = op.op === 'set'
+        ? await this.set(field, op.value) && landed
+        : await this.unset(field) && landed
+    }
+    return landed
+  }
+
+  private publish(partial: Partial<ConfigFormSnapshot<Record<string, unknown>>>): void {
     this.snapshot = { ...this.snapshot, ...partial }
     for (const listener of this.listeners) listener()
   }
 }
 
 /** The card's field set: backend radio, two text inputs, two checkboxes, two numbers. */
-function makeForm(scope: SettingsScope<Record<string, unknown>>) {
+function makeForm(scope: ConfigForm<Record<string, unknown>>) {
   return new CardForm(scope, [
     radioField('backend', ['local', 'cdp']),
     textField('playwrightPath'),
@@ -217,7 +239,19 @@ describe('CardForm', () => {
     const form = makeForm(scope)
     const store = form.bind(() => form.shell())
     expect(store.getSnapshot().dirty).toBe(false)
-    scope.set('playwrightPath', '/b')
+    void scope.set('playwrightPath', '/b')
     expect(store.getSnapshot().dirty).toBe(false)
+  })
+
+  it('dispose releases the form subscription: a later form change republishes nothing', () => {
+    const scope = new FakeScope({ playwrightPath: '/a' })
+    const form = makeForm(scope)
+    const store = form.bind(() => form.shell())
+    expect(store.getSnapshot().dirty).toBe(false)
+    form.dispose()
+    void scope.set('playwrightPath', '/b')
+    // The store keeps its last snapshot: no listener fired after dispose.
+    expect(store.getSnapshot().dirty).toBe(false)
+    expect(scope.getSnapshot().value?.playwrightPath).toBe('/b')
   })
 })

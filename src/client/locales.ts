@@ -7,7 +7,7 @@
 
 /** Locale keys this card renders. */
 export type PlaywrightCardLocaleKey =
-  | 'title' | 'description'
+  | 'description'
   | 'backendLabel' | 'backendLocal' | 'backendLocalHint' | 'backendCdp' | 'backendCdpHint'
   | 'playwrightPath' | 'playwrightPathHint' | 'playwrightPathPlaceholder'
   | 'cdpEndpoint' | 'cdpEndpointHint'
@@ -15,8 +15,8 @@ export type PlaywrightCardLocaleKey =
   | 'denoise' | 'denoiseHint'
   | 'maxConcurrency' | 'maxConcurrencyHint' | 'maxConcurrencyPlaceholder'
   | 'challengeWaitMs' | 'challengeWaitMsHint' | 'challengeWaitMsPlaceholder'
-  | 'overridden' | 'reset' | 'readOnly' | 'expand' | 'collapse'
-  | 'save' | 'saving' | 'discard' | 'unsaved' | 'saveFailed' | 'invalidText'
+  | 'overridden' | 'reset' | 'readOnly'
+  | 'save' | 'saving' | 'discard' | 'saveFailed' | 'invalidText'
 
 /** This plugin's dictionary namespace, merged into the locale key map. */
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -27,7 +27,6 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 
 /** English copy. */
 export const en: Record<PlaywrightCardLocaleKey, string> = {
-  title: 'Playwright web fetch',
   description: 'Fetches pages with a real browser (local Playwright or CDP) and returns denoised markdown.',
   backendLabel: 'Playwright backend',
   backendLocal: 'Local Playwright',
@@ -52,19 +51,15 @@ export const en: Record<PlaywrightCardLocaleKey, string> = {
   overridden: 'Overridden',
   reset: 'Reset to default',
   readOnly: 'This deployment stores settings read-only.',
-  expand: 'Show settings',
-  collapse: 'Hide settings',
   save: 'Save',
   saving: 'Saving…',
   discard: 'Discard',
-  unsaved: 'Unsaved',
   saveFailed: 'The deployment did not accept these values; they were left for you to correct.',
   invalidText: 'This value is not accepted here.',
 }
 
 /** Simplified Chinese copy. */
 export const zh: Record<PlaywrightCardLocaleKey, string> = {
-  title: 'Playwright 网页爬取',
   description: '用真实浏览器（本地 Playwright 或 CDP）抓取网页，降噪后转为 Markdown。',
   backendLabel: 'Playwright 后端',
   backendLocal: '本地 Playwright',
@@ -89,12 +84,9 @@ export const zh: Record<PlaywrightCardLocaleKey, string> = {
   overridden: '已覆盖',
   reset: '恢复默认',
   readOnly: '本部署的设置为只读。',
-  expand: '展开设置',
-  collapse: '收起设置',
   save: '保存',
   saving: '保存中…',
   discard: '放弃修改',
-  unsaved: '未保存',
   saveFailed: '本部署没有接受这些值，已保留供你修改。',
   invalidText: '该值不被此设置项接受。',
 }

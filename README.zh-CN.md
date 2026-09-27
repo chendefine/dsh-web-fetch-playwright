@@ -13,7 +13,7 @@
 - **两种后端** —— 本地启动 Playwright 浏览器，或通过 DevTools 协议（CDP）驱动一个已在运行的浏览器。
 - **浏览器解析** —— 配置路径 → `$PATH` 上的 `playwright` CLI → 插件自带的 `playwright-core`；CDP 模式完全不需要本地浏览器。
 - **共享或隔离会话（CDP）** —— 每次抓取严格限定为一个标签页。本地后端每次抓取启动并关闭自己的浏览器；CDP 后端对远端浏览器保持**一条共享连接**，每次抓取只在其里开一个标签页、用完即关。默认该标签页位于远端浏览器的**真实 profile**（沿用其 cookie、localStorage 与已登录会话，效果类似 `playwright-cli open`）；取消勾选「共享浏览器上下文」则切换为每次抓取全新隔离 context。
-- **热配置** —— 「设置 → 插件 → 插件配置」卡片可随时切换后端、上下文模式、降噪开关与并发数，改动对下一次抓取即时生效，无需重启。
+- **热配置** —— 插件页（侧边栏 → 插件 → *dsh-web-fetch-playwright*，dsh ≥ 0.1.7）在插件自己的包页面直接展示完整表单（也可通过该行的「配置」入口进入同一表单）；可随时切换后端、上下文模式、降噪开关与并发数，提交的改动对下一次抓取即时生效，无需重启。
 - **预算控制** —— 单次抓取 45s 超时；并发按后端定价（`maxConcurrency`，默认本地 4 个浏览器 / **CDP 50 个标签页**；排队的抓取等不到空位会在 20s 内尽快报错并提示重试，而不是一直挂到被工具层中止）；拦截图片/字体/媒体子请求；返回体 10 万字符封顶。
 - **Cloudflare 挑战有界等待** —— 导航落到验证中间页（"Just a moment…" 及其多语言同族，通过官方 `cf-mitigated: challenge` 响应头 + 结构性页面标记识别）时，抓取保持**同一标签页与上下文**，等待浏览器自行通过验证：跟踪*最后一次*主 frame 响应（真实页面随后重载进来），并轮询活 DOM 以捕获 SPA 式清除。有界且可配置（`challengeWaitMs`，默认 15s；`0` 恢复旧版首响应行为），附带同标签页有界重试（`challengeRetries`，默认 1）。预算耗尽时以独立的 `WEB_FETCH_CHALLENGE` 错误码明确失败，而不是把中间页当正文返回。全程不点击、不注入验证码答案、不伪造浏览器状态、不导出或复制 cookie。
 
@@ -22,7 +22,7 @@
 | 半端 | 位置 | 职责 |
 | --- | --- | --- |
 | 宿主（服务端） | `src/` | 向 `ctx.web` 注册 fetch provider（id `playwright`）；`cordis.patch.yml` 把 web seam 的 `fetchProvider` 固定为本插件，并启用 `web_fetch` 工具（60s 预算）。 |
-| 浏览器（客户端） | `src/client/` | 注册 *Playwright 网页爬取* 配置卡片，通过 settings 服务把改动热写入 `$DSH_HOME/settings.yaml`。 |
+| 浏览器（客户端） | `src/client/` | 在插件页的 `plugins.bundle.config` / `plugins.row.config` 席位注册 *Playwright 网页爬取* 配置表单，通过共享的设置表单服务提交改动。 |
 
 ```
 web_fetch (tool-web)
@@ -60,7 +60,7 @@ bundle 插件加入 profile 层栈后需**重启 `dsh web`** 生效；卸载用 
 
 ## 配置项
 
-设置卡片（设置 → 插件 → 插件配置 → *Playwright 网页爬取*）实时编辑 `web-fetch-playwright` 设置段：
+插件页（侧边栏 → 插件）从列表一跳即达：*dsh-web-fetch-playwright* 卡片落在包页面，完整表单位于其描述与行列表之间；该行的「配置」入口在插件自己的标题下打开同一表单。表单实时编辑 `web-fetch-playwright` 设置段（由插件条目的 `Config` schema 派生）：
 
 ![Playwright 网页爬取 plugin configuration card](./playwright-plugin-config.png)
 
@@ -129,7 +129,7 @@ pnpm build       # tsc 声明 + tsdown（宿主 ESM + 客户端 module-registrat
 
 ```
 src/
-├── index.ts               # 宿主入口：注册 provider 与设置段
+├── index.ts               # 宿主入口：注册 fetch provider（设置段由插件的 Config schema 派生）
 ├── config.ts              # schemastery schema、CDP 端点归一化
 ├── provider.ts            # WebFetchProvider：导航、超时、信号量、截断
 ├── markdown.ts            # 降噪管线（Readability + DOMPurify + Turndown/GFM）

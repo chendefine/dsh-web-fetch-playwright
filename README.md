@@ -13,7 +13,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plug
 - **Two backends** — launch a local Playwright browser, or drive an already-running browser over its DevTools Protocol (CDP) endpoint.
 - **Browser resolution** — a configured path, a `playwright` CLI on `$PATH`, or the bundled `playwright-core`; CDP needs no local browser at all.
 - **Isolated or profile sessions (CDP)** — every fetch is scoped to exactly one tab. Local launches close their browser per fetch; the CDP backend keeps **one shared connection** to the remote browser and each fetch opens a tab inside it, closed when done. By default that tab lives in the remote browser's **real profile** (its cookies, localStorage, and persistent logins apply — like `playwright-cli open`); unchecking *Share the browser context* switches to a throwaway isolated context per fetch.
-- **Live configuration** — a settings card (设置 → 插件 → 插件配置) edits the backend, context mode, denoise toggle, and concurrency; changes apply to the next fetch without a restart.
+- **Live configuration** — the Plugins page (侧边栏 → 插件 → *dsh-web-fetch-playwright*, dsh ≥ 0.1.7) shows the full form right on the plugin's package page (and on the row's own page via its configure control); it edits the backend, context mode, denoise toggle, and concurrency, and a committed change reaches the next fetch without a restart.
 - **Budget-aware** — per-fetch deadline (45s); concurrency is backend-priced (`maxConcurrency`, default 4 local browsers / **50 CDP tabs**; queued fetches fail fast with a retry hint after 20s instead of hanging); image/font/media subrequests aborted; body capped at 100k chars.
 - **Bounded Cloudflare-challenge wait** — when a navigation lands on a challenge interstitial ("Just a moment…" and its localized siblings, recognized via the documented `cf-mitigated: challenge` response header plus structural page markers), the fetch keeps the **same tab and context** and waits for the browser's own verification to clear it — tracking the *last* main-frame response (the real page reloads in) and watching the live DOM so SPA-style clears are caught too. Bounded and configurable (`challengeWaitMs`, default 15s; 0 restores the legacy first-response behavior), with a bounded same-tab retry (`challengeRetries`, default 1). When the budget runs out, the fetch fails with the distinct `WEB_FETCH_CHALLENGE` error code instead of returning the interstitial as content. It never clicks, never injects CAPTCHA answers, never fakes browser state, and never exports or copies cookies.
 
@@ -22,7 +22,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plug
 | Half | Location | Responsibility |
 | --- | --- | --- |
 | Host (server) | `src/` | Registers the fetch provider (id `playwright`) into `ctx.web`; `cordis.patch.yml` pins the web seam's `fetchProvider` to it and enables the `web_fetch` tool with a 60s budget. |
-| Browser (client) | `src/client/` | Registers the *Playwright 网页爬取* configuration card, which hot-writes the settings section into `$DSH_HOME/settings.yaml`. |
+| Browser (client) | `src/client/` | Registers the *Playwright web fetch* configuration form on the Plugins page's `plugins.bundle.config` / `plugins.row.config` seats, which stages edits and writes them through the shared settings form service. |
 
 ```
 web_fetch (tool-web)
@@ -60,7 +60,7 @@ After a bundle plugin is added to the profile layer stack, **restart `dsh web`**
 
 ## Configuration
 
-The settings card (设置 → 插件 → 插件配置 → *Playwright 网页爬取*) edits the `web-fetch-playwright` settings section live:
+The Plugins page (侧边栏 → 插件) opens the form one click from the list: the *dsh-web-fetch-playwright* card lands on the package page with the full form between its description and its rows, and the row's own configure control opens the same form under the plugin's title. It edits the `web-fetch-playwright` settings section — derived from the plugin entry's `Config` schema — live:
 
 ![Playwright 网页爬取 plugin configuration card](./playwright-plugin-config.png)
 
@@ -129,7 +129,7 @@ Repository layout:
 
 ```
 src/
-├── index.ts               # host entry: registers provider + settings section
+├── index.ts               # host entry: registers the fetch provider (the settings section derives from the plugin's Config schema)
 ├── config.ts              # schemastery schema, CDP endpoint normalizer
 ├── provider.ts            # WebFetchProvider: navigation, deadline, semaphore, caps
 ├── markdown.ts            # denoise pipeline (Readability + DOMPurify + Turndown/GFM)

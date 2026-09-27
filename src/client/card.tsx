@@ -5,44 +5,50 @@
  * the denoise checkbox, staged and saved through the card form like the
  * built-in plugin cards.
  *
+ * The Plugins page asks for `view: 'summary'` (a row's description
+ * fallback) or `view: 'page'` (this form). The same component serves both
+ * seats it is registered into: the bundle's own page (between its
+ * description and its rows) and the row's page (under the plugin's own
+ * title); one controller stages the edits shared by the two.
+ *
  * @module dsh-web-fetch-playwright/client/card
  */
 
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import { PluginCard } from './PluginCard.tsx'
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
+import { CardForm } from './PluginCard.tsx'
 import { CheckboxField, RadioGroupField, ValueField } from './fields.tsx'
 import type { PlaywrightCardFace, PlaywrightCardState } from './controller.ts'
 
 /** Props the renderer binds for the Playwright card. */
 export type PlaywrightCardProps =
-  PropsRuntime<'settings.plugin.item'>
+  (PropsRuntime<'plugins.bundle.config'> | PropsRuntime<'plugins.row.config'>)
   & PropsLocale<'web-fetch-playwright'>
   & InjectFace<PlaywrightCardFace>
 
 /**
- * Render the Playwright card.
- * @param props - locale copy, the card snapshot, and its form actions.
- * @returns the card.
+ * Render the Playwright card: its one-liner for the list, or the staged form
+ * for the page.
+ * @param props - the view asked for, locale copy, the card snapshot, and its form actions.
+ * @returns the one-liner, the form, or nothing while the namespace is unavailable.
  */
 export function PlaywrightCard(props: PlaywrightCardProps) {
   const { t } = props
+  if (props.view === 'summary') return t('description')
   const state = props.usePlaywrightCard(snapshot => snapshot)
+  if (!state.available) return null
   const disabled = !state.writable
   const backend = state.backend.text === 'cdp' ? 'cdp' : 'local'
   return (
-    <PluginCard
+    <CardForm
       copy={{
-        expand: t('expand'),
-        collapse: t('collapse'),
-        unsaved: t('unsaved'),
         readOnly: t('readOnly'),
         saveFailed: t('saveFailed'),
         discard: t('discard'),
         save: t('save'),
         saving: t('saving'),
       }}
-      title={t('title')}
-      description={t('description')}
       state={state}
       onSave={props.save}
       onDiscard={props.discard}
@@ -154,6 +160,6 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
         onEdit={(text) => { props.edit('challengeWaitMs', text) }}
         onReset={() => { props.resetField('challengeWaitMs') }}
       />
-    </PluginCard>
+    </CardForm>
   )
 }

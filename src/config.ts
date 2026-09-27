@@ -4,9 +4,16 @@
  * resolved shape, and the small pure normalizers the provider applies per
  * fetch (CDP endpoint shaping) — kept network-free for unit tests.
  *
+ * Since dsh 0.1.7 the settings service derives a plugin's configuration page
+ * from its composition entry's `Config` schema: every field marked
+ * `.volatile()` is editable live (Settings → Plugins), and a committed edit
+ * is pushed into the running plugin's volatile references without a remount —
+ * this schema IS the `web-fetch-playwright` settings section.
+ *
  * @module dsh-web-fetch-playwright/config
  */
 
+import type { Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 
 /** Default CDP endpoint when the settings section leaves it blank. */
@@ -99,22 +106,97 @@ export interface Config {
   maxConcurrency?: number
 }
 
-export const Config: z<Config> = z.object({
-  // union-of-consts rather than z.enum: the profile's published schemastery
-  // build does not expose `.enum`, and this schema executes at runtime
-  // against that copy.
-  backend: z.union([z.const('local'), z.const('cdp')]).default('local'),
-  playwrightPath: z.string().default(''),
-  cdpEndpoint: z.string().default(''),
-  shareBrowserContext: z.boolean().default(true),
-  denoise: z.boolean().default(true),
+// union-of-consts rather than z.enum: the profile's published schemastery
+// build does not expose `.enum`, and this schema executes at runtime
+// against that copy. Every field is `.volatile()`: the whole section is
+// live-editable from the Plugins page and a commit reaches the running
+// provider without a remount.
+export const Config = z.object({
+  backend: z.union([z.const('local'), z.const('cdp')]).default('local').volatile(),
+  playwrightPath: z.string().default('').volatile(),
+  cdpEndpoint: z.string().default('').volatile(),
+  shareBrowserContext: z.boolean().default(true).volatile(),
+  denoise: z.boolean().default(true).volatile(),
   // Optional on purpose: the effective default depends on `backend`, which a
   // static schema default cannot express.
-  maxConcurrency: z.number().step(1).min(1).max(MAX_CONCURRENCY_CEILING),
+  maxConcurrency: z.number().step(1).min(1).max(MAX_CONCURRENCY_CEILING).volatile(),
   // The bounded natural-wait knobs; 0 disables the whole challenge path.
-  challengeWaitMs: z.number().step(100).min(0).max(MAX_CHALLENGE_WAIT_MS).default(DEFAULT_CHALLENGE_WAIT_MS),
-  challengeRetries: z.number().step(1).min(0).max(MAX_CHALLENGE_RETRIES).default(DEFAULT_CHALLENGE_RETRIES),
+  challengeWaitMs: z.number().step(100).min(0).max(MAX_CHALLENGE_WAIT_MS).default(DEFAULT_CHALLENGE_WAIT_MS).volatile(),
+  challengeRetries: z.number().step(1).min(0).max(MAX_CHALLENGE_RETRIES).default(DEFAULT_CHALLENGE_RETRIES).volatile(),
 })
+
+/**
+ * The config `apply` receives once the schema resolves: every volatile field
+ * arrives as a live reference whose snapshot a settings commit replaces in
+ * place, so the provider re-reads them per fetch (the plugin never remounts
+ * for an edit).
+ */
+export interface PlaywrightPluginConfig {
+  /** Backend selector as a live reference. */
+  backend: Volatile<PlaywrightBackend>
+  /** Local backend executable path as a live reference. */
+  playwrightPath: Volatile<string>
+  /** CDP endpoint as a live reference. */
+  cdpEndpoint: Volatile<string>
+  /** Shared-context toggle as a live reference. */
+  shareBrowserContext: Volatile<boolean>
+  /** Denoise toggle as a live reference. */
+  denoise: Volatile<boolean>
+  /**
+   * Concurrency limit as a live reference; `undefined` while unset (the
+   * field owns no default — the backend resolves one).
+   */
+  maxConcurrency: Volatile<number | undefined>
+  /** Challenge wait budget (ms) as a live reference. */
+  challengeWaitMs: Volatile<number>
+  /** Challenge retry count as a live reference. */
+  challengeRetries: Volatile<number>
+}
+
+/**
+ * Read the live references `apply` holds into one plain input for
+ * {@link resolveConfig}; a settings commit has usually replaced the
+ * snapshots since the last call, which is the whole point.
+ *
+ * @param config - the plugin config as the loader resolved it.
+ * @returns the current snapshots, ready for resolution.
+ */
+export function snapshotsOf(config: PlaywrightPluginConfig): Config {
+  return {
+    backend: config.backend.get(),
+    playwrightPath: config.playwrightPath.get(),
+    cdpEndpoint: config.cdpEndpoint.get(),
+    shareBrowserContext: config.shareBrowserContext.get(),
+    denoise: config.denoise.get(),
+    maxConcurrency: config.maxConcurrency.get(),
+    challengeWaitMs: config.challengeWaitMs.get(),
+    challengeRetries: config.challengeRetries.get(),
+  }
+}
+
+/**
+ * Resolve any accepted config input into the fully-defaulted, plain form the
+ * provider consumes per fetch. Validation goes through the schema, so the
+ * volatile wrappers that produces are unwrapped immediately — the provider
+ * consumes plain values. The input face is `Partial` by design (composition
+ * entries and volatile snapshots both omit fields; defaults supply them).
+ *
+ * @param config - composition entry, settings-section value, or volatile snapshots.
+ * @returns the resolved config.
+ */
+export function resolveConfig(config: Partial<Config>): ResolvedConfig {
+  const resolved = Config(config as never) as PlaywrightPluginConfig
+  return {
+    backend: resolved.backend.get(),
+    playwrightPath: resolved.playwrightPath.get(),
+    cdpEndpoint: resolved.cdpEndpoint.get(),
+    shareBrowserContext: resolved.shareBrowserContext.get(),
+    denoise: resolved.denoise.get(),
+    maxConcurrency: resolved.maxConcurrency.get(),
+    challengeWaitMs: resolved.challengeWaitMs.get(),
+    challengeRetries: resolved.challengeRetries.get(),
+  }
+}
 
 /**
  * Complete config after schemastery applies the field defaults it owns.

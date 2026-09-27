@@ -1,18 +1,24 @@
 /**
  * The Playwright card's controller: the staged form over the
- * `web-fetch-playwright` settings namespace, projected into one snapshot the
- * card's slot entry injects.
+ * `web-fetch-playwright` plugin-entry configuration form, projected into one
+ * snapshot the card's slot entry injects.
+ *
+ * Since dsh 0.1.7 the scope is the shared `configForms` form for the plugin
+ * entry — the host's settings service derives the section from the plugin's
+ * Config schema (its volatile fields), keyed by the composition entry id.
  *
  * @module dsh-web-fetch-playwright/client/controller
  */
 
-import type { SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client'
 import { CardForm, checkboxField, numberField, radioField, textField } from './form.ts'
 import type { CardShell, CardFieldState, CardActions, SnapshotStore } from './form.ts'
 
 /**
- * Settings namespace this card edits. Spelled here rather than imported: a
- * client package must not depend on a Host package.
+ * Settings namespace this card edits: the composition entry id, which is
+ * what the host's settings service keys the section derived from the
+ * plugin's Config schema by. Spelled here rather than imported: a client
+ * package must not depend on a Host package.
  */
 export const WEB_FETCH_PLAYWRIGHT_NS = 'web-fetch-playwright'
 
@@ -67,15 +73,17 @@ export interface PlaywrightCardFace extends CardActions {
   }
 }
 
-/** Bridges the `web-fetch-playwright` settings scope onto the card. */
+/**
+ * Bridges the `web-fetch-playwright` configuration form onto the card.
+ */
 export class PlaywrightCardController {
   private readonly form: CardForm<PlaywrightSettings>
   private readonly store: SnapshotStore<PlaywrightCardState>
 
   /**
-   * @param scope - the bound settings scope for the `web-fetch-playwright` namespace.
+   * @param scope - the shared configuration form for the `web-fetch-playwright` entry.
    */
-  constructor(scope: SettingsScope<PlaywrightSettings>) {
+  constructor(scope: ConfigForm<PlaywrightSettings>) {
     this.form = new CardForm(
       scope,
       [
@@ -110,5 +118,10 @@ export class PlaywrightCardController {
    */
   inject(): PlaywrightCardFace {
     return { hooks: { playwrightCard: this.store }, ...this.form.actions() }
+  }
+
+  /** Release the form subscription and every bound stores. */
+  dispose(): void {
+    this.form.dispose()
   }
 }

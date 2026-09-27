@@ -1,6 +1,11 @@
 /**
  * Config schema defaults, the CDP endpoint normalizer, the backend-dependent
  * concurrency resolution, and the challenge-wait knobs (pure, network-free).
+ *
+ * The schema's fields are all `.volatile()`: resolving through the schema
+ * (what {@link resolveConfig} does — validate, fill defaults, unwrap the
+ * volatile references) yields the plain section the provider consumes, so
+ * these tests resolve every input that way.
  */
 import { describe, expect, it } from 'vitest'
 import {
@@ -18,11 +23,14 @@ import {
   effectiveContextMode,
   effectiveMaxConcurrency,
   normalizeCdpEndpoint,
+  resolveConfig,
+  snapshotsOf,
 } from '../src/config.ts'
+import type { PlaywrightPluginConfig } from '../src/config.ts'
 
 describe('Config', () => {
   it('fills every field default it owns (maxConcurrency stays optional)', () => {
-    const resolved = Config({})
+    const resolved = resolveConfig({})
     expect(resolved).toEqual({
       backend: 'local',
       playwrightPath: '',
@@ -34,8 +42,17 @@ describe('Config', () => {
     })
   })
 
+  it('resolves every field as a live volatile reference', () => {
+    // The schema itself (what the loader runs against the composition row)
+    // wraps every field in a Volatile ref — the face `apply` receives.
+    const resolved = Config({}) as PlaywrightPluginConfig
+    expect(typeof resolved.backend.get).toBe('function')
+    expect(resolved.backend.get()).toBe('local')
+    expect(resolved.maxConcurrency.get()).toBeUndefined()
+  })
+
   it('accepts a full CDP section unchanged', () => {
-    const resolved = Config({
+    const resolved = resolveConfig({
       backend: 'cdp',
       cdpEndpoint: 'browser.lan:9223',
       shareBrowserContext: false,
@@ -57,22 +74,60 @@ describe('Config', () => {
   })
 
   it('accepts maxConcurrency across its whole integer range and rejects outside it', () => {
-    expect(Config({ maxConcurrency: 1 }).maxConcurrency).toBe(1)
-    expect(Config({ maxConcurrency: MAX_CONCURRENCY_CEILING }).maxConcurrency).toBe(MAX_CONCURRENCY_CEILING)
-    expect(() => Config({ maxConcurrency: 0 })).toThrow()
-    expect(() => Config({ maxConcurrency: MAX_CONCURRENCY_CEILING + 1 })).toThrow()
-    expect(() => Config({ maxConcurrency: 2.5 })).toThrow()
+    expect(resolveConfig({ maxConcurrency: 1 }).maxConcurrency).toBe(1)
+    expect(resolveConfig({ maxConcurrency: MAX_CONCURRENCY_CEILING }).maxConcurrency).toBe(MAX_CONCURRENCY_CEILING)
+    expect(() => resolveConfig({ maxConcurrency: 0 })).toThrow()
+    expect(() => resolveConfig({ maxConcurrency: MAX_CONCURRENCY_CEILING + 1 })).toThrow()
+    expect(() => resolveConfig({ maxConcurrency: 2.5 })).toThrow()
   })
 
   it('accepts the challenge knobs across their ranges, rejects outside them', () => {
-    expect(Config({ challengeWaitMs: 0 }).challengeWaitMs).toBe(0)
-    expect(Config({ challengeWaitMs: MAX_CHALLENGE_WAIT_MS }).challengeWaitMs).toBe(MAX_CHALLENGE_WAIT_MS)
-    expect(() => Config({ challengeWaitMs: -1 })).toThrow()
-    expect(() => Config({ challengeWaitMs: MAX_CHALLENGE_WAIT_MS + 1 })).toThrow()
-    expect(Config({ challengeRetries: 0 }).challengeRetries).toBe(0)
-    expect(Config({ challengeRetries: MAX_CHALLENGE_RETRIES }).challengeRetries).toBe(MAX_CHALLENGE_RETRIES)
-    expect(() => Config({ challengeRetries: -1 })).toThrow()
-    expect(() => Config({ challengeRetries: MAX_CHALLENGE_RETRIES + 1 })).toThrow()
+    expect(resolveConfig({ challengeWaitMs: 0 }).challengeWaitMs).toBe(0)
+    expect(resolveConfig({ challengeWaitMs: MAX_CHALLENGE_WAIT_MS }).challengeWaitMs).toBe(MAX_CHALLENGE_WAIT_MS)
+    expect(() => resolveConfig({ challengeWaitMs: -1 })).toThrow()
+    expect(() => resolveConfig({ challengeWaitMs: MAX_CHALLENGE_WAIT_MS + 1 })).toThrow()
+    expect(resolveConfig({ challengeRetries: 0 }).challengeRetries).toBe(0)
+    expect(resolveConfig({ challengeRetries: MAX_CHALLENGE_RETRIES }).challengeRetries).toBe(MAX_CHALLENGE_RETRIES)
+    expect(() => resolveConfig({ challengeRetries: -1 })).toThrow()
+    expect(() => resolveConfig({ challengeRetries: MAX_CHALLENGE_RETRIES + 1 })).toThrow()
+  })
+})
+
+describe('the volatile configuration face', () => {
+  /** Build the live-reference face `apply` receives over one plain section. */
+  function pluginConfig(section: Record<string, unknown>): PlaywrightPluginConfig {
+    return Config(section as never) as PlaywrightPluginConfig
+  }
+
+  it('snapshotsOf dereferences every live field, defaults included', () => {
+    const config = pluginConfig({ maxConcurrency: 8 })
+    expect(snapshotsOf(config)).toEqual({
+      backend: 'local',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      shareBrowserContext: true,
+      denoise: true,
+      maxConcurrency: 8,
+      challengeWaitMs: DEFAULT_CHALLENGE_WAIT_MS,
+      challengeRetries: DEFAULT_CHALLENGE_RETRIES,
+    })
+  })
+
+  it('a settings commit reaches the provider through the same references', () => {
+    // A commit replaces a ref's snapshot in place (updateVolatile); the
+    // provider's per-fetch projection sees the new value without a remount.
+    // Model it exactly as the host does: fresh refs over the new section.
+    const config = pluginConfig({ backend: 'local' })
+    expect(resolveConfig(snapshotsOf(config)).backend).toBe('local')
+    const updated = pluginConfig({ backend: 'cdp', cdpEndpoint: 'browser.lan:9222' })
+    expect(resolveConfig(snapshotsOf(updated))).toMatchObject({ backend: 'cdp', cdpEndpoint: 'browser.lan:9222' })
+  })
+
+  it('an optional live field snapshots as undefined while unset', () => {
+    const config = pluginConfig({})
+    expect(snapshotsOf(config).maxConcurrency).toBeUndefined()
+    // And resolveConfig keeps it optional (the backend resolves a default).
+    expect(resolveConfig(snapshotsOf(config)).maxConcurrency).toBeUndefined()
   })
 })
 

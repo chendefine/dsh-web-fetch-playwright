@@ -1,10 +1,12 @@
 /**
  * The staged-form model behind the Playwright card — a faithful subset of the
- * shipped `ui-settings-plugins` CardForm (same staging semantics: edits stay
+ * shipped plugin-configuration CardForm (same staging semantics: edits stay
  * local until the card's save, presence in the user layer — not value
  * equality — marks a field overridden), plus the two field kinds this card
  * adds: a radio group (backend) and a checkbox (denoise), staged through the
- * same draft mechanism as text.
+ * same draft mechanism as text. Since dsh 0.1.7 the scope is the shared
+ * `configForms` form for the plugin entry (reads ride the describe mirror;
+ * writes are revision-fenced path mutations).
  *
  * Bundled locally because external client bundles cannot value-import
  * `@deepseek-ai/*` packages; the snapshot store is a local structural clone
@@ -13,7 +15,7 @@
  * @module dsh-web-fetch-playwright/client/form
  */
 
-import type { SettingsScope, SettingsScopeSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 
 /** The write one field's staged draft performs when the card is saved. */
 export type FieldWrite =
@@ -164,27 +166,35 @@ export function numberField(field: string, min: number, max: number): CardFieldS
 }
 
 /**
- * Stages the Playwright card's edits over one settings namespace and writes
- * them on save. Publishes through a snapshot store because slot components
- * read through a selector while both the scope and the drafts change below.
+ * Stages the Playwright card's edits over one plugin-entry configuration
+ * form and writes them on save. Publishes through a snapshot store because
+ * slot components read through a selector while both the form and the drafts
+ * change below.
  */
 export class CardForm<T> {
   private readonly specs: Map<string, CardFieldSpec>
   private readonly staged = new Map<string, StagedEdit>()
   private readonly listeners = new Set<() => void>()
+  private readonly unsubscribe: () => void
   private saving = false
   private failed = false
 
   /**
-   * @param scope - the bound settings scope for this card's namespace.
+   * @param scope - the shared configuration form for this plugin's entry.
    * @param specs - the section fields this card edits.
    */
   constructor(
-    private readonly scope: SettingsScope<T>,
+    private readonly scope: ConfigForm<T>,
     specs: CardFieldSpec[],
   ) {
     this.specs = new Map(specs.map(spec => [spec.field, spec]))
-    scope.subscribe(() => { this.publish() })
+    this.unsubscribe = scope.subscribe(() => { this.publish() })
+  }
+
+  /** Release the form subscription and every bound stores. */
+  dispose(): void {
+    this.unsubscribe()
+    this.listeners.clear()
   }
 
   /**
@@ -270,7 +280,9 @@ export class CardForm<T> {
   /**
    * Write every staged edit, then re-seed from what the Host accepted. A save
    * that did not land keeps its drafts, so the user corrects them instead of
-   * retyping.
+   * retyping. The shared form reports `false` (and reloads Host state) for a
+   * refused revision or validation, and a transport drop rejects — both fold
+   * into the same failed-save path.
    */
   async save(): Promise<void> {
     const plan = this.plan()
@@ -312,13 +324,21 @@ export class CardForm<T> {
   }
 
   private async clear(field: string): Promise<boolean> {
-    await this.scope.unset(field)
-    return !this.stored(field)
+    try {
+      return await this.scope.unset(field)
+    } catch (_sectionWriteFailure) {
+      // The Host refused the write: keep the drafts, flag the failure.
+      return false
+    }
   }
 
   private async store(field: string, value: unknown): Promise<boolean> {
-    await this.scope.set(field, value)
-    return this.userLayer()?.[field] === value
+    try {
+      return await this.scope.set(field, value)
+    } catch (_sectionWriteFailure) {
+      // The Host refused the write: keep the drafts, flag the failure.
+      return false
+    }
   }
 
   private stage(field: string, edit: StagedEdit): void {
@@ -333,7 +353,7 @@ export class CardForm<T> {
     return spec
   }
 
-  private snapshotOf(): SettingsScopeSnapshot<T> {
+  private snapshotOf(): ConfigFormSnapshot<T> {
     return this.scope.getSnapshot()
   }
 
