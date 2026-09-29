@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-09-28
+
+### Fixed
+
+- **The plugin now activates on dsh web hosts whose profile-scope module resolution chokes on tr46's `require("punycode/")`.** dsh ≥ 0.1.7 intercepts Node's CommonJS resolver for every package installed in a profile; its router classifies `punycode/` (the standard npm-package-over-deprecated-builtin idiom used by tr46, reached through jsdom → whatwg-url) as the builtin stem `punycode`, `require.resolve.paths()` answers `null` for a builtin, and the unguarded iteration throws `TypeError: createRequire.resolve.paths is not a function or its return value is not iterable` — killing the whole plugin import and leaving the entry enabled-but-fiberless, shown as 未运行 on the Plugins page (any other plugin whose tree required `punycode/` at load time failed identically; `dsh-web-search-aggregation` and friends survived only because their dependency trees never touch the idiom). Two contained changes, with behavior otherwise identical: jsdom is now loaded lazily on the first denoise call (`loadJsdom` in `src/markdown.ts`, CommonJS `createRequire` so `htmlToMarkdown` stays synchronous), so plugin activation no longer depends on jsdom's import chain surviving host interception at all; and a probe-then-patch compat shim (`src/host-resolve-compat.ts`) installs immediately before that first jsdom load — it wraps the public `Module._resolveFilename` and re-dispatches exactly the `<deprecated builtin>/` request shape with an explicit `paths` list, which every layer of the resolution chain (the host's included) by documented behavior defers to the native resolver, landing on the real npm `punycode`. On healthy hosts the probe resolves the request and no wrapper is ever installed. Full suite (131 tests incl. real-browser integration), typecheck, and build stay green; verified end-to-end against a clone of the affected profile: import succeeds, the denoise pipeline returns real markdown under the same interception that previously crashed, and the entry boots to `fiber=active` with zero startup warnings.
+
 ## [0.2.8] - 2026-09-27
 
 ### Changed

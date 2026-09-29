@@ -11,16 +11,46 @@
  * options and span-safe table rules as the shipped `dsh-tool-web` renderer,
  * so output is consistent with what `web_fetch` produces elsewhere.
  *
- * Pure and synchronous — unit-tested against fixture pages.
+ * Synchronous for its callers and unit-tested against fixture pages: jsdom
+ * itself is loaded lazily on the first call — and, inside a dsh profile, only
+ * after `installBuiltinSlashResolveCompat`, so a host resolver that
+ * mishandles tr46's `require("punycode/")` cannot take the plugin down.
  *
  * @module dsh-web-fetch-playwright/markdown
  */
 
-import { JSDOM, VirtualConsole } from 'jsdom'
+import { createRequire } from 'node:module'
 import createDOMPurify from 'dompurify'
 import { Readability } from '@mozilla/readability'
 import TurndownService from 'turndown'
 import { gfm } from '@joplin/turndown-plugin-gfm'
+import { installBuiltinSlashResolveCompat } from './host-resolve-compat.ts'
+
+/** `createRequire` anchored at this module, so jsdom resolves from this install. */
+const require_ = createRequire(import.meta.url)
+
+/** The lazily loaded jsdom exports; jsdom is CommonJS, so loading stays synchronous. */
+type JsdomModule = typeof import('jsdom')
+
+/** Loaded jsdom module, cached after the first denoise. */
+let jsdom: JsdomModule | undefined
+
+/**
+ * Load jsdom on first use, installing the host resolve compat first.
+ *
+ * Deferral serves two purposes: plugin activation never depends on jsdom's
+ * import chain surviving the host's module-resolution interception, and the
+ * compat shim — which must wrap the resolver *before* tr46's
+ * `require("punycode/")` runs — gets a guaranteed installation point.
+ * @returns the jsdom module exports.
+ */
+function loadJsdom(): JsdomModule {
+  if (jsdom === undefined) {
+    installBuiltinSlashResolveCompat()
+    jsdom = require_('jsdom') as JsdomModule
+  }
+  return jsdom
+}
 
 /** Layout/noise tags DOMPurify removes outright (with their content). */
 const FORBID_TAGS = [
@@ -157,6 +187,7 @@ export interface DenoiseResult {
  * @returns the markdown and the extraction mode used.
  */
 export function htmlToMarkdown(html: string, url: string): DenoiseResult {
+  const { JSDOM, VirtualConsole } = loadJsdom()
   // jsdom's virtual console defaults to forwarding parse noise; a silent one
   // keeps broken inline CSS on random pages out of host logs.
   const dom = new JSDOM(html, { url, virtualConsole: new VirtualConsole() })
