@@ -34,6 +34,8 @@ web_fetch (tool-web)
         └─ Markdown (or raw HTML when denoise is off)
 ```
 
+**Non-2xx statuses are results, not errors** — the web seam's contract (`@deepseek-ai/dsh-web`): a fetched 404/418/500 comes back with its status code, exactly what `dsh-web-fetch-http` does. Chromium complicates this for *status-only* responses — an error status with an empty body (httpbin's `/status/404`) fails the whole navigation with `net::ERR_HTTP_RESPONSE_CODE_FAILURE`, and a 204/205 is aborted (`net::ERR_ABORTED`) because nothing is renderable. The provider therefore tracks the last main-frame response on every fetch (that response arrives before Chromium fails the navigation) and recovers such failures into the status-bearing result, so `web_fetch` reports `Fetched … (HTTP 404)` instead of a `WEB_PROVIDER_ERROR` throw. A recovered response that is itself a Cloudflare challenge edge still fails with `WEB_FETCH_CHALLENGE`; transport errors and cancellations stay errors.
+
 ## Requirements
 
 - DSH web profile (`dsh web`), Node.js ≥ 20.

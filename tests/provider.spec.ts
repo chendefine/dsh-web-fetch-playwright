@@ -28,6 +28,21 @@ interface FakePageSpec {
   /** Never settle `goto` on its own — it rejects when the page closes. */
   hangGoto?: boolean
   /**
+   * Chromium status-render failure (httpbin `/status/N` shape): `goto` emits
+   * a main-frame response event (headers arrive before the loader is torn
+   * down), then rejects with the net error Chromium reports for a response
+   * it refused to render — `ERR_HTTP_RESPONSE_CODE_FAILURE` by default, or
+   * `ERR_ABORTED` with `aborted: true` (the 204/205 shape).
+   */
+  statusFailure?: {
+    status?: number
+    contentType?: string
+    headers?: Record<string, string>
+    body?: string
+    url?: string
+    aborted?: boolean
+  }
+  /**
    * Single-shot challenge goto: 403 + `cf-mitigated: challenge` + the
    * interstitial HTML, cleared only by the scripted probe behavior below.
    */
@@ -136,6 +151,29 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, popupListeners: 
       // A closed page rejects navigation, like a real Playwright page.
       if (state.pageClosed) return Promise.reject(new Error('Target closed'))
       if (spec.gotoError !== undefined) return Promise.reject(spec.gotoError)
+      if (spec.statusFailure !== undefined) {
+        // Chromium's order: responseReceived (the response event) fires
+        // before loadingFailed (the goto rejection) — the provider's
+        // recovery depends on exactly that ordering.
+        const sf = spec.statusFailure
+        const responseUrl = sf.url ?? spec.finalUrl ?? 'https://final.example.com/docs'
+        const response: PlaywrightResponse = {
+          status: () => sf.status ?? 404,
+          headers: () => ({ 'content-type': sf.contentType ?? 'text/html; charset=utf-8', ...(sf.headers ?? {}) }),
+          text: async () => sf.body ?? '',
+          url: () => responseUrl,
+          request: () => ({
+            isNavigationRequest: () => true,
+            resourceType: () => 'document',
+            frame: () => mainFrameToken,
+          }),
+        }
+        for (const listener of [...responseListeners]) listener(response)
+        const netError = sf.aborted === true ? 'net::ERR_ABORTED' : 'net::ERR_HTTP_RESPONSE_CODE_FAILURE'
+        return Promise.reject(new Error(
+          `page.goto: ${netError} at ${responseUrl}\nCall log:\n  - navigating to "${responseUrl}", waiting until "domcontentloaded"`,
+        ))
+      }
       if (spec.hangGoto === true) {
         return new Promise((_resolve, reject) => { gotoRejecters.push(reject) })
       }
@@ -413,6 +451,105 @@ describe('PlaywrightFetchProvider', () => {
   it('survives a networkidle settle timeout (keeps domcontentloaded content)', async () => {
     const result = await new FakeProvider({}, { networkIdleError: true }).fetch({ url: 'https://example.com/spa' })
     expect(result.body.kind).toBe('text')
+  })
+})
+
+describe('PlaywrightFetchProvider status-only navigation recovery', () => {
+  /**
+   * The seam contract: "a successful network fetch of a non-2xx response is
+   * a result, not an error". Chromium breaks the goto for status-only
+   * responses (empty-bodied error statuses via ERR_HTTP_RESPONSE_CODE_FAILURE;
+   * 204/205 via ERR_ABORTED) — the tracker lets the provider keep the
+   * contract the http backend already honors.
+   */
+  it('recovers an empty-bodied 404 (httpbin /status/N) as a result, not WEB_PROVIDER_ERROR', async () => {
+    const result = await new FakeProvider({}, { statusFailure: { status: 404, url: 'https://httpbin.org/status/404' } })
+      .fetch({ url: 'https://httpbin.org/status/404' })
+    expect(result.statusCode).toBe(404)
+    expect(result.url).toBe('https://httpbin.org/status/404')
+    expect(result.body).toEqual({ kind: 'text', content: '' })
+    expect(result.truncated).toBe(false)
+  })
+
+  it('recovers 4xx and 5xx shapes alike with the tracked content type', async () => {
+    for (const [status, contentType] of [[418, 'text/html; charset=utf-8'], [500, 'application/json']] as const) {
+      const result = await new FakeProvider({}, { statusFailure: { status, contentType } })
+        .fetch({ url: 'https://example.com/status' })
+      expect(result.statusCode).toBe(status)
+      expect(result.body).toEqual({ kind: 'text', content: '' })
+    }
+  })
+
+  it('recovers on the legacy challengeWaitMs: 0 path too (tracker is always on)', async () => {
+    const result = await new FakeProvider({ challengeWaitMs: 0 }, { statusFailure: { status: 404 } })
+      .fetch({ url: 'https://example.com/legacy' })
+    expect(result.statusCode).toBe(404)
+  })
+
+  it('recovers with the challenge wait armed without burning the challenge budget', async () => {
+    const result = await new FakeProvider({ challengeWaitMs: 60_000, challengeRetries: 3 }, { statusFailure: { status: 503 } })
+      .fetch({ url: 'https://example.com/slow-origin' })
+    expect(result.statusCode).toBe(503)
+  })
+
+  it('recovers a status-only 204 behind ERR_ABORTED as a result', async () => {
+    const result = await new FakeProvider({}, { statusFailure: { status: 204, aborted: true, contentType: '' } })
+      .fetch({ url: 'https://example.com/no-content' })
+    expect(result.statusCode).toBe(204)
+    expect(result.body).toEqual({ kind: 'text', content: '' })
+  })
+
+  it('keeps a body-bearing recovered html response through the denoise pipeline', async () => {
+    const result = await new FakeProvider({}, {
+      statusFailure: {
+        status: 404,
+        body: '<!doctype html><html><body><main><article><h1>Lost</h1><p>The page exists but the article is gone, with enough prose that the extractor locks on.</p></article></main></body></html>',
+      },
+    }).fetch({ url: 'https://example.com/gone' })
+    expect(result.statusCode).toBe(404)
+    expect(result.body.kind).toBe('text')
+    if (result.body.kind === 'text') {
+      expect(result.body.content).toMatch(/# (Lost|404|Fake page)/)
+    }
+  })
+
+  it('keeps a body-bearing recovered html page raw when denoise is off', async () => {
+    const result = await new FakeProvider({ denoise: false }, {
+      statusFailure: { status: 404, body: '<html><body>raw missing page</body></html>' },
+    }).fetch({ url: 'https://example.com/gone' })
+    expect(result.statusCode).toBe(404)
+    expect(result.body).toEqual({ kind: 'html', content: '<html><body>raw missing page</body></html>' })
+  })
+
+  it('refuses an unsupported content type on the recovered response', async () => {
+    const code = await codeOf(new FakeProvider({}, { statusFailure: { status: 404, contentType: 'application/octet-stream' } })
+      .fetch({ url: 'https://example.com/bin' }))
+    expect(code).toBe('WEB_UNSUPPORTED_CONTENT_TYPE')
+  })
+
+  it('fails with WEB_FETCH_CHALLENGE when the unrendered response is a challenge edge', async () => {
+    const error = await new FakeProvider({}, {
+      statusFailure: { status: 403, headers: { 'cf-mitigated': 'challenge', server: 'cloudflare' } },
+    }).fetch({ url: 'https://example.com/guarded' }).catch(error2 => error2)
+    expect(error).toBeInstanceOf(WebError)
+    expect((error as WebError).code).toBe(WEB_FETCH_CHALLENGE_CODE)
+    expect((error as WebError).message).toContain('HTTP 403')
+  })
+
+  it('does NOT recover an ERR_ABORTED whose tracked status is not 204/205 (a download, an SPA cancel)', async () => {
+    const code = await codeOf(new FakeProvider({}, { statusFailure: { status: 200, aborted: true, body: 'irrelevant' } })
+      .fetch({ url: 'https://example.com/attachment' }))
+    expect(code).toBe('WEB_PROVIDER_ERROR')
+  })
+
+  it('propagates WEB_PROVIDER_ERROR when no response event survived the failure', async () => {
+    // gotoError rejects BEFORE any response event — a backend without
+    // response tracking (minimal fake) cannot support recovery.
+    const code = await codeOf(
+      new FakeProvider({}, { gotoError: new Error('page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE at https://example.com/x') })
+        .fetch({ url: 'https://example.com/x' }),
+    )
+    expect(code).toBe('WEB_PROVIDER_ERROR')
   })
 })
 

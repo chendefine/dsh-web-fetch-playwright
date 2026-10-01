@@ -146,6 +146,28 @@ beforeAll(async () => {
       }
       return
     }
+    if (url === '/status/404') {
+      // httpbin /status/N parity: an error status whose body is EMPTY. Some
+      // Chromium builds refuse to render such responses and fail the whole
+      // navigation (ERR_HTTP_RESPONSE_CODE_FAILURE); the seam contract still
+      // wants the status as a result.
+      res.writeHead(404, { 'content-type': 'text/html; charset=utf-8' })
+      res.end()
+      return
+    }
+    if (url === '/status/500') {
+      res.writeHead(500, { 'content-type': 'application/json' })
+      res.end()
+      return
+    }
+    if (url === '/no-content') {
+      // Status-only success: Chromium never renders a 204 document and
+      // aborts the navigation (ERR_ABORTED) even though the response is
+      // final — the recovery path must surface it as a result.
+      res.writeHead(204, { 'content-type': 'text/html; charset=utf-8' })
+      res.end()
+      return
+    }
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
     res.end(PAGE)
   })
@@ -240,6 +262,78 @@ describe('PlaywrightFetchProvider integration', () => {
       .then(() => { throw new Error('expected rejection') }, (e: unknown) => e)
     expect(error).toBeInstanceOf(WebError)
     expect((error as WebError).code).toBe('WEB_PROVIDER_ERROR')
+  })
+
+  /**
+   * The seam contract ("a successful network fetch of a non-2xx response is
+   * a result, not an error") meets Chromium's refusal to render status-only
+   * responses. Whether the local build commits the empty document or fails
+   * the navigation, the provider must answer with the STATUS — the same
+   * thing `dsh-web-fetch-http` returns for these URLs.
+   */
+  it('returns an empty-bodied 404 as a result (httpbin /status parity)', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping browser smoke (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'local',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      shareBrowserContext: true,
+      denoise: true,
+      maxConcurrency: 4,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
+    }))
+    const result = await provider.fetch({ url: `${baseUrl}status/404` })
+    expect(result.statusCode).toBe(404)
+    expect(result.body.kind).toBe('text')
+    expect(result.body.kind === 'text' ? result.body.content : '').toBe('')
+  })
+
+  it('returns an empty-bodied 500 json status as a result', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping browser smoke (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'local',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      shareBrowserContext: true,
+      denoise: true,
+      maxConcurrency: 4,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
+    }))
+    const result = await provider.fetch({ url: `${baseUrl}status/500` })
+    expect(result.statusCode).toBe(500)
+  })
+
+  /**
+   * 204 is the one status-only response EVERY Chromium build refuses to
+   * render (ERR_ABORTED), so this case exercises the recovery path through
+   * a real browser and a real navigation failure.
+   */
+  it('recovers a status-only 204 from Chromium\'s ERR_ABORTED as a result', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping browser smoke (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'local',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      shareBrowserContext: true,
+      denoise: true,
+      maxConcurrency: 4,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
+    }))
+    const result = await provider.fetch({ url: `${baseUrl}no-content` })
+    expect(result.statusCode).toBe(204)
+    expect(result.body.kind === 'text' ? result.body.content : '').toBe('')
   })
 })
 

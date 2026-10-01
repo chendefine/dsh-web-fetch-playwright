@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-09-29
+
+### Fixed
+
+- **A status-only HTTP response is now a result, not a `WEB_PROVIDER_ERROR`** (badcase: `https://httpbin.org/status/404` → `page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE`). The web seam's contract says "a successful network fetch of a non-2xx response is a result, not an error: the status code is part of the fetched resource state", and `dsh-web-fetch-http` honors it — but the Playwright backend let Chromium's *rendering* decisions leak out as fetch failures: some Chromium builds refuse to commit an error-status response whose body is empty (httpbin `/status/N`: `Content-Length: 0`) and fail the whole navigation with `net::ERR_HTTP_RESPONSE_CODE_FAILURE`, and every build aborts a status-only 204/205 document with `net::ERR_ABORTED` (both documented as rendering/API-level decisions in `net_error_list.h`/`NavigationRequest`, not transport errors); the provider then wrapped the throw as `WEB_PROVIDER_ERROR`, so the agent saw a hard error where the tool layer expects `Fetched … (HTTP 404)`. The last main-frame response is now tracked on every fetch — the response arrives (and is recorded) before Chromium fails the navigation, verified against a real browser — and such a failed `goto` is recovered into the status-bearing result (`statusCode` 404/418/500/204…, empty body decoded as the empty string it is; the `denoise` toggle still applies when a body exists). Deliberately NOT recovered: transport errors (no response to recover), our own deadline/abort (still `WEB_FETCH_TIMEOUT`/`WEB_ABORTED`), `ERR_ABORTED` whose tracked status is not 204/205 (downloads, SPA cancels), and a recovered response that is itself a Cloudflare challenge edge (still `WEB_FETCH_CHALLENGE`, keeping the plugin's never-pass-challenge-content invariant). The tracker is now always installed (previously only with `challengeWaitMs > 0`), which changes nothing else: the challenge wait's use of the LAST response stays gated on the feature switch. Full suite (145 tests incl. three real-browser cases — an empty-bodied 404/500 and a genuine Chromium `ERR_ABORTED` on 204 that failed as `WEB_PROVIDER_ERROR` before the fix), typecheck, and build stay green; verified end-to-end against live `https://httpbin.org/status/404` (now `RESULT statusCode=404`).
+
 ## [0.2.9] - 2026-09-28
 
 ### Fixed

@@ -2,7 +2,16 @@
  * The Playwright `WebFetchProvider`: renders one URL in a real browser and
  * returns it as markdown (denoised) or HTML. Mirrors `dsh-web-fetch-http`'s
  * error taxonomy (URL hygiene, abort/timeout translation, content-type
- * classification) so the tool layer sees the same codes from either backend.
+ * classification) so the tool layer sees the same codes from either backend —
+ * including the seam contract that a fetched non-2xx status is a RESULT, not
+ * an error. Chromium can make that awkward: it refuses to render status-only
+ * responses (error statuses with an empty body — httpbin's `/status/N` —
+ * plus 204/205), failing the whole navigation with
+ * `net::ERR_HTTP_RESPONSE_CODE_FAILURE` / `net::ERR_ABORTED` even though the
+ * response itself arrived. The last main-frame response is therefore tracked
+ * on every fetch, and such a failed `goto` is recovered into the
+ * status-bearing result the contract demands instead of a
+ * `WEB_PROVIDER_ERROR` (see {@link recoverUnrenderedStatus}).
  *
  * Lifecycle: the local backend launches a browser per fetch and closes it —
  * nothing outlives the call. The CDP backend keeps ONE shared connection to
@@ -414,18 +423,23 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
   ): Promise<WebFetchResult> {
     const page = session.page
     const challengeWaitMs = effectiveChallengeWaitMs(config)
+    // The tracker is always on: the challenge wait needs the LAST main-frame
+    // response (feature switch below only gates the waiting), and status
+    // recovery needs whatever response arrived before a failed goto.
+    const tracker = trackMainFrameResponses(page)
     // Feature switch: 0 keeps the exact legacy (pre-0.2.5) behavior — the
     // first response decides, no waiting — an escape hatch and the A/B
     // baseline every test proves the bug against.
-    const tracker = challengeWaitMs > 0 ? trackMainFrameResponses(page) : undefined
-    let response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: deadline.remainingMs() })
-    tracker?.seed(response)
+    const first = await this.navigate(page, url, tracker, deadline, config.denoise)
+    if (first.recovered !== undefined) return first.recovered
+    let response = first.response
+    tracker.seed(response)
 
     let challengeEntryResponse: PlaywrightResponse | null = null
     if (challengeWaitMs > 0) {
       let attemptsLeft = effectiveChallengeRetries(config) + 1
       for (;;) {
-        const verdict = await this.verdictAfterLoad(page, tracker?.last() ?? response)
+        const verdict = await this.verdictAfterLoad(page, tracker.last() ?? response)
         if (verdict === 'blocked') {
           throw new WebError(
             `the site hard-blocked this fetch at its Cloudflare edge (waiting cannot clear it): ${page.url()}`,
@@ -433,7 +447,7 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
           )
         }
         if (verdict !== 'challenge') break
-        challengeEntryResponse = tracker?.last() ?? response
+        challengeEntryResponse = tracker.last() ?? response
         const cleared = await this.waitForChallengeClear(page, deadline, challengeWaitMs)
         if (cleared) {
           // The settled document may be the next round of a CHAINED
@@ -446,7 +460,7 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
           if (!chained) break
         }
         if (--attemptsLeft <= 0) {
-          const lastStatus = (tracker?.last() ?? response)?.status()
+          const lastStatus = (tracker.last() ?? response)?.status()
           throw new WebError(
             `the site kept serving a Cloudflare challenge (last status ${lastStatus === undefined ? 'unknown' : String(lastStatus)}) for up to ${String(challengeWaitMs)}ms across ${String(effectiveChallengeRetries(config) + 1)} attempt(s); the browser did not clear it naturally — retry later, raise challengeWaitMs, or use a profile whose browser already holds clearance`,
             WEB_FETCH_CHALLENGE_CODE,
@@ -455,14 +469,16 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
         // Same page, same context — after an expired window OR a chained
         // round: any clearance cookies already earned stay in the jar for
         // this one retry, then everything is torn down as usual.
-        response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: deadline.remainingMs() })
-        tracker?.seed(response)
+        const retry = await this.navigate(page, url, tracker, deadline, config.denoise)
+        if (retry.recovered !== undefined) return retry.recovered
+        response = retry.response
+        tracker.seed(response)
       }
     }
 
     // Final document: the LAST main-frame response when the challenge wait
     // ran (the real page reloads in), else the response goto returned.
-    const finalResponse = (challengeWaitMs > 0 ? tracker?.last() : undefined) ?? response
+    const finalResponse = (challengeWaitMs > 0 ? tracker.last() : undefined) ?? response
     const kind = classifyContentType(finalResponse?.headers()['content-type'])
     if (kind === undefined) {
       throw new WebError(`unsupported content type "${finalResponse?.headers()['content-type'] ?? 'unknown'}"`, 'WEB_UNSUPPORTED_CONTENT_TYPE')
@@ -495,6 +511,37 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     return bounded !== html
       ? { ...result, truncated: true }
       : result
+  }
+
+  /**
+   * One tracked `goto`: the navigation response on success, or — when
+   * Chromium failed the navigation purely because of the HTTP status it
+   * received (an error status with an empty body, or a status-only 204/205)
+   * — the recovered status-bearing result from {@link recoverUnrenderedStatus}.
+   *
+   * @returns the response `goto` resolved with, plus `recovered` when the
+   * navigation failure was recovered into a finished result the caller must
+   * return verbatim (the throw never escapes in that case).
+   */
+  private async navigate(
+    page: PlaywrightPage,
+    url: URL,
+    tracker: MainFrameTracker,
+    deadline: Deadline,
+    denoise: boolean,
+  ): Promise<{ response: PlaywrightResponse | null; recovered?: WebFetchResult }> {
+    try {
+      const response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: deadline.remainingMs() })
+      return { response }
+    } catch (error) {
+      // Our own deadline/abort closing the page mid-navigation is a
+      // cancellation (translateError classifies it) — never a status fact.
+      if (!deadline.signal.aborted) {
+        const recovered = await recoverUnrenderedStatus(error, tracker, url, denoise)
+        if (recovered !== undefined) return { response: null, recovered }
+      }
+      throw error
+    }
   }
 
   /**
@@ -606,6 +653,88 @@ function trackMainFrameResponses(page: PlaywrightPage): MainFrameTracker {
     last: () => last,
     seed: (response) => { if (response !== null) last = response },
   }
+}
+
+/**
+ * Whether a `goto` throw is Chromium refusing to RENDER a response it
+ * received — not a transport failure. Two net errors, both documented as
+ * rendering decisions rather than network ones:
+ *
+ * - `ERR_HTTP_RESPONSE_CODE_FAILURE` — an error status whose empty body
+ *   leaves nothing to commit (httpbin's `/status/N`); net_error_list.h
+ *   describes the code as "only used by certain APIs that interpret the
+ *   HTTP response itself".
+ * - `ERR_ABORTED` on a status-only 204/205 — Chromium never renders those
+ *   documents (`NavigationRequest` aborts them), while the response is
+ *   final and the seam contract wants it as a result.
+ *
+ * @param error - the value `page.goto` rejected with.
+ * @param status - the status of the last tracked main-frame response.
+ * @returns true when the navigation failed for the status it received.
+ */
+function isUnrenderedStatusFailure(error: unknown, status: number): boolean {
+  if (!(error instanceof Error)) return false
+  const message = error.message
+  if (message.includes('ERR_HTTP_RESPONSE_CODE_FAILURE')) return true
+  return message.includes('ERR_ABORTED') && (status === 204 || status === 205)
+}
+
+/**
+ * Recover the response behind a status-only navigation failure into the
+ * result the web seam's contract demands — "a successful network fetch of a
+ * non-2xx response is a result, not an error: the status code is part of the
+ * fetched resource state" (`@deepseek-ai/dsh-web` types). The main-frame
+ * response arrives (and the tracker records it) before Chromium fails the
+ * navigation, so its status, headers, and URL are recoverable; only the body
+ * dies with the unrendered loader, and this failure class only fires on
+ * empty bodies — so an unreadable body decodes as the empty string it is.
+ *
+ * Deliberately NOT recovered: genuine transport errors (they carry no
+ * response), and our own deadline/abort (the caller classifies those).
+ *
+ * @param error - the value `page.goto` rejected with.
+ * @param tracker - the fetch's main-frame response record.
+ * @param url - the request URL (fallback when the response carries none).
+ * @param denoise - the settings toggle, honored as on the normal HTML path.
+ * @returns the finished fetch result, or undefined when the failure is not
+ * a recoverable status-only navigation (the throw should propagate).
+ */
+async function recoverUnrenderedStatus(
+  error: unknown,
+  tracker: MainFrameTracker,
+  url: URL,
+  denoise: boolean,
+): Promise<WebFetchResult | undefined> {
+  const response = tracker.last()
+  if (response === null) return undefined
+  const status = response.status()
+  if (!isUnrenderedStatusFailure(error, status)) return undefined
+  const headers = response.headers()
+  // A challenge edge answering with nothing to render cannot be waited out
+  // (no document ever loaded to clear); keep the plugin's invariant of
+  // never passing challenge responses through as content.
+  if (classifyChallengeResponse(status, headers) === 'challenge') {
+    throw new WebError(
+      `the site answered with a Cloudflare challenge response (HTTP ${String(status)}) whose empty body the browser refused to render; waiting cannot clear it — retry later or use a profile whose browser already holds clearance`,
+      WEB_FETCH_CHALLENGE_CODE,
+    )
+  }
+  const kind = classifyContentType(headers['content-type'])
+  if (kind === undefined) {
+    throw new WebError(`unsupported content type "${headers['content-type'] ?? 'unknown'}"`, 'WEB_UNSUPPORTED_CONTENT_TYPE')
+  }
+  const finalUrl = response.url?.() ?? url.toString()
+  // The unrenderable loader may refuse the body read too; this failure
+  // class only fires on empty bodies, so '' is the honest fallback.
+  let content = ''
+  try { content = await response.text() } catch { content = '' }
+  if (kind === 'text' || content === '') {
+    // Empty HTML needs no pipeline — the empty string IS the body.
+    return capResult(finalUrl, status, { kind: 'text', content })
+  }
+  if (!denoise) return capResult(finalUrl, status, { kind: 'html', content })
+  const { markdown } = htmlToMarkdown(content, finalUrl)
+  return capResult(finalUrl, status, { kind: 'text', content: markdown })
 }
 
 /**
