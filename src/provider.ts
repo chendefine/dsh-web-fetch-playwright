@@ -7,11 +7,16 @@
  * an error. Chromium can make that awkward: it refuses to render status-only
  * responses (error statuses with an empty body — httpbin's `/status/N` —
  * plus 204/205), failing the whole navigation with
- * `net::ERR_HTTP_RESPONSE_CODE_FAILURE` / `net::ERR_ABORTED` even though the
- * response itself arrived. The last main-frame response is therefore tracked
- * on every fetch, and such a failed `goto` is recovered into the
- * status-bearing result the contract demands instead of a
- * `WEB_PROVIDER_ERROR` (see {@link recoverUnrenderedStatus}).
+ * `net::ERR_HTTP_RESPONSE_CODE_FAILURE` / `net::ERR_ABORTED`, and it hands a
+ * `Content-Disposition: attachment` response (publish.twitter.com's oembed
+ * JSON, the URL agents use to read a tweet) to its download manager instead
+ * of committing a document, failing `goto` with "Download is starting" —
+ * even though the response itself arrived and is decodable. The last
+ * main-frame response is therefore tracked on every fetch, and such failed
+ * `goto`s are recovered — the status-only shape into the status-bearing
+ * result ({@link recoverUnrenderedStatus}), the download shape via a
+ * refetch through the page's API request context
+ * ({@link recoverDownloadResponse}) — instead of a `WEB_PROVIDER_ERROR`.
  *
  * Lifecycle: the local backend launches a browser per fetch and closes it —
  * nothing outlives the call. The CDP backend keeps ONE shared connection to
@@ -55,7 +60,7 @@ import type { ResolvedConfig } from './config.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
 import { htmlToMarkdown } from './markdown.ts'
 import { resolveCdpBackend, resolvePlaywrightBackend } from './playwright-resolve.ts'
-import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage, PlaywrightResponse, PlaywrightRoute } from './types.ts'
+import type { PlaywrightBrowser, PlaywrightContext, PlaywrightDownload, PlaywrightPage, PlaywrightResponse, PlaywrightRoute } from './types.ts'
 
 /** Stable id this provider registers under (the bundle patch pins it). */
 export const PLAYWRIGHT_FETCH_PROVIDER_ID = 'playwright'
@@ -373,6 +378,7 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
         const lease = await this.cdpPool.acquire(endpoint, timeout, effectiveContextMode(config))
         await installResourceFilter(lease.page)
         guardPopups(lease.page)
+        guardDownloads(lease.page)
         return {
           browser: lease.browser,
           context: lease.context,
@@ -396,6 +402,7 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       const page = await context.newPage()
       await installResourceFilter(page)
       guardPopups(page)
+      guardDownloads(page)
       return { browser, context, page }
     } catch (error: unknown) {
       // A partial setup (browser launched, then newContext/newPage failed)
@@ -515,9 +522,12 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
 
   /**
    * One tracked `goto`: the navigation response on success, or — when
-   * Chromium failed the navigation purely because of the HTTP status it
-   * received (an error status with an empty body, or a status-only 204/205)
-   * — the recovered status-bearing result from {@link recoverUnrenderedStatus}.
+   * Chromium failed the navigation for a reason that is not a transport
+   * error — the recovered finished result. Two such reasons are recovered:
+   * the HTTP status it received (an error status with an empty body, or a
+   * status-only 204/205 — {@link recoverUnrenderedStatus}), and the response
+   * being a download the browser refuses to commit as a document
+   * (`Content-Disposition: attachment` — {@link recoverDownloadResponse}).
    *
    * @returns the response `goto` resolved with, plus `recovered` when the
    * navigation failure was recovered into a finished result the caller must
@@ -539,6 +549,8 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       if (!deadline.signal.aborted) {
         const recovered = await recoverUnrenderedStatus(error, tracker, url, denoise)
         if (recovered !== undefined) return { response: null, recovered }
+        const download = await recoverDownloadResponse(error, page, tracker, url, deadline, denoise)
+        if (download !== undefined) return { response: null, recovered: download }
       }
       throw error
     }
@@ -738,6 +750,104 @@ async function recoverUnrenderedStatus(
 }
 
 /**
+ * Whether a `goto` throw is Chromium handing the navigation to its download
+ * manager instead of committing a document. Playwright rejects with
+ * "Download is starting" when the navigation response carries
+ * `Content-Disposition: attachment` (publish.twitter.com's oembed endpoint —
+ * the workaround URL agents use to read a tweet — serves exactly that:
+ * decodable `application/json` the browser still refuses to render). The
+ * attachment disposition on the tracked response is a second,
+ * engine-version-proof signal for engines that report a plain `ERR_ABORTED`
+ * instead; note `ERR_ABORTED` alone is NOT enough (the status recovery
+ * above legitimately owns the 204/205 shape, and SPA cancels abort too).
+ *
+ * @param error - the value `page.goto` rejected with.
+ * @param response - the last tracked main-frame response, if any.
+ * @returns true when the navigation failed because it became a download.
+ */
+function isDownloadFailure(error: unknown, response: PlaywrightResponse | null): boolean {
+  if (!(error instanceof Error)) return false
+  if (error.message.includes('Download is starting')) return true
+  if (!error.message.includes('ERR_ABORTED')) return false
+  const disposition = (response?.headers()['content-disposition'] ?? '').toLowerCase()
+  return disposition.includes('attachment')
+}
+
+/**
+ * Recover a download-turned navigation into the finished fetch result the
+ * seam's contract demands. The resource itself is often perfectly decodable
+ * — the oembed endpoint's `application/json` classifies as `text` — the
+ * browser just will not commit it as a document, and the response it tracked
+ * cannot yield its body either (Chromium streams a download to its download
+ * manager, so `Network.getResponseBody` answers "No resource with given
+ * identifier found"; both verified against a real browser). The body is
+ * therefore refetched through the page's API request context: plain HTTP
+ * from the Playwright client — same cookie jar, same URL, no render-or-
+ * download decision — which works identically on the local and CDP
+ * backends because it never touches the remote artifact.
+ *
+ * Undecodable downloads (a PDF, a ZIP) still fail with
+ * `WEB_UNSUPPORTED_CONTENT_TYPE`, classified from what the navigation
+ * actually served; a playwright build without a request context surfaces a
+ * clear "the browser will not render this" error instead of the raw
+ * "Download is starting".
+ *
+ * @param error - the value `page.goto` rejected with.
+ * @param page - the fetch's tab, for its API request context.
+ * @param tracker - the fetch's main-frame response record.
+ * @param url - the request URL (fallback when the response carries none).
+ * @param deadline - the fetch budget, applied to the refetch.
+ * @param denoise - the settings toggle, honored as on the normal HTML path.
+ * @returns the finished fetch result, or undefined when the failure is not
+ * a download navigation (the throw should propagate).
+ */
+async function recoverDownloadResponse(
+  error: unknown,
+  page: PlaywrightPage,
+  tracker: MainFrameTracker,
+  url: URL,
+  deadline: Deadline,
+  denoise: boolean,
+): Promise<WebFetchResult | undefined> {
+  const tracked = tracker.last()
+  if (!isDownloadFailure(error, tracked)) return undefined
+  if (tracked !== null) {
+    // What the site served the navigation is the truth about the resource:
+    // an undecodable download (PDF/ZIP/…) has no business being refetched.
+    const trackedKind = classifyContentType(tracked.headers()['content-type'])
+    if (trackedKind === undefined) {
+      throw new WebError(`unsupported content type "${tracked.headers()['content-type'] ?? 'unknown'}" (served as a download)`, 'WEB_UNSUPPORTED_CONTENT_TYPE')
+    }
+  }
+  if (page.request === undefined) {
+    throw new WebError(
+      'the response is a file download (Content-Disposition: attachment) the browser will not render, and this playwright build exposes no request context to refetch it',
+      'WEB_PROVIDER_ERROR',
+      { cause: error },
+    )
+  }
+  const fetchUrl = tracked?.url?.() ?? url.toString()
+  const refetched = await page.request.get(fetchUrl, { timeout: deadline.remainingMs(), signal: deadline.signal })
+  const headers = refetched.headers()
+  // The refetch speaks for the bytes it returned; only a content-type-free
+  // answer falls back to what the navigation served.
+  const servedType = (headers['content-type'] ?? '').trim() !== '' ? headers['content-type'] : tracked?.headers()['content-type']
+  const kind = classifyContentType(servedType)
+  if (kind === undefined) {
+    throw new WebError(`unsupported content type "${servedType ?? 'unknown'}"`, 'WEB_UNSUPPORTED_CONTENT_TYPE')
+  }
+  const finalUrl = refetched.url?.() ?? fetchUrl
+  const statusCode = refetched.status()
+  const content = await refetched.text()
+  if (kind === 'text') {
+    return capResult(finalUrl, statusCode, { kind: 'text', content })
+  }
+  if (!denoise) return capResult(finalUrl, statusCode, { kind: 'html', content })
+  const { markdown } = htmlToMarkdown(content, finalUrl)
+  return capResult(finalUrl, statusCode, { kind: 'text', content: markdown })
+}
+
+/**
  * Probe the live document for challenge markers. Prefers the in-page probe
  * (`page.evaluate`) — the only thing that can see SPA-style clears — and
  * falls back to reading and classifying the serialized HTML when the backend
@@ -826,6 +936,23 @@ async function installResourceFilter(owner: {
     })
   } catch {
     // keep going without the filter
+  }
+}
+
+/**
+ * Cancel any download Chromium starts on the fetch's tab. A navigation whose
+ * response carries `Content-Disposition: attachment` never commits a
+ * document — `goto` rejects with "Download is starting" and the recovery
+ * refetches the bytes (see {@link recoverDownloadResponse}) — but the
+ * browser still hands the original body to its download manager, which in
+ * profile mode would drop files into the remote machine's download dir.
+ * Best-effort: a page without the listener just loses the guard.
+ */
+function guardDownloads(page: PlaywrightPage): void {
+  try {
+    page.on?.('download', (download: PlaywrightDownload) => { void download.cancel().catch(() => {}) })
+  } catch {
+    // keep going without the guard
   }
 }
 

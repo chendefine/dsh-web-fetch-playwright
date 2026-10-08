@@ -14,7 +14,7 @@ import type { ResolvedConfig } from '../src/config.ts'
 import { CdpConnectionPool } from '../src/cdp-pool.ts'
 import { PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE } from '../src/provider.ts'
 import type { BrowserSession } from '../src/provider.ts'
-import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage, PlaywrightResponse } from '../src/types.ts'
+import type { PlaywrightBrowser, PlaywrightContext, PlaywrightDownload, PlaywrightPage, PlaywrightResponse } from '../src/types.ts'
 
 /** Everything a fake navigation can be told to produce. */
 interface FakePageSpec {
@@ -41,6 +41,26 @@ interface FakePageSpec {
     body?: string
     url?: string
     aborted?: boolean
+  }
+  /**
+   * A download-turned navigation (publish.twitter.com oembed shape):
+   * `goto` emits the main-frame response event — headers arrive before
+   * Chromium flips the navigation to its download manager, and the response
+   * body is already gone from the network stack — then rejects with
+   * Playwright's "Download is starting". The recovery refetches through
+   * `page.request`, which serves `refetched`.
+   */
+  downloadFailure?: {
+    status?: number
+    contentType?: string
+    headers?: Record<string, string>
+    url?: string
+    /** What the page's API request context serves the recovery refetch. */
+    refetched?: { status?: number; contentType?: string; body?: string }
+    /** Omit `page.request` to exercise the no-request-context error path. */
+    noRequestContext?: boolean
+    /** Reject with a bare `net::ERR_ABORTED` instead of "Download is starting". */
+    abortedSpelling?: boolean
   }
   /**
    * Single-shot challenge goto: 403 + `cf-mitigated: challenge` + the
@@ -86,6 +106,12 @@ interface FakePageState {
   pageClosed: boolean
   /** How many `goto` calls the page served. */
   gotos: number
+  /** Downloads the browser started (downloadFailure navigations fire one). */
+  downloadsStarted: number
+  /** How many of those the provider's guard canceled. */
+  downloadCancels: number
+  /** How many API-context refetches the page served. */
+  refetches: number
 }
 
 function fakeResponse(spec: FakePageSpec, entry?: NonNullable<FakePageSpec['gotoScript']>[number]): PlaywrightResponse | null {
@@ -106,10 +132,18 @@ function fakeResponse(spec: FakePageSpec, entry?: NonNullable<FakePageSpec['goto
   }
 }
 
+/** Guards (listeners) the provider registers on a fake page, for assertion. */
+interface FakePageListeners {
+  popup: Array<(page: PlaywrightPage) => void>
+  download: Array<(download: PlaywrightDownload) => void>
+}
+
 /** Shared page behavior: the members the provider touches, close tracking. */
-function makeFakePage(spec: FakePageSpec, state: FakePageState, popupListeners: Array<(page: PlaywrightPage) => void> = []): PlaywrightPage {
+function makeFakePage(spec: FakePageSpec, state: FakePageState, listeners: FakePageListeners = { popup: [], download: [] }): PlaywrightPage {
   const gotoRejecters: Array<(error: Error) => void> = []
   const responseListeners: Array<(response: PlaywrightResponse) => void> = []
+  const downloadListeners = listeners.download
+  const popupListeners = listeners.popup
   const scripted = spec.gotoScript ?? []
   let reads = 0
   let cleared = false
@@ -174,6 +208,34 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, popupListeners: 
           `page.goto: ${netError} at ${responseUrl}\nCall log:\n  - navigating to "${responseUrl}", waiting until "domcontentloaded"`,
         ))
       }
+      if (spec.downloadFailure !== undefined) {
+        // Chromium's order for a download-turned navigation: responseReceived
+        // (the response event with the attachment disposition) fires, the
+        // body is handed to the download manager (a download event follows),
+        // and only then does goto reject with "Download is starting".
+        const df = spec.downloadFailure
+        const responseUrl = df.url ?? spec.finalUrl ?? 'https://final.example.com/download.json'
+        const response: PlaywrightResponse = {
+          status: () => df.status ?? 200,
+          headers: () => ({ 'content-type': df.contentType ?? 'application/json; charset=utf-8', 'content-disposition': 'attachment; filename=json.json', ...(df.headers ?? {}) }),
+          // The network stack no longer has the body — the real error shape.
+          text: async () => { throw new Error('Protocol error (Network.getResponseBody): No resource with given identifier found') },
+          url: () => responseUrl,
+          request: () => ({
+            isNavigationRequest: () => true,
+            resourceType: () => 'document',
+            frame: () => mainFrameToken,
+          }),
+        }
+        for (const listener of [...responseListeners]) listener(response)
+        state.downloadsStarted++
+        const download: PlaywrightDownload = { cancel: async () => { state.downloadCancels++ } }
+        for (const listener of [...downloadListeners]) listener(download)
+        const netError = df.abortedSpelling === true ? 'net::ERR_ABORTED' : 'Download is starting'
+        return Promise.reject(new Error(
+          `page.goto: ${netError}\nCall log:\n  - navigating to "${responseUrl}", waiting until "domcontentloaded"`,
+        ))
+      }
       if (spec.hangGoto === true) {
         return new Promise((_resolve, reject) => { gotoRejecters.push(reject) })
       }
@@ -195,9 +257,10 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, popupListeners: 
       for (const reject of gotoRejecters.splice(0)) reject(new Error('Target closed'))
     },
     route: async () => {},
-    on: (event: 'popup' | 'response', listener: ((page: PlaywrightPage) => void) | ((response: PlaywrightResponse) => void)) => {
+    on: (event: 'popup' | 'response' | 'download', listener: ((page: PlaywrightPage) => void) | ((response: PlaywrightResponse) => void) | ((download: PlaywrightDownload) => void)) => {
       if (event === 'popup') popupListeners.push(listener as (page: PlaywrightPage) => void)
-      else responseListeners.push(listener as (response: PlaywrightResponse) => void)
+      else if (event === 'response') responseListeners.push(listener as (response: PlaywrightResponse) => void)
+      else downloadListeners.push(listener as (download: PlaywrightDownload) => void)
     },
     ...(spec.noEvaluate === true ? {} : {
       evaluate: async (): Promise<unknown> => {
@@ -206,12 +269,30 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, popupListeners: 
       },
     }),
     mainFrame: () => mainFrameToken,
+    ...(spec.downloadFailure?.noRequestContext === true ? {} : {
+      // The API request context the download recovery refetches through.
+      // Absent entirely when no spec asks for it, mirroring minimal fakes.
+      ...(spec.downloadFailure !== undefined ? {
+        request: {
+          get: async (fetchUrl: string): Promise<PlaywrightResponse> => {
+            state.refetches++
+            const rf = spec.downloadFailure?.refetched
+            return {
+              status: () => rf?.status ?? 200,
+              headers: () => ({ 'content-type': rf?.contentType ?? 'application/json; charset=utf-8' }),
+              text: async () => rf?.body ?? '{"type":"tweet","html":"<blockquote>…</blockquote>"}',
+              url: () => fetchUrl,
+            }
+          },
+        },
+      } : {}),
+    }),
   }
   return page
 }
 
 function fakeSession(spec: FakePageSpec): BrowserSession {
-  const pageState: FakePageState = { pageClosed: false, gotos: 0 }
+  const pageState: FakePageState = { pageClosed: false, gotos: 0, downloadsStarted: 0, downloadCancels: 0, refetches: 0 }
   const closed = { context: false, browser: false }
   const page = makeFakePage(spec, pageState)
   const context: PlaywrightContext = {
@@ -230,10 +311,13 @@ function fakeSession(spec: FakePageSpec): BrowserSession {
     closed: {
       get pageClosed() { return pageState.pageClosed },
       get gotos() { return pageState.gotos },
+      get downloadsStarted() { return pageState.downloadsStarted },
+      get downloadCancels() { return pageState.downloadCancels },
+      get refetches() { return pageState.refetches },
       get context() { return closed.context },
       get browser() { return closed.browser },
     },
-  } as unknown as BrowserSession & { closed: { pageClosed: boolean; context: boolean; browser: boolean; gotos: number } }
+  } as unknown as BrowserSession & { closed: { pageClosed: boolean; context: boolean; browser: boolean; gotos: number; downloadsStarted: number; downloadCancels: number; refetches: number } }
 }
 
 /** The provider under test: a fixed config and an injected fake session. */
@@ -319,11 +403,13 @@ function fakeCdpConnection(spec: FakePageSpec = {}) {
     browserClosed: false,
     /** Popup listeners the guard registered on the leased pages. */
     popupListeners: [] as Array<(page: PlaywrightPage) => void>,
+    /** Download listeners the guard registered on the leased pages. */
+    downloadListeners: [] as Array<(download: PlaywrightDownload) => void>,
   }
   const makePage = (): PlaywrightPage => {
     state.pagesOpened++
-    const pageState = { pageClosed: false, gotos: 0 }
-    const page = makeFakePage(spec, pageState, state.popupListeners)
+    const pageState: FakePageState = { pageClosed: false, gotos: 0, downloadsStarted: 0, downloadCancels: 0, refetches: 0 }
+    const page = makeFakePage(spec, pageState, { popup: state.popupListeners, download: state.downloadListeners })
     const base = page.close.bind(page)
     return {
       ...page,
@@ -536,7 +622,7 @@ describe('PlaywrightFetchProvider status-only navigation recovery', () => {
     expect((error as WebError).message).toContain('HTTP 403')
   })
 
-  it('does NOT recover an ERR_ABORTED whose tracked status is not 204/205 (a download, an SPA cancel)', async () => {
+  it('does NOT recover an ERR_ABORTED whose tracked response shows no attachment (an SPA cancel, a bare abort)', async () => {
     const code = await codeOf(new FakeProvider({}, { statusFailure: { status: 200, aborted: true, body: 'irrelevant' } })
       .fetch({ url: 'https://example.com/attachment' }))
     expect(code).toBe('WEB_PROVIDER_ERROR')
@@ -550,6 +636,119 @@ describe('PlaywrightFetchProvider status-only navigation recovery', () => {
         .fetch({ url: 'https://example.com/x' }),
     )
     expect(code).toBe('WEB_PROVIDER_ERROR')
+  })
+})
+
+describe('PlaywrightFetchProvider download navigation recovery', () => {
+  /**
+   * The badcase (https://publish.twitter.com/oembed?url=<tweet>): a
+   * decodable `application/json` body served with `Content-Disposition:
+   * attachment`. Chromium refuses to commit it as a document — goto rejects
+   * "Download is starting" and the body is gone from the network stack — so
+   * the provider refetches through the page's API request context and keeps
+   * the seam's "a fetched response is a result" contract.
+   */
+  it('recovers an attachment JSON (oembed shape) as a text result via the request-context refetch', async () => {
+    const provider = new FakeProvider({}, {
+      downloadFailure: {
+        status: 200,
+        contentType: 'application/json; charset=utf-8',
+        url: 'https://publish.x.com/oembed?url=https://x.com/tianyi/status/2105790798461882377',
+        refetched: { status: 200, contentType: 'application/json; charset=utf-8', body: '{"url":"https://x.com/tianyi/status/2105790798461882377","author_name":"Tianyi Cui"}' },
+      },
+    })
+    const result = await provider.fetch({ url: 'https://publish.twitter.com/oembed?url=https://x.com/tianyi/status/2105790798461882377' })
+    expect(result.statusCode).toBe(200)
+    expect(result.body.kind).toBe('text')
+    expect(result.body.kind === 'text' ? result.body.content : '').toContain('Tianyi Cui')
+    expect(result.truncated).toBe(false)
+  })
+
+  it('reports the refetch\'s status when the download answered non-2xx (contract: a result, not an error)', async () => {
+    const result = await new FakeProvider({}, {
+      downloadFailure: { status: 401, refetched: { status: 401, contentType: 'application/json', body: '{"errors":["Unauthorized"]}' } },
+    }).fetch({ url: 'https://example.com/oembed' })
+    expect(result.statusCode).toBe(401)
+    expect(result.body.kind).toBe('text')
+  })
+
+  it('runs an html attachment through the denoise pipeline, honoring the toggle', async () => {
+    const denoised = await new FakeProvider({}, {
+      downloadFailure: { contentType: 'text/html; charset=utf-8', refetched: { contentType: 'text/html; charset=utf-8', body: '<!doctype html><html><body><main><article><h1>Attached</h1><p>The saved page body, with enough prose that the extractor locks onto the article.</p></article></main></body></html>' } },
+    }).fetch({ url: 'https://example.com/saved-page' })
+    expect(denoised.body.kind).toBe('text')
+    if (denoised.body.kind === 'text') expect(denoised.body.content).toMatch(/# Attached/)
+
+    const raw = await new FakeProvider({ denoise: false }, {
+      downloadFailure: { contentType: 'text/html; charset=utf-8', refetched: { contentType: 'text/html; charset=utf-8', body: '<html><body>attached raw</body></html>' } },
+    }).fetch({ url: 'https://example.com/saved-page' })
+    expect(raw.body).toEqual({ kind: 'html', content: '<html><body>attached raw</body></html>' })
+  })
+
+  it('refuses an undecodable download (pdf/zip) as WEB_UNSUPPORTED_CONTENT_TYPE without refetching', async () => {
+    const provider = new FakeProvider({}, {
+      downloadFailure: { contentType: 'application/pdf' },
+    })
+    const code = await codeOf(provider.fetch({ url: 'https://example.com/file.pdf' }))
+    expect(code).toBe('WEB_UNSUPPORTED_CONTENT_TYPE')
+    const session = provider.lastSession as unknown as { closed: { refetches: number } }
+    expect(session.closed.refetches).toBe(0)
+  })
+
+  it('recognizes the ERR_ABORTED + attachment-disposition spelling of a download failure', async () => {
+    // Engines that report a plain ERR_ABORTED for a download: the tracked
+    // response's disposition is the second, engine-proof signal. (A bare
+    // ERR_ABORTED WITHOUT the disposition stays unrecovered — covered in the
+    // status-recovery block above.)
+    const result = await new FakeProvider({}, {
+      downloadFailure: {
+        abortedSpelling: true,
+        refetched: { status: 200, contentType: 'application/json', body: '{"ok":true}' },
+      },
+    }).fetch({ url: 'https://example.com/aborted-download' })
+    expect(result.statusCode).toBe(200)
+    expect(result.body.kind).toBe('text')
+    if (result.body.kind === 'text') expect(result.body.content).toBe('{"ok":true}')
+  })
+
+  it('fails with a clear WEB_PROVIDER_ERROR when the page exposes no request context', async () => {
+    const error = await new FakeProvider({}, {
+      downloadFailure: { noRequestContext: true },
+    }).fetch({ url: 'https://example.com/oembed' }).catch(caught => caught)
+    expect(error).toBeInstanceOf(WebError)
+    expect((error as WebError).code).toBe('WEB_PROVIDER_ERROR')
+    expect((error as WebError).message).toContain('will not render')
+  })
+
+  it('the download guard cancels what the browser starts downloading', async () => {
+    // Through the CDP path (whose real openSession installs the guards), the
+    // same shape as the popup-guard case: a registered listener that cancels
+    // whatever Chromium starts downloading on the fetch's tab, so nothing
+    // lands in the (possibly remote) profile's download dir.
+    const { state, pool } = fakeCdpConnection()
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'cdp',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      shareBrowserContext: true,
+      denoise: true,
+      maxConcurrency: 4,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
+    }), pool)
+    await provider.fetch({ url: 'https://example.com/download-spawner' })
+    expect(state.downloadListeners.length).toBeGreaterThan(0) // the guard attached
+
+    let cancels = 0
+    for (const listener of state.downloadListeners) listener({ cancel: async () => { cancels++ } }) // the browser started a download
+    expect(cancels).toBe(state.downloadListeners.length)
+  })
+
+  it('recovers on the challenge-armed path too, without touching the challenge budget', async () => {
+    const result = await new FakeProvider({ challengeWaitMs: 60_000, challengeRetries: 3 }, {
+      downloadFailure: { refetched: { status: 200, contentType: 'application/json', body: '{"ok":true}' } },
+    }).fetch({ url: 'https://example.com/oembed' })
+    expect(result.statusCode).toBe(200)
   })
 })
 
@@ -779,7 +978,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
     await provider.fetch({ url: 'https://example.com/popup-spawner' })
     expect(state.popupListeners.length).toBeGreaterThan(0) // the guard attached
 
-    const popupState = { pageClosed: false, gotos: 0 }
+    const popupState: FakePageState = { pageClosed: false, gotos: 0, downloadsStarted: 0, downloadCancels: 0, refetches: 0 }
     const popup = makeFakePage({}, popupState)
     for (const listener of state.popupListeners) listener(popup) // page spawned a popup
     expect(popupState.pageClosed).toBe(true)

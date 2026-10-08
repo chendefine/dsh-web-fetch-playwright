@@ -22,6 +22,26 @@ export interface PlaywrightResponse {
   request?(): PlaywrightRequest
 }
 
+/**
+ * A download Chromium started instead of committing a document (a response
+ * with `Content-Disposition: attachment`).
+ */
+export interface PlaywrightDownload {
+  cancel(): Promise<void>
+}
+
+/**
+ * The page's `APIRequestContext` surface the download recovery refetches
+ * through — plain HTTP from the Playwright client, the context's cookie jar,
+ * and none of Chromium's render-or-download semantics. Reuses
+ * {@link PlaywrightResponse} because that is structurally what an
+ * `APIResponse` is for the members this plugin reads. Absent on fakes that
+ * do not exercise the recovery.
+ */
+export interface PlaywrightRequestContext {
+  get(url: string, options?: { timeout?: number; signal?: AbortSignal }): Promise<PlaywrightResponse>
+}
+
 /** The request side of a response, for main-frame filtering. */
 export interface PlaywrightRequest {
   /** True for navigations (document loads and their redirect hops). */
@@ -53,12 +73,24 @@ export interface PlaywrightPage {
    */
   on?(event: 'response', listener: (response: PlaywrightResponse) => void): unknown
   /**
+   * Download notification — a navigation the browser handed to its download
+   * manager instead of committing a document (`Content-Disposition:
+   * attachment`); the fetch's guard cancels it so nothing lands on disk.
+   * Absent on minimal fakes (the recovery does not depend on it).
+   */
+  on?(event: 'download', listener: (download: PlaywrightDownload) => void): unknown
+  /**
    * Evaluate an expression in the page — the challenge probe's live-DOM
    * path. Absent on minimal fakes (content polling covers them).
    */
   evaluate?(script: string, arg?: unknown): Promise<unknown>
   /** The main frame handle; compare with `request.frame()` for filtering. */
   mainFrame?(): unknown
+  /**
+   * The page's API request context — the download recovery's refetch path
+   * (see {@link PlaywrightRequestContext}). Absent on minimal fakes.
+   */
+  request?: PlaywrightRequestContext
 }
 
 /**

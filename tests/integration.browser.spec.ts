@@ -168,6 +168,20 @@ beforeAll(async () => {
       res.end()
       return
     }
+    if (url === '/download/json') {
+      // publish.twitter.com/oembed parity: decodable JSON served with an
+      // attachment disposition — Chromium hands it to its download manager
+      // instead of committing a document, so goto rejects with
+      // "Download is starting". The recovery must refetch the bytes.
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'content-disposition': 'attachment; filename=json.json' })
+      res.end('{"url":"https://x.com/tianyi/status/2105790798461882377","author_name":"Tianyi Cui"}')
+      return
+    }
+    if (url === '/download/pdf') {
+      res.writeHead(200, { 'content-type': 'application/pdf', 'content-disposition': 'attachment; filename=doc.pdf' })
+      res.end('%PDF-1.7 fake')
+      return
+    }
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
     res.end(PAGE)
   })
@@ -334,6 +348,56 @@ describe('PlaywrightFetchProvider integration', () => {
     const result = await provider.fetch({ url: `${baseUrl}no-content` })
     expect(result.statusCode).toBe(204)
     expect(result.body.kind === 'text' ? result.body.content : '').toBe('')
+  })
+
+  /**
+   * The oembed badcase shape (https://publish.twitter.com/oembed?url=<tweet>):
+   * decodable JSON behind `Content-Disposition: attachment`. A real Chromium
+   * fails goto with "Download is starting" and the navigation body is gone
+   * from the network stack — the recovery refetches through the page's API
+   * request context and returns the JSON as a text result.
+   */
+  it('recovers an attachment JSON (oembed parity) from "Download is starting" as a result', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping browser smoke (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'local',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      shareBrowserContext: true,
+      denoise: true,
+      maxConcurrency: 4,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
+    }))
+    const result = await provider.fetch({ url: `${baseUrl}download/json` })
+    expect(result.statusCode).toBe(200)
+    expect(result.body.kind).toBe('text')
+    const content = result.body.kind === 'text' ? result.body.content : ''
+    expect(content).toContain('Tianyi Cui')
+    expect(result.truncated).toBe(false)
+  })
+
+  it('refuses an attachment PDF as WEB_UNSUPPORTED_CONTENT_TYPE (an undecodable download)', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping browser smoke (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'local',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      shareBrowserContext: true,
+      denoise: true,
+      maxConcurrency: 4,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
+    }))
+    const error = await provider.fetch({ url: `${baseUrl}download/pdf` }).catch(caught => caught)
+    expect(error).toBeInstanceOf(WebError)
+    expect((error as WebError).code).toBe('WEB_UNSUPPORTED_CONTENT_TYPE')
   })
 })
 
