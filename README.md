@@ -1,4 +1,5 @@
 # dsh-web-fetch-playwright
+[![DSH Insights health](https://dsh-insights.com/badge/chendefine/dsh-web-fetch-playwright.svg)](https://dsh-insights.com/p/chendefine/dsh-web-fetch-playwright/)
 
 [中文](./README.zh-CN.md) · [npm](https://www.npmjs.com/package/dsh-web-fetch-playwright) · [GitHub](https://github.com/chendefine/dsh-web-fetch-playwright)
 
