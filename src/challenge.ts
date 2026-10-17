@@ -16,10 +16,12 @@
  *    (`/cdn-cgi/challenge-platform/` scripts, `#challenge-*` elements,
  *    `cf-chl-widget-` Turnstile frames, `window._cf_chl_opt`). Markers are
  *    deliberately structural: a blog post that merely MENTIONS Cloudflare
- *    must not classify as a challenge. Bot Management's passive JSD
- *    telemetry (`/cdn-cgi/challenge-platform/scripts/jsd/`), which
- *    Cloudflare injects into every NORMAL page of a protected zone, is
- *    explicitly neutralized — it is not a challenge signal.
+ *    must not classify as a challenge, so the challenge-platform script
+ *    check reads `<script src>` attributes only (never prose or escaped
+ *    code samples) and identifies the runtime POSITIVELY by its
+ *    `/orchestrate/` mount — the JSD/Precursor instrumentation Cloudflare
+ *    injects into every NORMAL page of a protected zone, on several moving
+ *    mounts, is not a challenge signal.
  *
  * The security stance (issue #2): this module only DETECTS and classifies.
  * Solving, spoofing, CAPTCHA answering, and cookie lifting live outside the
@@ -89,30 +91,93 @@ export const CHALLENGE_TITLE_RE = new RegExp(
 )
 
 /**
- * Cloudflare Bot Management's passive JavaScript-Detections (JSD)
- * telemetry directory. Cloudflare injects this into EVERY normal page of
- * a protected zone — as a direct `<script src>` or as the URL strung
- * inside the hidden-1x1-iframe bootstrap's inline script text — with the
- * page itself a plain 200 of real content. The path therefore proves
- * nothing about a challenge and must be neutralized before the
- * challenge-platform prefix check: real interstitials load orchestrate
- * scripts (`/cdn-cgi/challenge-platform/h/[b|g]/orchestrate/...`), which
- * never live under `scripts/jsd/`.
+ * Cloudflare's challenge-platform namespace holds two very different things,
+ * and telling them apart is the whole game:
+ *
+ * - the challenge RUNTIME — `/cdn-cgi/challenge-platform/h/[b|g]/orchestrate/…`
+ *   — which real interstitials load to run the verification;
+ * - PASSIVE INSTRUMENTATION — everything else Cloudflare injects into NORMAL
+ *   pages of a protected zone, as a direct `<script src>` or as the URL
+ *   strung inside the hidden-1x1-iframe bootstrap's inline script text. The
+ *   page itself is a plain 200 of real content.
+ *
+ * Observed instrumentation layouts (a thread that lists all of them:
+ * `community.cloudflare.com/t/3-javascripts-are-added-unable-to-disable`):
+ *
+ * - `/cdn-cgi/challenge-platform/scripts/jsd/…` — JavaScript Detections;
+ * - `/cdn-cgi/challenge-platform/scripts/precursor/…` — Precursor, the
+ *   continuous behavioral-validation engine;
+ * - `/cdn-cgi/challenge-platform/h/[b|g]/scripts/jsd/<hash>/…` and
+ *   `/cdn-cgi/challenge-platform/h/[b|g]/jsd/r/…` — the same detections
+ *   served from a hash-scoped runtime mount, with no `scripts/` segment.
+ *
+ * Enumerating instrumentation names (`jsd`, `precursor`) or carving out a
+ * `scripts/` namespace is a standing false-positive subscription: Cloudflare
+ * keeps ADDING packages and keeps moving them onto new mounts (openrouter.ai
+ * broke on JSD, nodeseek.com broke on Precursor, and the hash-scoped variant
+ * defeats a `scripts/`-only carve-out). So the runtime is identified
+ * POSITIVELY instead: `orchestrate` is the challenge runtime's own mount and
+ * never appears in instrumentation. Everything else under the prefix is
+ * treated as passive — the directive that a protected page must stay
+ * readable.
+ *
+ * Losing an unknown future runtime mount costs little here: the response
+ * header, the localized title family, and the challenge DOM elements remain
+ * independent signals, and the content-level script check is only their
+ * fallback.
  */
-const TELEMETRY_JSD_DIR = '/cdn-cgi/challenge-platform/scripts/jsd/'
+const CHALLENGE_PLATFORM_PREFIX = '/cdn-cgi/challenge-platform/'
+
+/** The path segment that identifies the challenge runtime (not telemetry). */
+const CHALLENGE_RUNTIME_SEGMENT = '/orchestrate/'
+
+/**
+ * A `<script src>` value in document HTML: double-quoted, single-quoted, or
+ * bare. Only real `src` attributes are read, so prose and escaped code
+ * samples that merely quote a path can never match (badcase:
+ * `community.cloudflare.com/t/3-javascripts-are-added-unable-to-disable`
+ * — a thread ABOUT these injected scripts, which lists
+ * `/cdn-cgi/challenge-platform/scripts/jsd/main.js` in its body text and was
+ * misclassified as a challenge by the old whole-document substring scan).
+ */
+const SCRIPT_SRC_RE = /<script\b[^>]*?\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi
+
+/**
+ * Extract every `<script src>` value from a document's HTML, lowercased.
+ *
+ * @param html - the document HTML as `page.content()` returns it.
+ * @returns the script source URLs, in document order.
+ */
+function scriptSrcsOf(html: string): string[] {
+  const srcs: string[] = []
+  SCRIPT_SRC_RE.lastIndex = 0
+  for (let match = SCRIPT_SRC_RE.exec(html); match !== null; match = SCRIPT_SRC_RE.exec(html)) {
+    srcs.push((match[1] ?? match[2] ?? match[3] ?? '').toLowerCase())
+  }
+  return srcs
+}
+
+/**
+ * Whether a script src belongs to the challenge RUNTIME rather than to the
+ * passive instrumentation Cloudflare injects into normal pages.
+ *
+ * @param src - a lowercased script source URL.
+ * @returns true when the script is the challenge runtime.
+ */
+function isChallengeRuntimeScript(src: string): boolean {
+  return src.includes(CHALLENGE_PLATFORM_PREFIX) && src.includes(CHALLENGE_RUNTIME_SEGMENT)
+}
 
 /**
  * Structural markers a challenge document carries in its HTML. Kept in
  * attribute/assignment form (`id="…"`, `window._cf_chl_opt`) rather than bare
  * substrings so an article that merely QUOTES these strings in prose or code
  * samples does not classify — the marker must look like the real element.
- * The bare `/cdn-cgi/challenge-platform/` prefix is checked only after
- * {@link TELEMETRY_JSD_DIR} occurrences are stripped (see
- * {@link classifyChallengeHtml}); `scripts/jsd/main.js` in any spelling is
- * passive telemetry and deliberately absent from this list.
+ * The challenge-platform prefix is deliberately absent: script evidence goes
+ * through {@link scriptSrcsOf} + {@link isChallengeRuntimeScript}, which
+ * distinguish a real `src` from prose and runtime from instrumentation.
  */
 const CHALLENGE_HTML_MARKERS = [
-  '/cdn-cgi/challenge-platform/',
   'id="cf-chl-widget-',
   'window._cf_chl_opt',
   'id="challenge-form"',
@@ -206,14 +271,15 @@ export function classifyChallengeHtml(html: string): ChallengeVerdict {
   const lowered = html.toLowerCase()
   if (lowered.includes(BLOCKED_BODY_PHRASE) && BLOCKED_BODY_MARKERS.some(marker => lowered.includes(marker))) return 'blocked'
   if (CHALLENGE_TITLE_RE.test(title)) return 'challenge'
-  // Strip the passive JSD telemetry directory before the marker scan: its
-  // URL embeds the `/cdn-cgi/challenge-platform/` prefix, so an unstripped
-  // scan misreads every Bot-Management-protected normal page (a plain 200
-  // with real content — e.g. openrouter.ai) as an interstitial, the wait
-  // can then never confirm a clear, and the fetch dies with
-  // WEB_FETCH_CHALLENGE despite the page having loaded fine.
-  const withoutTelemetry = lowered.split(TELEMETRY_JSD_DIR).join('')
-  if (CHALLENGE_HTML_MARKERS.some(marker => withoutTelemetry.includes(marker))) return 'challenge'
+  // Script evidence BEFORE the text markers: only a real `<script src>`
+  // counts, and only when it is the challenge runtime rather than passive
+  // instrumentation. Both halves matter — scanning prose false-positived on
+  // an article quoting these paths, and reading the prefix as a challenge
+  // false-positived on every protected normal page (openrouter.ai's JSD,
+  // nodeseek.com's Precursor). Either way the wait can never confirm a
+  // "clear", and a page that loaded fine dies with WEB_FETCH_CHALLENGE.
+  if (scriptSrcsOf(html).some(isChallengeRuntimeScript)) return 'challenge'
+  if (CHALLENGE_HTML_MARKERS.some(marker => lowered.includes(marker))) return 'challenge'
   // Crawlee's footer marker, as a two-class combo so prose quoting one class
   // alone stays clean.
   if (lowered.includes('class="ray-id"') && lowered.includes('class="footer-inner"')) return 'challenge'
@@ -226,19 +292,21 @@ export function classifyChallengeHtml(html: string): ChallengeVerdict {
  * what makes SPA-style clears visible — the document swaps its content
  * without any navigation, so only a DOM read can see the change. The title
  * regex is baked in at build time from the same single source the Node-side
- * check uses, so the two can never drift apart. Script srcs under
- * `/cdn-cgi/challenge-platform/scripts/jsd/` are Bot Management's passive
- * JSD telemetry — present on every normal page of a protected zone — and are
- * excluded just like in {@link classifyChallengeHtml}.
+ * check uses, so the two can never drift apart. Script evidence follows the
+ * same rule as {@link classifyChallengeHtml}: only the challenge runtime
+ * counts, and the instrumentation Cloudflare injects into normal pages of a
+ * protected zone is ignored.
  */
 export const CHALLENGE_DOM_PROBE = `(() => {
   const re = new RegExp(${JSON.stringify(CHALLENGE_TITLE_RE.source)}, ${JSON.stringify(CHALLENGE_TITLE_RE.flags)})
+  const platform = ${JSON.stringify(CHALLENGE_PLATFORM_PREFIX)}
+  const runtime = ${JSON.stringify(CHALLENGE_RUNTIME_SEGMENT)}
   if (re.test(document.title.trim())) return true
   if (document.querySelector('#challenge-form, #challenge-running, #challenge-stage, #challenge-error-text')) return true
   if (document.querySelector('[id^="cf-chl-widget-"]')) return true
   for (const script of Array.from(document.scripts)) {
-    const src = script.getAttribute('src') || ''
-    if (src.includes('/cdn-cgi/challenge-platform/') && !src.includes('/cdn-cgi/challenge-platform/scripts/jsd/')) return true
+    const src = (script.getAttribute('src') || '').toLowerCase()
+    if (src.includes(platform) && src.includes(runtime)) return true
   }
   if (document.querySelector('.footer .footer-inner .ray-id')) return true
   return false

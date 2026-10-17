@@ -55,6 +55,37 @@ const JSD_DIRECT_PAGE = `<!doctype html><html><head><title>A normal protected pa
 <script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js" defer></script>
 </head><body><main><article><h1>Article</h1><p>Body.</p></article></main></body></html>`
 
+/**
+ * Cloudflare Precursor — the continuous behavioral-validation script
+ * injected into NORMAL pages of a protected zone, captured from
+ * https://www.nodeseek.com/post-523877-1 (HTTP 200, `server: cloudflare`,
+ * no `cf-mitigated`, full article rendered). The regression is identical to
+ * the JSD badcase: the challenge-platform prefix scan saw this one passive
+ * script, the bounded wait could never confirm a clear, and two 15s attempts
+ * turned a 4s page load into a `WEB_FETCH_CHALLENGE`.
+ */
+const PRECURSOR_PAGE = `<!doctype html><html><head><title>[腾讯云轻量被封]疑似端口转发给侦测</title>
+<script src="/cdn-cgi/challenge-platform/scripts/precursor/main.js" defer></script>
+</head><body><main><article><h1>[腾讯云轻量被封]疑似端口转发给侦测</h1><p>Real body text.</p></article></main></body></html>`
+
+/**
+ * A page that merely TALKS about the injected scripts — captured from
+ * https://community.cloudflare.com/t/3-javascripts-are-added-unable-to-disable/848155
+ * (HTTP 200, no `cf-mitigated`, no challenge-platform `<script src>` at all,
+ * 4512 chars of real thread text). Its body lists
+ * `/cdn-cgi/challenge-platform/scripts/jsd/main.js` and the hashed
+ * `/cdn-cgi/challenge-platform/h/g/scripts/jsd/<hash>/main.js` variant as
+ * PROSE — the whole-document substring scan classified it as a challenge and
+ * the fetch died without ever reading the thread.
+ */
+const ARTICLE_QUOTING_CF_PATHS = `<!doctype html><html><head><title>3 JavaScripts are added unable to disable</title></head><body>
+<main><article><h1>3 JavaScripts are added unable to disable</h1>
+<p>I am experiencing unexpected script injections on my site from Cloudflare's challenge platform, such as
+/cdn-cgi/challenge-platform/scripts/jsd/main.js, /cdn-cgi/challenge-platform/h/g/scripts/jsd/e9c9e9d67513/main.js,
+and /cdn-cgi/challenge-platform/scripts/precursor/main.js.</p>
+<p>An escaped code sample is just prose too: &lt;script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"&gt;&lt;/script&gt;</p>
+</article></main></body></html>`
+
 describe('classifyChallengeResponse', () => {
   it('the documented header alone marks a challenge, whatever the status', () => {
     expect(classifyChallengeResponse(403, { 'cf-mitigated': 'challenge', 'content-type': 'text/html' })).toBe('challenge')
@@ -106,7 +137,7 @@ describe('classifyChallengeHtml', () => {
   it('classifies the canonical interstitial through every marker family', () => {
     expect(classifyChallengeHtml(CHALLENGE_HTML)).toBe('challenge')
     // Each structural marker alone is enough (title stripped, one marker left).
-    expect(classifyChallengeHtml('<html><head><title>x</title></head><body><script src="/cdn-cgi/challenge-platform/h/b/x"></script></body></html>')).toBe('challenge')
+    expect(classifyChallengeHtml('<html><head><title>x</title></head><body><script src="/cdn-cgi/challenge-platform/h/b/orchestrate/x"></script></body></html>')).toBe('challenge')
     expect(classifyChallengeHtml('<html><body><div id="challenge-form"></div></body></html>')).toBe('challenge')
     expect(classifyChallengeHtml('<html><body><div id="challenge-running"></div></body></html>')).toBe('challenge')
     expect(classifyChallengeHtml('<html><body><iframe id="cf-chl-widget-0001" src="https://challenges.cloudflare.com"></iframe></body></html>')).toBe('challenge')
@@ -158,10 +189,50 @@ describe('classifyChallengeHtml', () => {
     expect(classifyChallengeHtml('<html><head><script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js?ray=abc" defer></script></head><body><p>x</p></body></html>')).toBe('none')
   })
 
+  it('Cloudflare Precursor instrumentation is not a challenge (nodeseek.com badcase)', () => {
+    // Precursor is the behavioral-validation engine Cloudflare injects into
+    // normal pages of a protected zone — same passive shape as JSD. Left
+    // unstripped it burns the whole budget on a wait that can never clear.
+    expect(classifyChallengeHtml(PRECURSOR_PAGE)).toBe('none')
+    expect(classifyChallengeHtml('<html><head><script src="/cdn-cgi/challenge-platform/scripts/precursor/main.js?v=2" defer></script></head><body><p>x</p></body></html>')).toBe('none')
+    // Both passive scripts together still classify clean.
+    expect(classifyChallengeHtml(`${JSD_DIRECT_PAGE}<script src="/cdn-cgi/challenge-platform/scripts/precursor/main.js" defer></script>`)).toBe('none')
+  })
+
   it('stripping JSD telemetry does not over-exclude a real interstitial', () => {
     // A real challenge page may carry the JSD script AND its own orchestrate
     // scripts; the orchestrate path survives the strip and still classifies.
     expect(classifyChallengeHtml(`${CHALLENGE_HTML}<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js" defer></script>`)).toBe('challenge')
+    // Same for Precursor: the boundary is "under scripts/", not one filename.
+    expect(classifyChallengeHtml(`${CHALLENGE_HTML}<script src="/cdn-cgi/challenge-platform/scripts/precursor/main.js" defer></script>`)).toBe('challenge')
+  })
+
+  it('instrumentation on a hash-scoped mount is passive too', () => {
+    // Cloudflare also serves detections from /h/[b|g]/ mounts: the hash-scoped
+    // `/h/g/scripts/jsd/<hash>/main.js` AND `/h/g/jsd/r/…`, which has no
+    // `scripts/` segment at all — the reason the runtime is matched
+    // positively instead of carving out a namespace.
+    expect(classifyChallengeHtml('<html><head><script src="/cdn-cgi/challenge-platform/h/g/scripts/jsd/e9c9e9d67513/main.js" defer></script></head><body><p>x</p></body></html>')).toBe('none')
+    expect(classifyChallengeHtml('<html><head><script src="/cdn-cgi/challenge-platform/h/g/jsd/r/7f3"></script></head><body><p>x</p></body></html>')).toBe('none')
+  })
+
+  it('a page that merely QUOTES challenge-platform paths is not a challenge', () => {
+    // Whole-document substring scanning can't tell a script tag from prose.
+    // The community thread listing the injected URLs is the badcase.
+    expect(classifyChallengeHtml(ARTICLE_QUOTING_CF_PATHS)).toBe('none')
+    // A bare mention without any src attribute is not script evidence.
+    expect(classifyChallengeHtml('<html><body><p>See /cdn-cgi/challenge-platform/ for details.</p></body></html>')).toBe('none')
+  })
+
+  it('script evidence reads real src attributes, in every quoting style', () => {
+    // Double, single and bare quotes are all real elements.
+    expect(classifyChallengeHtml(`<html><head><script src="/cdn-cgi/challenge-platform/h/b/orchestrate/x"></script></head><body><p>x</p></body></html>`)).toBe('challenge')
+    expect(classifyChallengeHtml(`<html><head><script src='/cdn-cgi/challenge-platform/h/b/orchestrate/x'></script></head><body><p>x</p></body></html>`)).toBe('challenge')
+    expect(classifyChallengeHtml(`<html><head><script src=/cdn-cgi/challenge-platform/h/b/orchestrate/x></script></head><body><p>x</p></body></html>`)).toBe('challenge')
+    // A challenge-platform script outside the runtime mount is instrumentation:
+    // Cloudflare serves detections from hash-scoped mounts with no `scripts/`
+    // segment at all — `/h/g/jsd/r/…` — so only the runtime path may count.
+    expect(classifyChallengeHtml('<html><head><script src="/cdn-cgi/challenge-platform/h/g/jsd/r/7f3"></script></head><body><p>x</p></body></html>')).toBe('none')
   })
 
   it('recognizes the hard-block page distinctly', () => {
@@ -211,7 +282,7 @@ describe('CHALLENGE_DOM_PROBE', () => {
     expect(runProbe(fakeDocument({ title: '请稍候…' }))).toBe(true)
     expect(runProbe(fakeDocument({ selectors: { '#challenge-form, #challenge-running, #challenge-stage, #challenge-error-text': true } }))).toBe(true)
     expect(runProbe(fakeDocument({ selectors: { '[id^="cf-chl-widget-"]': true } }))).toBe(true)
-    expect(runProbe(fakeDocument({ scriptSrcs: ['/cdn-cgi/challenge-platform/h/b/x'] }))).toBe(true)
+    expect(runProbe(fakeDocument({ scriptSrcs: ['/cdn-cgi/challenge-platform/h/b/orchestrate/x'] }))).toBe(true)
     expect(runProbe(fakeDocument({ selectors: { '.footer .footer-inner .ray-id': true } }))).toBe(true)
   })
 
@@ -220,6 +291,18 @@ describe('CHALLENGE_DOM_PROBE', () => {
     expect(runProbe(fakeDocument({ title: 'Real protected article', scriptSrcs: ['/static/app.js'] }))).toBe(false)
     // JSD telemetry srcs are passive detection on normal pages, not markers.
     expect(runProbe(fakeDocument({ title: 'Real protected article', scriptSrcs: ['/cdn-cgi/challenge-platform/scripts/jsd/main.js', '/cdn-cgi/challenge-platform/scripts/jsd/main.js?ray=abc'] }))).toBe(false)
+    // Precursor srcs are equally passive (the nodeseek.com badcase).
+    expect(runProbe(fakeDocument({ title: 'Real protected article', scriptSrcs: ['/cdn-cgi/challenge-platform/scripts/precursor/main.js'] }))).toBe(false)
+    // Hash-scoped instrumentation mounts are passive, `scripts/` segment or not.
+    expect(runProbe(fakeDocument({ title: 'Real protected article', scriptSrcs: ['/cdn-cgi/challenge-platform/h/g/scripts/jsd/e9c9e9d67513/main.js'] }))).toBe(false)
+    expect(runProbe(fakeDocument({ title: 'Real protected article', scriptSrcs: ['/cdn-cgi/challenge-platform/h/g/jsd/r/7f3'] }))).toBe(false)
+  })
+
+  it('script evidence mirrors the Node-side boundary', () => {
+    // A runtime path outside the passive namespace still reports true...
+    expect(runProbe(fakeDocument({ scriptSrcs: ['/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1/x'] }))).toBe(true)
+    // ...and src matching is case-insensitive, like classifyChallengeHtml.
+    expect(runProbe(fakeDocument({ scriptSrcs: ['/CDN-CGI/Challenge-Platform/h/b/orchestrate/x'] }))).toBe(true)
   })
 
   it('exports sane bounded-wait constants', () => {
