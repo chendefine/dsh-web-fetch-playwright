@@ -36,6 +36,7 @@ describe('Config', () => {
       playwrightPath: '',
       cdpEndpoint: '',
       shareBrowserContext: true,
+      contextIsolationScope: 'global',
       denoise: true,
       challengeWaitMs: DEFAULT_CHALLENGE_WAIT_MS,
       challengeRetries: DEFAULT_CHALLENGE_RETRIES,
@@ -56,6 +57,7 @@ describe('Config', () => {
       backend: 'cdp',
       cdpEndpoint: 'browser.lan:9223',
       shareBrowserContext: false,
+      contextIsolationScope: 'global',
       denoise: false,
       maxConcurrency: 50,
       challengeWaitMs: 30_000,
@@ -66,6 +68,7 @@ describe('Config', () => {
       playwrightPath: '',
       cdpEndpoint: 'browser.lan:9223',
       shareBrowserContext: false,
+      contextIsolationScope: 'global',
       denoise: false,
       maxConcurrency: 50,
       challengeWaitMs: 30_000,
@@ -106,6 +109,7 @@ describe('the volatile configuration face', () => {
       playwrightPath: '',
       cdpEndpoint: '',
       shareBrowserContext: true,
+      contextIsolationScope: 'global',
       denoise: true,
       maxConcurrency: 8,
       challengeWaitMs: DEFAULT_CHALLENGE_WAIT_MS,
@@ -193,5 +197,23 @@ describe('normalizeCdpEndpoint', () => {
   it('rejects unparseable values', () => {
     expect(() => normalizeCdpEndpoint('http://')).toThrow()
     expect(() => normalizeCdpEndpoint('://missing-host')).toThrow()
+  })
+})
+
+
+describe('isolated context reuse configuration', () => {
+  it('defaults isolated contexts to global reuse', () => {
+    const config = resolveConfig({ backend: 'cdp', shareBrowserContext: false })
+    expect(config.contextIsolationScope).toBe('global')
+  })
+
+  it.each(['session', 'global'] as const)('accepts %s scope and exposes live snapshots', scope => {
+    const config = Config({ contextIsolationScope: scope }) as PlaywrightPluginConfig
+    expect(config.contextIsolationScope.get()).toBe(scope)
+    expect(snapshotsOf(config)).toMatchObject({ contextIsolationScope: scope })
+  })
+
+  it('rejects unsupported isolation scopes', () => {
+    expect(() => resolveConfig({ contextIsolationScope: 'fetch' as never })).toThrow()
   })
 })

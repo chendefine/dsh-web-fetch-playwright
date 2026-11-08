@@ -8,6 +8,7 @@
  * @module dsh-web-fetch-playwright/client/fields
  */
 
+import { useId } from 'react'
 import type { ReactNode } from 'react'
 import css from './fields.module.css'
 
@@ -86,6 +87,9 @@ export interface RadioOption {
 
 /** A staged radio group: the backend selector. */
 export function RadioGroupField(props: {
+  embedded?: boolean
+  /** Render options without card borders or backgrounds. */
+  plainOptions?: boolean
   label: string
   options: readonly RadioOption[]
   text: string
@@ -96,8 +100,9 @@ export function RadioGroupField(props: {
   onEdit: (text: string) => void
   onReset: () => void
 }) {
+  const name = useId()
   return (
-    <fieldset className={css.field}>
+    <fieldset className={props.embedded ? css.fieldEmbedded : css.field}>
       <div className={css.head}>
         <span className={css.label}>{props.label}</span>
         {props.overridden
@@ -118,11 +123,11 @@ export function RadioGroupField(props: {
       </div>
       <div className={css.radioGroup} role="radiogroup" aria-label={props.label}>
         {props.options.map(option => (
-          <div key={option.value} className={css.radioOption}>
+          <div key={option.value} className={props.plainOptions ? css.radioOptionPlain : css.radioOption}>
             <label className={css.radioPick}>
               <input
                 type="radio"
-                name="playwright-backend"
+                name={name}
                 value={option.value}
                 checked={props.text === option.value}
                 disabled={props.disabled}

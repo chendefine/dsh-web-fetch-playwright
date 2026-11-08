@@ -94,14 +94,19 @@ export interface PlaywrightPage {
 }
 
 /**
- * A browser context: fetch-owned and isolated (local backend, or CDP
- * `isolated` mode), or the remote browser's default context carrying its
- * real profile (CDP `profile` mode — never closed by a fetch).
+ * A browser context: fetch-owned and isolated, a pool-owned named context,
+ * or the remote browser's default context carrying its real profile. Named
+ * session contexts close when idle; global contexts are retained until teardown.
+ * The default context is never explicitly closed.
  */
 export interface PlaywrightContext {
   newPage(): Promise<PlaywrightPage>
+  /** Currently open tabs; used before releasing an idle session context. */
+  pages?(): PlaywrightPage[]
   route(glob: string, handler: (route: PlaywrightRoute) => Promise<void>): Promise<void>
   close(): Promise<void>
+  /** Invalidate cached named contexts when the remote context closes. */
+  on?(event: 'close', listener: () => void): unknown
 }
 
 /** A route interception decision. */

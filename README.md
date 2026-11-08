@@ -12,7 +12,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plug
 - **Denoise pipeline** — Mozilla Readability extracts the article, DOMPurify removes layout/noise tags (nav, sidebar, footer, ads, forms), and Turndown with the GFM plugin converts to Markdown with the same style options as the shipped `tool-web` renderer. Inline `data:` images (build tools like Docusaurus embed screenshots as base64) are elided to size placeholders such as `![alt](data:image/png;base64,...8.9KB)` so they cannot flood the body.
 - **Two backends** — launch a local Playwright browser, or drive an already-running browser over its DevTools Protocol (CDP) endpoint.
 - **Browser resolution** — a configured path, a `playwright` CLI on `$PATH`, or the bundled `playwright-core`; CDP needs no local browser at all.
-- **Isolated or profile sessions (CDP)** — every fetch is scoped to exactly one tab. Local launches close their browser per fetch; the CDP backend keeps **one shared connection** to the remote browser and each fetch opens a tab inside it, closed when done. By default that tab lives in the remote browser's **real profile** (its cookies, localStorage, and persistent logins apply — like `playwright-cli open`); unchecking *Share the browser context* switches to a throwaway isolated context per fetch.
+- **Shared profile or reusable isolation (CDP)** — each fetch opens and closes its own tab; session isolation uses a dedicated CDP connection per DSH session, while global/profile modes share one connection. By default it uses the browser's existing default context and logins (`connectOverCDP` → `browser.contexts()[0]`, like CLI CDP attach with isolation disabled, not `playwright-cli open`). Session isolation creates an in-memory context on demand and shares it only while same-session fetches or other tabs keep it in use; global isolation retains one fixed isolated context across all sessions within the same plugin instance. Local launches still close their browser per fetch.
 - **Live configuration** — the Plugins page (侧边栏 → 插件 → *dsh-web-fetch-playwright*, dsh ≥ 0.1.7) shows the full form right on the plugin's package page (and on the row's own page via its configure control); it edits the backend, context mode, denoise toggle, and concurrency, and a committed change reaches the next fetch without a restart.
 - **Budget-aware** — per-fetch deadline (45s); concurrency is backend-priced (`maxConcurrency`, default 4 local browsers / **50 CDP tabs**; queued fetches fail fast with a retry hint after 20s instead of hanging); image/font/media subrequests aborted; body capped at 100k chars.
 - **Bounded Cloudflare-challenge wait** — when a navigation lands on a challenge interstitial ("Just a moment…" and its localized siblings, recognized via the documented `cf-mitigated: challenge` response header plus structural page markers), the fetch keeps the **same tab and context** and waits for the browser's own verification to clear it — tracking the *last* main-frame response (the real page reloads in) and watching the live DOM so SPA-style clears are caught too. Bounded and configurable (`challengeWaitMs`, default 15s; 0 restores the legacy first-response behavior), with a bounded same-tab retry (`challengeRetries`, default 1). When the budget runs out, the fetch fails with the distinct `WEB_FETCH_CHALLENGE` error code instead of returning the interstitial as content. It never clicks, never injects CAPTCHA answers, never fakes browser state, and never exports or copies cookies.
@@ -71,7 +71,8 @@ The Plugins page (侧边栏 → 插件) opens the form one click from the list: 
 | `backend` | `local` | Radio: *Local Playwright* or *Remote CDP endpoint*, each with its own nested input. |
 | `playwrightPath` | (blank) | Local backend: path to a `playwright` executable or a Chromium-family browser binary. Blank = discover on `$PATH`, then fall back to the bundled `playwright-core`. |
 | `cdpEndpoint` | `127.0.0.1:9222` | Remote backend: `host:port`, `http(s)://…` or `ws(s)://…`. |
-| `shareBrowserContext` | `true` | CDP backend only. **Checked (profile mode)**: each fetch is a tab in the remote browser's default context — its real profile — so cookies/localStorage are shared and its persistent logins apply; only the tab closes when the fetch ends. **Unchecked (isolated mode)**: a fresh incognito-like context per fetch, nothing shared. Local backend ignores this field. |
+| `shareBrowserContext` | `true` | CDP only: Share / Isolate radio. `true` uses the remote default context and logins; `false` uses a separate context with the lifecycle determined by the scope below. Ignored locally. |
+| `contextIsolationScope` | `global` | CDP isolation only: `session` creates a context on demand per DSH session and closes it when no active/pending fetches or open tabs remain (next fetch starts fresh); `global` reuses one fixed isolated context across all DSH sessions within this plugin instance. |
 | `denoise` | `true` | Run the denoise pipeline; off returns the full rendered HTML for the tool layer to convert. |
 | `maxConcurrency` | *(auto)* | How many fetches may render at once (1–200). Blank = backend default: **4** for local (each slot launches a browser) / **50** for CDP (each slot is just a tab in the already-running remote browser). Beyond the limit, fetches wait briefly; if no slot frees within 20s they fail with `WEB_FETCH_TIMEOUT` and a hint to retry or raise this setting, rather than hanging until the tool budget aborts. |
 | `challengeWaitMs` | `15000` | Bounded wait (ms, 0–60000) for a Cloudflare challenge to clear naturally in the same tab. `0` disables the whole challenge path — the first response is returned as-is (the pre-0.2.5 behavior). |
@@ -89,7 +90,16 @@ CDP mode needs no local browser: the provider holds **one shared connection** fo
 
 ### The CDP context modes (share the browser's profile or not)
 
-With *Share the browser context* **checked** (default, profile mode), each fetch is a tab in the remote browser's default context — the real profile. Cookies and localStorage come from and are written back to that profile, so sites the browser is logged into are fetched logged-in, exactly like a tab you open by hand. The shared context is never closed; resource filtering and popup guards attach to the fetch's tab only, so your other tabs are untouched. With it **unchecked** (isolated mode), every fetch gets a fresh incognito-like context — anonymous reads, nothing persists.
+Choose **Share the browser context** (default) to open tabs in the remote browser's existing default context. Cookies and localStorage come from and are written back to that profile; the plugin never closes it. Resource filters and popup guards apply only to the fetch-owned tab.
+
+Choose **Isolate from the browser profile**, then select:
+
+- **Per DSH session**: create a dedicated CDP connection, isolated context and dedicated browser window on demand per DSH session ID. This also separates gateway implementations that map each connection's first context to a distinct Chromium process; different sessions never become nested contexts on one gateway connection. Concurrent fetches in the same session share that context/window in separate tabs; each fetch closes only its own tab. Context creation, tab creation, and tab-close/empty-check/context-close are serialized by a per-session FIFO mutex; fetching content stays concurrent and different sessions do not block each other. Once no fetch-owned or other open tabs remain, the context closes. A queued acquisition waits for that close before opening a fresh context. Cookies/localStorage reset after idle cleanup. The plugin verifies real CDP context and window IDs, matches newly created targets by ID, and fails explicitly if the endpoint cannot provide the isolation guarantees or the call lacks a session ID; it never falls back to the default profile.
+- **Global reuse across DSH sessions** (default): all DSH sessions within this plugin instance reuse one fixed isolated context.
+
+The plugin creates its own isolated contexts; it does not discover contexts created by other tools. Global isolation remains retained between fetches: completion closes only the fetch-owned tab, so cookies/localStorage survive subsequent fetches. Session isolation instead releases its context once no active/pending fetches or open tabs remain, as described above. This is in-memory reuse, not persistent storage across browser/plugin restarts; changing the context configuration retires old contexts, and teardown or connection loss/replacement discards them. Global isolation separates you from the browser profile, **not from other DSH sessions** within the same plugin instance.
+
+If another CDP client deletes a plugin-owned isolated context, Chromium may not emit a Playwright context `close` event. On the explicit `Target.createTarget` “Failed to find browser context with id …” error, the plugin invalidates only that cached context and retries opening a tab once in a fresh context. Concurrent requests share the replacement; the deleted context's cookies/localStorage are lost. Other contexts and the default profile are untouched. Generic page errors are not retried by this recovery, and it never replays navigation or falls back to the default profile.
 
 **Profile-mode risk notes** — it upgrades `web_fetch` from "anonymous read" to "acts as the browser's logged-in user":
 
@@ -116,7 +126,7 @@ With the wait on (default):
 3. **Bounded retry** — when a window runs out, the same tab re-navigates once (default; `challengeRetries`) with whatever clearance cookies the context already holds.
 4. **Clear failure** — `WEB_FETCH_CHALLENGE` (a provider-specific code the web seam's open-string `code` allows) naming the site, the budget spent, and the last challenge status.
 
-Security boundary (deliberate): no clicking through Turnstile, no CAPTCHA solving or token injection, no fingerprint/UA spoofing, no proxy rotation, and no cookie export — in isolated mode the clearance a fetch's browser earns dies with that fetch's context; in profile mode it stays in the remote browser's own profile, which this plugin never copies or cleans. The wait is always bounded by `challengeWaitMs` and the 45s per-fetch deadline; nothing blocks forever.
+Security boundary (deliberate): no clicking through Turnstile, no CAPTCHA solving or token injection, no fingerprint/UA spoofing, no proxy rotation, and no cookie export — in CDP isolated mode clearance remains within its session/global context until that context is discarded (local contexts still end with each fetch); in profile mode it stays in the remote browser's own profile, which this plugin never copies or cleans. The wait is always bounded by `challengeWaitMs` and the 45s per-fetch deadline; nothing blocks forever.
 
 ## Development
 
@@ -125,6 +135,20 @@ pnpm install
 pnpm typecheck   # tsc --noEmit
 pnpm test        # vitest run (browser smoke self-skips without a browser)
 pnpm build       # tsc declarations + tsdown (host ESM + client module-registration bundle)
+```
+
+Run the real context/window isolation, cookie/localStorage separation, concurrent provider identity, create/close race, and external-context-deletion regressions (the tests launch their own browser and local server, never the configured user browser):
+
+```sh
+PLAYWRIGHT_TEST_EXECUTABLE_PATH=/path/to/chromium pnpm exec vitest run tests/cdp-recovery.browser.spec.ts
+```
+
+Without an override it uses Playwright's default executable and reports skipped tests when that binary is absent; an explicit invalid path or a launch failure fails the test. Set `PLAYWRIGHT_TEST_HEADED=1` with a working `DISPLAY` to verify real headed windows as well. A source build does not reload an already running DSH server: restart/reload the plugin host before judging the new behavior.
+
+For an explicitly authorized connection-scoped gateway, run the opt-in regression below. It creates only test-owned contexts, fulfills a `.invalid` probe locally, checks cookies/localStorage and idle disconnect, then cleans up its resources. Numeric window IDs are process-local and may repeat across cloned Chromium processes; they must not be compared across gateway connections.
+
+```sh
+PLAYWRIGHT_TEST_CDP_ENDPOINT=http://your-gateway:9222 pnpm exec vitest run tests/cdp-gateway.browser.spec.ts
 ```
 
 Repository layout:

@@ -158,7 +158,16 @@
   background: var(--dsw-alias-bg-layer-3);
 }
 
-.radioOption:has(input[type='radio']:checked) {
+.radioOptionPlain {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0;
+  border: 0;
+  background: none;
+}
+
+.radioOption:has(> .radioPick > input[type='radio']:checked) {
   border-color: var(--dsw-alias-brand-primary);
 }
 

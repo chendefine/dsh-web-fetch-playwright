@@ -19,10 +19,12 @@
  * ({@link recoverDownloadResponse}) — instead of a `WEB_PROVIDER_ERROR`.
  *
  * Lifecycle: the local backend launches a browser per fetch and closes it —
- * nothing outlives the call. The CDP backend keeps ONE shared connection to
- * the remote browser for the provider's lifetime; each fetch only opens a
- * page (tab) inside it and closes that on completion — in a throwaway
- * isolated context, or (the default, `shareBrowserContext`) in the remote
+ * nothing outlives the call. CDP session isolation keeps one connection per
+ * DSH session until its context becomes idle; this also isolates gateways that
+ * map a connection's first context to a separate browser process. Global/profile
+ * modes share a provider-lifetime connection. Each fetch owns only its page;
+ * contexts are per-session until idle, global until teardown, or (the default,
+ * `shareBrowserContext`) in the remote
  * browser's default context so its profile, cookies, and persistent logins
  * apply; that default context is never closed. The concurrency cap counts
  * tabs, not browsers. Either way, an aborted signal closes the fetch's page.
@@ -117,8 +119,10 @@ export interface BrowserSession {
   page: PlaywrightPage
   /** True when `browser` is the CDP pool's shared connection — never closed per fetch. */
   sharedBrowser?: boolean
-  /** True when `context` is the remote default context — close only the page. */
+  /** True for retained contexts (remote profile or pool-owned named context). */
   persistent?: boolean
+  /** Pool cleanup: closes this tab and, for session isolation, its idle context. */
+  release?: () => Promise<void>
 }
 
 /**
@@ -224,12 +228,8 @@ class Semaphore {
   release(): void {
     // Below the limit a freed slot hands straight to the next waiter; above
     // it (the limit was lowered) the slot disappears instead.
-    const next = this.active <= this.limit ? this.queue.shift() : undefined
-    if (next === undefined) {
-      this.active = Math.max(0, this.active - 1)
-      return
-    }
-    next.start()
+    this.active = Math.max(0, this.active - 1)
+    this.drain()
   }
 
   private drain(): void {
@@ -303,7 +303,11 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
    * @param configSource - thunk returning the currently authoritative config.
    * @param cdpPool - optional pool over the CDP backend (tests inject fakes).
    */
-  constructor(private readonly configSource: () => ResolvedConfig, cdpPool?: CdpConnectionPool) {
+  constructor(
+    private readonly configSource: () => ResolvedConfig,
+    cdpPool?: CdpConnectionPool,
+    private readonly sessionIdSource: () => string | undefined = () => undefined,
+  ) {
     this.cdpPool = cdpPool ?? new CdpConnectionPool(defaultCdpConnect)
   }
 
@@ -324,6 +328,18 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
   async fetch(request: WebFetchRequest, signal?: AbortSignal): Promise<WebFetchResult> {
     if (signal?.aborted) throw new WebError('web fetch aborted', 'WEB_ABORTED')
     const config = this.configSource()
+    // Capture identity before queueing: never derive ownership from a shared
+    // mutable "current session", nor from process environment variables.
+    const sessionScoped = config.backend === 'cdp' && !config.shareBrowserContext && config.contextIsolationScope === 'session'
+    let sessionId: string | undefined
+    if (sessionScoped) {
+      // The identity source may throw (e.g. the agents service was already
+      // disposed during unload); surface that as the seam's error, not a raw Error.
+      try { sessionId = this.sessionIdSource() } catch { sessionId = undefined }
+      if (!sessionId?.trim()) {
+        throw new WebError('per-session context isolation requires a DSH session identity', 'WEB_FETCH_SESSION_REQUIRED')
+      }
+    }
     const url = validateFetchUrl(request.url)
     const deadline = new Deadline(signal, DEFAULT_TIMEOUT_MS)
 
@@ -335,7 +351,8 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       this.semaphore.resize(effectiveMaxConcurrency(config))
       await this.semaphore.acquire(deadline.signal, QUEUE_TIMEOUT_MS)
       acquired = true
-      session = await this.openSession(config, deadline)
+      session = await this.openSession(config, deadline, sessionId)
+      if (deadline.signal.aborted) throw new Error('web fetch aborted during session setup')
       // An aborted deadline must also interrupt Playwright's own waits:
       // closing the page rejects every pending operation on it (and, for
       // fetch-owned contexts, the context close that follows takes the rest).
@@ -366,16 +383,26 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
    * @param deadline - the fetch budget, applied to launch/connect timeouts.
    * @returns the browser session the fetch will use.
    */
-  protected async openSession(config: ResolvedConfig, deadline: Deadline): Promise<BrowserSession> {
+  protected async openSession(config: ResolvedConfig, deadline: Deadline, sessionId?: string): Promise<BrowserSession> {
     const timeout = Math.min(deadline.remainingMs(), 20_000)
     if (config.backend === 'cdp') {
       const endpoint = normalizeCdpEndpoint(config.cdpEndpoint)
+      const profile = effectiveContextMode(config) === 'profile'
+      if (!profile && config.contextIsolationScope === 'session' && !sessionId?.trim()) {
+        throw new WebError('per-session context isolation requires a DSH session identity', 'WEB_FETCH_SESSION_REQUIRED')
+      }
+      const mode = profile
+        ? 'profile' as const
+        : { scope: config.contextIsolationScope, name: config.contextIsolationScope === 'session' ? sessionId! : 'global' }
       const { source } = await resolveCdpBackend()
+      // A policy contains the scope, NOT the requesting session: switching
+      // between sessions must not evict the other session's retained context.
+      this.cdpPool.setPolicy(JSON.stringify([endpoint, config.shareBrowserContext,
+        config.shareBrowserContext ? '' : config.contextIsolationScope]))
       try {
-        // One shared connection per provider; this fetch leases a tab — in a
-        // throwaway isolated context, or in the remote profile's default
-        // context (profile mode), whose persistent logins then apply.
-        const lease = await this.cdpPool.acquire(endpoint, timeout, effectiveContextMode(config))
+        // Lease a tab in a retained named context or the remote default
+        // profile. Only the pool owns context/connection cleanup.
+        const lease = await this.cdpPool.acquire(endpoint, timeout, mode)
         await installResourceFilter(lease.page)
         guardPopups(lease.page)
         guardDownloads(lease.page)
@@ -385,15 +412,17 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
           page: lease.page,
           sharedBrowser: true,
           persistent: lease.persistent,
+          release: () => lease.release(),
         }
       } catch (error: unknown) {
         throw new WebError(
-          `cannot connect to the CDP endpoint ${endpoint} (${source}); is the browser started with --remote-debugging-port? ${String(error instanceof Error ? error.message : error)}`,
+          `cannot open a fetch session via the CDP endpoint ${endpoint} (${source}): ${String(error instanceof Error ? error.message : error)}`,
           'WEB_PROVIDER_ERROR',
           { cause: error },
         )
       }
     }
+    this.cdpPool.setPolicy('local')
     const { chromium, executablePath, source } = await resolvePlaywrightBackend(config.playwrightPath)
     let browser: PlaywrightBrowser | undefined
     try {
@@ -892,6 +921,10 @@ function capResult(url: string, statusCode: number, body: { kind: 'html' | 'text
  */
 async function closeSession(session: BrowserSession | undefined): Promise<void> {
   if (session === undefined) return
+  if (session.release !== undefined) {
+    await closeWithGrace({ close: session.release })
+    return
+  }
   await closeWithGrace(session.page)
   if (session.persistent !== true) await closeWithGrace(session.context)
   if (session.sharedBrowser !== true) await closeWithGrace(session.browser)

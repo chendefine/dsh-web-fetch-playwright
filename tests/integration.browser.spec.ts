@@ -18,6 +18,8 @@
  * and the feature-on provider for the before/after comparison (issue #2).
  */
 import { createServer } from 'node:http'
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { resolveConfig } from '../src/config.ts'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { WebError } from '@deepseek-ai/dsh-web'
 import { PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE } from '../src/provider.ts'
@@ -136,6 +138,14 @@ beforeAll(async () => {
       res.end(GUARDED_ARTICLE)
       return
     }
+    if (url.startsWith('/storage')) {
+      res.writeHead(200, { 'content-type': 'text/html' })
+      res.end(`<html><body><p id="result"></p><script>
+        document.querySelector('#result').textContent = localStorage.getItem('probe') ? 'STORAGE-SEEN' : 'STORAGE-EMPTY';
+        localStorage.setItem('probe', '1');
+      </script></body></html>`)
+      return
+    }
     if (url.startsWith('/cookie')) {
       if ((req.headers.cookie ?? '').includes('dsh-profile-probe=')) {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
@@ -219,6 +229,7 @@ describe('PlaywrightFetchProvider integration', () => {
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
@@ -245,6 +256,7 @@ describe('PlaywrightFetchProvider integration', () => {
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
       shareBrowserContext: true,
       denoise: false,
       maxConcurrency: 4,
@@ -265,6 +277,7 @@ describe('PlaywrightFetchProvider integration', () => {
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
@@ -294,6 +307,7 @@ describe('PlaywrightFetchProvider integration', () => {
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
@@ -315,6 +329,7 @@ describe('PlaywrightFetchProvider integration', () => {
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
@@ -339,6 +354,7 @@ describe('PlaywrightFetchProvider integration', () => {
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
@@ -366,6 +382,7 @@ describe('PlaywrightFetchProvider integration', () => {
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
@@ -389,6 +406,7 @@ describe('PlaywrightFetchProvider integration', () => {
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
@@ -454,6 +472,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: endpoint,
+      contextIsolationScope: 'global' as const,
       shareBrowserContext: false, // isolated: preserves this suite's original stance
       denoise: true,
       challengeWaitMs: 0,
@@ -477,6 +496,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: endpoint,
+      contextIsolationScope: 'global' as const,
       shareBrowserContext: false, // isolated: preserves this suite's original stance
       denoise: true,
       challengeWaitMs: 0,
@@ -501,6 +521,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: endpoint,
+      contextIsolationScope: 'global' as const,
       shareBrowserContext: true,
       denoise: true,
       challengeWaitMs: 0,
@@ -518,7 +539,27 @@ describe('PlaywrightFetchProvider CDP integration', () => {
     expect(debugBrowser.isConnected()).toBe(true)
   })
 
-  it('isolated mode: every fetch gets a fresh jar, no cookie crosses fetches', { timeout: 120_000 }, async () => {
+  it('session isolation retains cookies and localStorage only within the owning session', { timeout: 120_000 }, async () => {
+    if (!browserAvailable || debugBrowser === undefined) return
+    const identity = new AsyncLocalStorage<string>()
+    const provider = new PlaywrightFetchProvider(() => resolveConfig({
+      backend: 'cdp', cdpEndpoint: endpoint, shareBrowserContext: false,
+      contextIsolationScope: 'session', denoise: false, challengeWaitMs: 0,
+    }), undefined, () => identity.getStore())
+    const fetchAs = (id: string, path: string) => identity.run(id, () => provider.fetch({ url: `${baseUrl}${path}` }))
+    try {
+      expect((await fetchAs('A', 'cookie')).body.content).not.toContain('COOKIE-SEEN')
+      expect((await fetchAs('B', 'cookie')).body.content).not.toContain('COOKIE-SEEN')
+      expect((await fetchAs('A', 'cookie')).body.content).toContain('COOKIE-SEEN')
+      // Match rendered DOM, not the JavaScript string literals in the HTML.
+      expect((await fetchAs('A', 'storage')).body.content).toContain('id="result">STORAGE-EMPTY')
+      expect((await fetchAs('B', 'storage')).body.content).toContain('id="result">STORAGE-EMPTY')
+      expect((await fetchAs('A', 'storage')).body.content).toContain('id="result">STORAGE-SEEN')
+    } finally { await provider.dispose() }
+    expect(debugBrowser.isConnected()).toBe(true)
+  })
+
+  it('global isolated mode: retains its jar without inheriting default profile cookies', { timeout: 120_000 }, async () => {
     if (!browserAvailable || debugBrowser === undefined) {
       console.warn('skipping CDP smoke (no launchable browser)')
       return
@@ -527,15 +568,17 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: endpoint,
+      contextIsolationScope: 'global' as const,
       shareBrowserContext: false,
       denoise: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
-    await provider.fetch({ url: `${baseUrl}cookie` }) // sets a cookie — then dies with its context
+    const first = await provider.fetch({ url: `${baseUrl}cookie` })
+    expect(first.body.content).not.toContain('COOKIE-SEEN')
     const second = await provider.fetch({ url: `${baseUrl}cookie` })
     const secondText = second.body.kind === 'text' ? second.body.content : ''
-    expect(secondText).not.toContain('COOKIE-SEEN')
+    expect(secondText).toContain('COOKIE-SEEN')
     await provider.dispose()
   })
 
@@ -552,6 +595,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: endpoint,
+      contextIsolationScope: 'global' as const,
       shareBrowserContext: true,
       denoise: true,
       challengeWaitMs: 12_000,
@@ -572,7 +616,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
     expect(debugBrowser.isConnected()).toBe(true)
   })
 
-  it('isolated mode: challenge clearance dies with the fetch — the second fetch is challenged again', { timeout: 120_000 }, async () => {
+  it('global isolated mode: challenge clearance survives across fetches', { timeout: 120_000 }, async () => {
     if (!browserAvailable || debugBrowser === undefined) {
       console.warn('skipping CDP smoke (no launchable browser)')
       return
@@ -581,6 +625,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: endpoint,
+      contextIsolationScope: 'global' as const,
       shareBrowserContext: false,
       denoise: true,
       challengeWaitMs: 12_000,
@@ -591,8 +636,8 @@ describe('PlaywrightFetchProvider CDP integration', () => {
     const served = challengeState.challengesServed
     const second = await provider.fetch({ url: `${baseUrl}guarded/article` })
     const secondText = second.body.kind === 'text' ? second.body.content : ''
-    // The fresh context was challenged again — and cleared it again on its own.
-    expect(challengeState.challengesServed).toBe(served + 1)
+    // The plugin-owned context retained its clearance across tab closes.
+    expect(challengeState.challengesServed).toBe(served)
     expect(secondText).toContain('Real protected content')
     await provider.dispose()
   })
@@ -609,6 +654,7 @@ describe('PlaywrightFetchProvider challenge A/B (simulated Cloudflare edge)', ()
       backend: 'local' as const,
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,

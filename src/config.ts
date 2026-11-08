@@ -58,10 +58,13 @@ export const MAX_CHALLENGE_RETRIES = 3
 export type PlaywrightBackend = 'local' | 'cdp'
 
 /**
- * How the CDP backend scopes a fetch: a throwaway isolated context, or a tab
+ * How the CDP backend scopes a fetch: a reusable isolated context, or a tab
  * in the remote browser's real profile (default context).
  */
 export type CdpContextMode = 'isolated' | 'profile'
+
+/** Isolation key: an on-demand context per DSH session or one retained global context. */
+export type ContextIsolationScope = 'session' | 'global'
 
 /** Plugin config: everything optional — the schema fills the defaults. */
 export interface Config {
@@ -79,10 +82,18 @@ export interface Config {
    * CDP backend only. `true` (default): each fetch is a tab in the remote
    * browser's default context — the real profile — so cookies/localStorage
    * come from (and are written back to) it and its persistent logins apply.
-   * `false`: a fresh incognito-like isolated context per fetch, no shared
-   * state. Meaningless for the local backend (collapses to isolated).
+   * `false`: use an on-demand isolated context per session or a retained global context.
+   * Meaningless for the local backend (collapses to isolated).
    */
   shareBrowserContext?: boolean
+  /**
+   * CDP isolated context scope; defaults to global (retained between fetches).
+   * Session contexts are created on demand; concurrent same-session fetches
+   * share the context but each opens and closes its own tab. The context closes
+   * when no active/pending fetches and no other open tabs remain, so the next
+   * fetch starts with fresh cookies/localStorage. Profile mode is unaffected.
+   */
+  contextIsolationScope?: ContextIsolationScope
   /** Whether the Readability + DOMPurify denoise pipeline runs before markdown. */
   denoise?: boolean
   /**
@@ -116,6 +127,7 @@ export const Config = z.object({
   playwrightPath: z.string().default('').volatile(),
   cdpEndpoint: z.string().default('').volatile(),
   shareBrowserContext: z.boolean().default(true).volatile(),
+  contextIsolationScope: z.union([z.const('session'), z.const('global')]).default('global').volatile(),
   denoise: z.boolean().default(true).volatile(),
   // Optional on purpose: the effective default depends on `backend`, which a
   // static schema default cannot express.
@@ -140,6 +152,7 @@ export interface PlaywrightPluginConfig {
   cdpEndpoint: Volatile<string>
   /** Shared-context toggle as a live reference. */
   shareBrowserContext: Volatile<boolean>
+  contextIsolationScope: Volatile<ContextIsolationScope>
   /** Denoise toggle as a live reference. */
   denoise: Volatile<boolean>
   /**
@@ -167,6 +180,7 @@ export function snapshotsOf(config: PlaywrightPluginConfig): Config {
     playwrightPath: config.playwrightPath.get(),
     cdpEndpoint: config.cdpEndpoint.get(),
     shareBrowserContext: config.shareBrowserContext.get(),
+    contextIsolationScope: config.contextIsolationScope.get(),
     denoise: config.denoise.get(),
     maxConcurrency: config.maxConcurrency.get(),
     challengeWaitMs: config.challengeWaitMs.get(),
@@ -191,6 +205,7 @@ export function resolveConfig(config: Partial<Config>): ResolvedConfig {
     playwrightPath: resolved.playwrightPath.get(),
     cdpEndpoint: resolved.cdpEndpoint.get(),
     shareBrowserContext: resolved.shareBrowserContext.get(),
+    contextIsolationScope: resolved.contextIsolationScope.get(),
     denoise: resolved.denoise.get(),
     maxConcurrency: resolved.maxConcurrency.get(),
     challengeWaitMs: resolved.challengeWaitMs.get(),
@@ -245,7 +260,7 @@ export function effectiveChallengeRetries(config: Pick<Config, 'challengeRetries
 /**
  * The context mode a fetch actually runs with: profile (a tab in the remote
  * browser's real profile) requires the CDP backend — a local launch has no
- * meaningful shared profile — and the checkbox (which defaults on, so an
+ * meaningful shared profile — and the share option (which defaults on, so an
  * absent value reads as `true`, mirroring the schema default); everything
  * else collapses to isolated.
  *

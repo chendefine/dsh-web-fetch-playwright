@@ -1,7 +1,7 @@
 /**
  * The Playwright plugin-configuration card: backend radio group (each option
  * carrying its backend-specific inputs nested inside — local path under Local
- * Playwright, CDP endpoint and shared-context checkbox under Remote CDP) plus
+ * Playwright, CDP endpoint and context-mode radios under Remote CDP) plus
  * the denoise checkbox, staged and saved through the card form like the
  * built-in plugin cards.
  *
@@ -39,6 +39,8 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
   const state = props.usePlaywrightCard(snapshot => snapshot)
   if (!state.available) return null
   const disabled = !state.writable
+  const isolated = state.shareBrowserContext.text === 'false'
+  const scope = state.contextIsolationScope.text === 'session' ? 'session' : 'global'
   const backend = state.backend.text === 'cdp' ? 'cdp' : 'local'
   return (
     <CardForm
@@ -97,12 +99,40 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
                   onEdit={(text) => { props.edit('cdpEndpoint', text) }}
                   onReset={() => { props.resetField('cdpEndpoint') }}
                 />
-                <CheckboxField
+                <RadioGroupField
                   embedded
-                  id="plugin-config-playwright-share-context"
-                  label={t('shareBrowserContext')}
-                  hint={t('shareBrowserContextHint')}
-                  checked={state.shareBrowserContext.text !== 'false'}
+                  label={t('contextMode')}
+                  text={isolated ? 'false' : 'true'}
+                  options={[
+                    { value: 'true', label: t('shareBrowserContext'), hint: t('shareBrowserContextHint') },
+                    {
+                      value: 'false',
+                      label: t('isolateBrowserContext'),
+                      hint: t('isolateBrowserContextHint'),
+                      content: isolated ? (
+                        <RadioGroupField
+                          embedded
+                          plainOptions
+                          label={t('contextIsolationScope')}
+                          text={scope}
+                          options={[
+                            {
+                              value: 'global',
+                              label: t('contextScopeGlobal'),
+                              hint: t('contextScopeGlobalHint'),
+                            },
+                            { value: 'session', label: t('contextScopeSession'), hint: t('contextScopeSessionHint') },
+                          ]}
+                          overridden={state.contextIsolationScope.overridden}
+                          overriddenLabel={t('overridden')}
+                          resetLabel={t('reset')}
+                          disabled={disabled || backend !== 'cdp'}
+                          onEdit={(text) => { props.edit('contextIsolationScope', text) }}
+                          onReset={() => { props.resetField('contextIsolationScope') }}
+                        />
+                      ) : undefined,
+                    },
+                  ]}
                   overridden={state.shareBrowserContext.overridden}
                   overriddenLabel={t('overridden')}
                   resetLabel={t('reset')}
@@ -114,7 +144,7 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
             ),
           },
         ]}
-        text={state.backend.text}
+        text={backend}
         overridden={state.backend.overridden}
         overriddenLabel={t('overridden')}
         resetLabel={t('reset')}

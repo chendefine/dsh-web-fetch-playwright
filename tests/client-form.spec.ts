@@ -5,6 +5,12 @@
  * DOM.
  */
 import { describe, expect, it } from 'vitest'
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { RadioGroupField } from '../src/client/fields.tsx'
+import { PlaywrightCard, type PlaywrightCardProps } from '../src/client/card.tsx'
+import { en, zh } from '../src/client/locales.ts'
+import { PlaywrightCardController } from '../src/client/controller.ts'
 import type { SettingsPathOpView } from '@deepseek-ai/dsh-api-remotes/client'
 import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import { CardForm, checkboxField, numberField, radioField, textField } from '../src/client/form.ts'
@@ -83,6 +89,7 @@ function makeForm(scope: ConfigForm<Record<string, unknown>>) {
     radioField('backend', ['local', 'cdp']),
     textField('playwrightPath'),
     checkboxField('shareBrowserContext'),
+    radioField('contextIsolationScope', ['session', 'global']),
     checkboxField('denoise'),
     numberField('maxConcurrency', 1, 8),
     numberField('challengeWaitMs', 0, 60_000),
@@ -253,5 +260,77 @@ describe('CardForm', () => {
     // The store keeps its last snapshot: no listener fired after dispose.
     expect(store.getSnapshot().dirty).toBe(false)
     expect(scope.getSnapshot().value?.playwrightPath).toBe('/b')
+  })
+})
+
+
+describe('context controls', () => {
+  it('saves scope and boolean mode', async () => {
+    const scope = new FakeScope({ shareBrowserContext: true })
+    const controller = new PlaywrightCardController(scope)
+    const face = controller.inject()
+    face.edit('shareBrowserContext', 'false')
+    face.edit('contextIsolationScope', 'global')
+    face.save()
+    await expect.poll(() => scope.writes).toEqual([
+      { field: 'shareBrowserContext', op: 'set', value: false },
+      { field: 'contextIsolationScope', op: 'set', value: 'global' },
+    ])
+    face.edit('contextIsolationScope', 'fetch')
+    expect(face.hooks.playwrightCard.getSnapshot().invalid).toBe(true)
+    controller.dispose()
+  })
+
+  it('keeps scope drafts staged until save and supports discard', () => {
+    const scope = new FakeScope({ shareBrowserContext: false })
+    const controller = new PlaywrightCardController(scope)
+    const face = controller.inject()
+    expect(face.hooks.playwrightCard.getSnapshot().contextIsolationScope.text).toBe('')
+    face.edit('contextIsolationScope', 'session')
+    expect(face.hooks.playwrightCard.getSnapshot().contextIsolationScope.text).toBe('session')
+    expect(scope.writes).toHaveLength(0)
+    face.discard()
+    expect(face.hooks.playwrightCard.getSnapshot().contextIsolationScope.text).toBe('')
+    controller.dispose()
+  })
+
+  it.each([
+    ['zh', zh, '跨 DSH 会话全局复用'],
+    ['en', en, 'Global reuse across DSH sessions'],
+  ] as const)('renders scope choices without a name input (%s)', (_locale, copy, label) => {
+    for (const contextIsolationScope of ['global', 'session']) {
+      const controller = new PlaywrightCardController(new FakeScope({
+        backend: 'cdp', shareBrowserContext: false, contextIsolationScope,
+      }))
+      const face = controller.inject()
+      const props = {
+        ...face, view: 'page', t: (key: keyof typeof en) => copy[key],
+        usePlaywrightCard: (select: (state: ReturnType<typeof face.hooks.playwrightCard.getSnapshot>) => unknown) =>
+          select(face.hooks.playwrightCard.getSnapshot()),
+      } as PlaywrightCardProps
+      const html = renderToStaticMarkup(createElement(PlaywrightCard, props))
+      expect(html).toContain(label)
+      expect(html).toContain(copy.contextScopeSession)
+      expect(html).toContain(copy.contextScopeGlobalHint)
+      expect(html).not.toContain('plugin-config-playwright-context-name')
+      expect(html).not.toContain('上下文名称')
+      expect(html).not.toContain('Context name')
+      controller.dispose()
+    }
+  })
+
+  it('gives each mounted radio group its own name', () => {
+    const props = {
+      label: 'Group', options: [{ value: 'a', label: 'A', hint: '' }, { value: 'b', label: 'B', hint: '' }],
+      text: 'a', overridden: false, overriddenLabel: '', resetLabel: '', disabled: false,
+      onEdit: () => {}, onReset: () => {},
+    }
+    const html = renderToStaticMarkup(createElement('div', null,
+      createElement(RadioGroupField, props), createElement(RadioGroupField, props)))
+    const names = [...html.matchAll(/name="([^"]+)"/g)].map(match => match[1])
+    expect(names).toHaveLength(4)
+    expect(names[0]).toBe(names[1])
+    expect(names[2]).toBe(names[3])
+    expect(names[0]).not.toBe(names[2])
   })
 })

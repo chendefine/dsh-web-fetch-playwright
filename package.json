@@ -1,6 +1,6 @@
 {
   "name": "dsh-web-fetch-playwright",
-  "version": "0.2.13",
+  "version": "0.2.14",
   "description": "Playwright/CDP web-fetch provider for DeepSeek Harness: renders pages in a real browser, denoises them (Readability + DOMPurify), and returns markdown.",
   "type": "module",
   "license": "MIT",
@@ -74,16 +74,16 @@
   },
   "disclosure": {
     "cloud": false,
-    "network": [],
+    "network": [ ],
     "offlineMode": false,
-    "apiKeys": [],
+    "apiKeys": [ ],
     "permissions": [
       "network:fetch (renders the URLs the user requests in a local browser)",
       "network:connect (user-configured CDP endpoint, default 127.0.0.1:9222)",
       "fs:read (user-configured playwright/browser executable path)",
       "network:fetch (CDP profile mode: renders the URLs the user requests WITH the remote browser's logged-in sessions)"
     ],
-    "jurisdiction": [],
+    "jurisdiction": [ ],
     "retention": "none (profile mode: site data lands in the remote browser's own persistent user-data-dir, which this plugin never cleans)"
   },
   "dependencies": {
@@ -92,7 +92,7 @@
     "@mozilla/readability": "^0.6.0",
     "dompurify": "^3.2.4",
     "jsdom": "^26.0.0",
-    "playwright-core": "^1.64.1",
+    "playwright-core": "^1.65.0",
     "turndown": "^7.2.0"
   },
   "peerDependencies": {
@@ -114,6 +114,7 @@
     "@deepseek-ai/dsh-client-ui-settings": "0.1.7-rc.2",
     "@deepseek-ai/dsh-client-ui-slots": "0.1.7-rc.2",
     "@deepseek-ai/dsh-web": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-agent": "0.1.7-rc.2",
     "@types/jsdom": "^30.0.0",
     "@types/node": "^24.0.0",
     "@types/react": "^18.3.1",

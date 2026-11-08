@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Reusable isolated CDP contexts with a selectable scope** (`contextIsolationScope`, CDP backend with `shareBrowserContext: false` only). `global` (default) keeps one isolated context for the plugin instance, shared by all DSH sessions until teardown or a settings change. `session` creates a context per DSH session (its own CDP connection and window) on demand; same-session fetches already inside the pool share it in separate tabs, and it closes once no such fetch and no open tab remains. A fetch without a DSH session identity fails with `WEB_FETCH_SESSION_REQUIRED`. The profile mode (`shareBrowserContext: true`, the default) is unaffected.
+
+### Changed
+
+- **Behavior change for `shareBrowserContext: false`:** fetches no longer get a throwaway context each time. With the default `global` scope, cookies and localStorage now persist across fetches (and DSH sessions) until the plugin unloads or the context settings change; choose `session` to bound them to one DSH session.
+
 ## [0.2.12] - 2026-10-17
 
 ### Fixed

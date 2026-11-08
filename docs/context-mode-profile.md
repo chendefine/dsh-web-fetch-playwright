@@ -9,6 +9,14 @@
 > 适用版本:插件 v0.2.1,捆绑 `playwright-core` **1.62.1**(证据行号以此版本 bundle 为准,
 > 升级后行号会漂移,按附录 C 的符号搜索方式定位)。
 
+## 当前隔离上下文生命周期（覆盖下文历史设计中的隔离行为）
+
+下文保留 v0.2.2 的 profile 模式设计记录和代码草稿，不代表当前隔离模式的完整生命周期。当前配置使用 `shareBrowserContext` 与 `contextIsolationScope`：
+
+- **会话隔离（`session`）**：按 DSH 会话 ID 按需创建独立 CDP 连接、context 和独立窗口；空闲时同时断开该会话连接。这避免连接级 CDP 网关把不同会话嵌套进同一 Chromium，或让一个会话的关闭销毁另一个会话。首次页面通过 Playwright 注册的 context 与 CDP `Target.createTarget(newWindow: true)` 创建，随后页面校验真实 context/window ID；禁止回退到默认 profile。每个会话键的 FIFO 锁串行化 context/tab 创建与“关 tab→判空→关 context”整个事务，锁不覆盖网页抓取且不同会话互不阻塞。只关闭自己拥有的 tab；最后一个 tab 关闭后回收 context，排队的新建等待关闭完成后重新创建。其他标签页仍打开时不会回收；新 context 的 cookie/localStorage 为空。缺少会话 ID 或端点不能满足隔离保证时明确失败。
+- **全局隔离（`global`，默认）不变**：同一插件实例内所有 DSH 会话复用一个保留的隔离 context，抓取结束仅关自己的标签页，后续抓取沿用 cookie / localStorage；配置退役、卸载、断连或连接替换时才清理。
+- **共享 profile 模式不变**：每次抓取在远端默认 context 中开关自己的标签页，插件不关闭默认 context，也不清理 profile 数据。本地后端行为不变。
+
 ---
 
 ## 1. 背景与动机

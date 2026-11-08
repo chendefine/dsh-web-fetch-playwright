@@ -12,6 +12,9 @@ export type PlaywrightCardLocaleKey =
   | 'playwrightPath' | 'playwrightPathHint' | 'playwrightPathPlaceholder'
   | 'cdpEndpoint' | 'cdpEndpointHint'
   | 'shareBrowserContext' | 'shareBrowserContextHint'
+  | 'contextMode' | 'isolateBrowserContext' | 'isolateBrowserContextHint'
+  | 'contextIsolationScope' | 'contextScopeSession' | 'contextScopeSessionHint'
+  | 'contextScopeGlobal' | 'contextScopeGlobalHint'
   | 'denoise' | 'denoiseHint'
   | 'maxConcurrency' | 'maxConcurrencyHint' | 'maxConcurrencyPlaceholder'
   | 'challengeWaitMs' | 'challengeWaitMsHint' | 'challengeWaitMsPlaceholder'
@@ -39,7 +42,15 @@ export const en: Record<PlaywrightCardLocaleKey, string> = {
   cdpEndpoint: 'CDP endpoint',
   cdpEndpointHint: 'host:port or http(s)/ws URL. Leave blank for 127.0.0.1:9222.',
   shareBrowserContext: 'Share the browser context (profile logins)',
-  shareBrowserContextHint: 'Each fetch opens a tab in the remote browser\u2019s real profile \u2014 cookies and localStorage are shared and its persistent logins apply. Unchecked: every fetch uses a fresh isolated context.',
+  shareBrowserContextHint: 'Each fetch opens a tab in the remote browser\u2019s real profile \u2014 cookies and localStorage are shared and its persistent logins apply.',
+  contextMode: 'Browser context',
+  isolateBrowserContext: 'Isolate from the browser profile',
+  isolateBrowserContextHint: 'Use a separate in-memory context with the lifecycle chosen below; no access to the browser profile’s logins.',
+  contextIsolationScope: 'Reuse isolated context',
+  contextScopeSession: 'Per DSH session',
+  contextScopeSessionHint: 'Created on demand per DSH session. Concurrent fetches share the context in separate tabs, each closing its own tab. The context closes when no active or pending fetches and no other open tabs remain; the next fetch starts with fresh cookies. Different sessions keep separate site data.',
+  contextScopeGlobal: 'Global reuse across DSH sessions',
+  contextScopeGlobalHint: 'All DSH sessions share cookies and localStorage within this plugin instance.',
   denoise: 'Enable the denoise algorithm',
   denoiseHint: 'Readability + DOMPurify strip nav bars, sidebars, footers, and ads before converting to markdown.',
   maxConcurrency: 'Max concurrent fetches',
@@ -72,7 +83,15 @@ export const zh: Record<PlaywrightCardLocaleKey, string> = {
   cdpEndpoint: 'CDP 地址',
   cdpEndpointHint: 'host:port 或 http(s)/ws 地址；留空默认 127.0.0.1:9222。',
   shareBrowserContext: '共享浏览器上下文（复用登录态）',
-  shareBrowserContextHint: '每次抓取在远端浏览器的真实 profile 里开一个标签页：共享 cookie 与 localStorage、复用已登录会话，页面会看到你的登录身份；取消勾选则每次抓取使用全新隔离上下文。',
+  shareBrowserContextHint: '每次抓取在远端浏览器的真实 profile 里开一个标签页：共享 cookie 与 localStorage、复用已登录会话，页面会看到你的登录身份。',
+  contextMode: '浏览器上下文',
+  isolateBrowserContext: '隔离浏览器上下文',
+  isolateBrowserContextHint: '使用独立的内存上下文，生命周期由下方范围决定，不使用远端浏览器 profile 的登录态。',
+  contextIsolationScope: '隔离上下文复用范围',
+  contextScopeSession: '按 DSH 会话隔离',
+  contextScopeSessionHint: '按 DSH 会话按需创建上下文；并发抓取共享上下文，各用独立标签页并各自关闭。没有活动或待处理抓取，且没有其他打开的标签页时关闭上下文；下次抓取使用全新 cookie。不同会话的站点数据互不共享。',
+  contextScopeGlobal: '跨 DSH 会话全局复用',
+  contextScopeGlobalHint: '本插件实例内，所有 DSH 会话共享 cookie 与 localStorage。',
   denoise: '启用降噪算法',
   denoiseHint: '使用 Readability + DOMPurify 清洗导航栏、侧边栏、页脚与贴片广告后再转为 Markdown。',
   maxConcurrency: '最大并发抓取数',

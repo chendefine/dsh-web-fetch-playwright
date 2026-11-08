@@ -10,7 +10,9 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WebError } from '@deepseek-ai/dsh-web'
+import { resolveConfig } from '../src/config.ts'
 import type { ResolvedConfig } from '../src/config.ts'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { CdpConnectionPool } from '../src/cdp-pool.ts'
 import { PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE } from '../src/provider.ts'
 import type { BrowserSession } from '../src/provider.ts'
@@ -330,6 +332,7 @@ class FakeProvider extends PlaywrightFetchProvider {
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global',
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
@@ -360,6 +363,7 @@ class GatedProvider extends PlaywrightFetchProvider {
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global',
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
@@ -444,7 +448,7 @@ function fakeCdpConnection(spec: FakePageSpec = {}) {
   return {
     state,
     /** A pool whose connect always lands on this one connection. */
-    pool: new CdpConnectionPool(async () => { state.connects++; return browser }),
+    pool: new CdpConnectionPool(async () => { state.connects++; return browser }, async context => await context.newPage()),
   }
 }
 
@@ -525,6 +529,19 @@ describe('PlaywrightFetchProvider', () => {
         .fetch({ url: 'https://example.com/down' }),
     )
     expect(code).toBe('WEB_PROVIDER_ERROR')
+  })
+
+  it('never replays a navigation based on a missing-context-looking error', async () => {
+    const goto = vi.fn().mockRejectedValue(new Error('Protocol error (Target.createTarget): Failed to find browser context with id ABC123'))
+    class ObservedProvider extends FakeProvider {
+      protected override async openSession(): Promise<BrowserSession> {
+        const session = await super.openSession()
+        session.page.goto = goto
+        return session
+      }
+    }
+    expect(await codeOf(new ObservedProvider().fetch({ url: 'https://example.com' }))).toBe('WEB_PROVIDER_ERROR')
+    expect(goto).toHaveBeenCalledTimes(1)
   })
 
   it('translates a pre-aborted signal to WEB_ABORTED', async () => {
@@ -730,6 +747,7 @@ describe('PlaywrightFetchProvider download navigation recovery', () => {
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global',
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
@@ -831,12 +849,95 @@ describe('PlaywrightFetchProvider concurrency queue', () => {
 })
 
 describe('PlaywrightFetchProvider CDP backend', () => {
-  it('isolated mode (checkbox off): one shared connection, each fetch a throwaway context it closes', async () => {
+  it('captures queued session identity and recreates contexts after each idle period', async () => {
+    const { state, pool } = fakeCdpConnection()
+    const identity = new AsyncLocalStorage<string>()
+    const acquire = vi.spyOn(pool, 'acquire')
+    const provider = new PlaywrightFetchProvider(() => resolveConfig({
+      backend: 'cdp', shareBrowserContext: false, contextIsolationScope: 'session',
+      challengeWaitMs: 0, maxConcurrency: 1,
+    }), pool, () => identity.getStore())
+    try {
+      await Promise.all(['A', 'B', 'A', 'B'].map(id => identity.run(id,
+        () => provider.fetch({ url: 'https://example.com' }))))
+      expect(state.isolatedContextsOpened).toBe(4)
+      expect(state.isolatedContextsClosed).toBe(4)
+      expect(state.pagesClosed).toBe(4)
+      expect(acquire.mock.calls.map(call => call[2])).toEqual([
+        { scope: 'session', name: 'A' },
+        { scope: 'session', name: 'B' },
+        { scope: 'session', name: 'A' },
+        { scope: 'session', name: 'B' },
+      ])
+    } finally { await provider.dispose() }
+    expect(state.isolatedContextsClosed).toBe(4)
+  })
+
+  it('fails closed without session identity, before connecting', async () => {
+    const { state, pool } = fakeCdpConnection()
+    const provider = new PlaywrightFetchProvider(() => resolveConfig({
+      backend: 'cdp', shareBrowserContext: false, contextIsolationScope: 'session',
+    }), pool)
+    expect(await codeOf(provider.fetch({ url: 'https://example.com' }))).toBe('WEB_FETCH_SESSION_REQUIRED')
+    expect(state.connects).toBe(0)
+  })
+
+  it('fails closed as a WebError when the session identity source throws', async () => {
+    const { state, pool } = fakeCdpConnection()
+    const provider = new PlaywrightFetchProvider(() => resolveConfig({
+      backend: 'cdp', shareBrowserContext: false, contextIsolationScope: 'session',
+    }), pool, () => { throw new Error('agents service disposed') })
+    expect(await codeOf(provider.fetch({ url: 'https://example.com' }))).toBe('WEB_FETCH_SESSION_REQUIRED')
+    expect(state.connects).toBe(0)
+  })
+
+  it('retains global state for unrelated edits and retires it on scope changes', async () => {
+    const { state, pool } = fakeCdpConnection()
+    let config = resolveConfig({ backend: 'cdp', shareBrowserContext: false, challengeWaitMs: 0 })
+    const acquire = vi.spyOn(pool, 'acquire')
+    const provider = new PlaywrightFetchProvider(() => config, pool, () => 'session-A')
+    try {
+      await provider.fetch({ url: 'https://example.com' })
+      config = { ...config, denoise: false }
+      await provider.fetch({ url: 'https://example.com' })
+      expect(state.isolatedContextsOpened).toBe(1)
+      expect(acquire.mock.calls[1]?.[2]).toEqual({ scope: 'global', name: 'global' })
+      config = { ...config, contextIsolationScope: 'session' }
+      await provider.fetch({ url: 'https://example.com' })
+      expect(state.isolatedContextsOpened).toBe(2)
+      expect(state.isolatedContextsClosed).toBe(2)
+      expect(acquire.mock.calls[2]?.[2]).toEqual({ scope: 'session', name: 'session-A' })
+    } finally { await provider.dispose() }
+  })
+
+  it('reuses one global context across different DSH sessions', async () => {
+    const { state, pool } = fakeCdpConnection()
+    const identity = new AsyncLocalStorage<string>()
+    const acquire = vi.spyOn(pool, 'acquire')
+    const provider = new PlaywrightFetchProvider(() => resolveConfig({
+      backend: 'cdp', shareBrowserContext: false, contextIsolationScope: 'global',
+      challengeWaitMs: 0, maxConcurrency: 1,
+    }), pool, () => identity.getStore())
+    try {
+      await Promise.all(['A', 'B', 'A', 'B'].map(id => identity.run(id,
+        () => provider.fetch({ url: 'https://example.com' }))))
+      expect(state.isolatedContextsOpened).toBe(1)
+      expect(state.isolatedContextsClosed).toBe(0)
+      expect(state.pagesClosed).toBe(4)
+      expect(acquire.mock.calls.map(call => call[2])).toEqual(
+        Array.from({ length: 4 }, () => ({ scope: 'global', name: 'global' })),
+      )
+    } finally { await provider.dispose() }
+    expect(state.isolatedContextsClosed).toBe(1)
+  })
+
+  it('global isolation: one shared context, only fetch tabs close', async () => {
     const { state, pool } = fakeCdpConnection()
     const provider = new PlaywrightFetchProvider(() => ({
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global',
       shareBrowserContext: false,
       denoise: true,
       challengeWaitMs: 0,
@@ -848,10 +949,10 @@ describe('PlaywrightFetchProvider CDP backend', () => {
     expect(first.statusCode).toBe(200)
     expect(second.statusCode).toBe(200)
 
-    // Two fetches, two isolated tabs (page + context each), ONE connection.
+    // Two tabs share one plugin-owned context until provider teardown.
     expect(state.connects).toBe(1)
-    expect(state.isolatedContextsOpened).toBe(2)
-    expect(state.isolatedContextsClosed).toBe(2)
+    expect(state.isolatedContextsOpened).toBe(1)
+    expect(state.isolatedContextsClosed).toBe(0)
     expect(state.pagesClosed).toBe(2)
     expect(state.defaultPagesOpened).toBe(0)
     expect(state.browserClosed).toBe(false)
@@ -867,6 +968,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global',
       shareBrowserContext: false,
       denoise: true,
       challengeWaitMs: 0,
@@ -879,8 +981,10 @@ describe('PlaywrightFetchProvider CDP backend', () => {
     // All fifty rode the single connection as concurrent tabs — the CDP
     // default concurrency is high enough that none queued.
     expect(state.connects).toBe(1)
-    expect(state.isolatedContextsOpened).toBe(50)
-    expect(state.isolatedContextsClosed).toBe(50)
+    expect(state.isolatedContextsOpened).toBe(1)
+    expect(state.isolatedContextsClosed).toBe(0)
+    await provider.dispose()
+    expect(state.isolatedContextsClosed).toBe(1)
   })
 
   it('profile mode: each fetch is a tab of the shared default context, closed when done', async () => {
@@ -889,6 +993,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global',
       shareBrowserContext: true,
       denoise: true,
       challengeWaitMs: 0,
@@ -921,6 +1026,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global',
       shareBrowserContext: true,
       denoise: true,
       challengeWaitMs: 0,
@@ -942,6 +1048,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global',
       shareBrowserContext: true,
       denoise: true,
       challengeWaitMs: 0,
@@ -969,6 +1076,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: '',
+      contextIsolationScope: 'global',
       shareBrowserContext: true,
       denoise: true,
       challengeWaitMs: 0,
@@ -993,11 +1101,25 @@ describe('PlaywrightFetchProvider CDP backend', () => {
     expect(closed.browser).toBe(true)
   })
 
+  it('describes tab setup failures without misdiagnosing a disconnected endpoint', async () => {
+    const { pool } = fakeCdpConnection()
+    vi.spyOn(pool, 'acquire').mockRejectedValue(new Error('browserContext.newPage: Permission denied'))
+    const provider = new PlaywrightFetchProvider(() => resolveConfig({ backend: 'cdp', shareBrowserContext: false }), pool)
+    const error = await provider.fetch({ url: 'https://example.com' }).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(WebError)
+    expect((error as WebError).code).toBe('WEB_PROVIDER_ERROR')
+    expect((error as WebError).message).toContain('cannot open a fetch session via the CDP endpoint')
+    expect((error as WebError).message).toContain('browserContext.newPage: Permission denied')
+    expect((error as WebError).message).not.toContain('is the browser started')
+    await provider.dispose()
+  })
+
   it('wraps a dead CDP endpoint as WEB_PROVIDER_ERROR naming the endpoint', { timeout: 30_000 }, async () => {
     const provider = new PlaywrightFetchProvider(() => ({
       backend: 'cdp',
       playwrightPath: '',
       cdpEndpoint: '127.0.0.1:1',
+      contextIsolationScope: 'global',
       shareBrowserContext: true,
       denoise: true,
       challengeWaitMs: 0,

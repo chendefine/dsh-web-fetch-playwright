@@ -16,6 +16,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-web'
+import type {} from '@deepseek-ai/dsh-agent'
 import { resolveConfig, snapshotsOf } from './config.ts'
 import type { PlaywrightPluginConfig } from './config.ts'
 import { PlaywrightFetchProvider } from './provider.ts'
@@ -35,6 +36,7 @@ export {
 export type {
   Config as PlaywrightFetchConfig,
   CdpContextMode,
+  ContextIsolationScope,
   PlaywrightBackend,
   PlaywrightPluginConfig,
   ResolvedConfig,
@@ -75,9 +77,13 @@ export function apply(ctx: Context, config: PlaywrightPluginConfig): void {
   // Re-read AND re-resolve per fetch: `snapshotsOf` dereferences the volatile
   // references each time, so a section committed from the settings page
   // between two fetches serves the second one.
-  const provider = new PlaywrightFetchProvider(() => resolveConfig(snapshotsOf(config)))
-  // The CDP backend holds one shared connection for the provider's lifetime;
-  // drop it when this plugin unloads so restarts don't strand sockets.
-  ctx.effect(() => () => { void provider.dispose() }, 'dsh-web-fetch-playwright: shared CDP connection')
+  const provider = new PlaywrightFetchProvider(
+    () => resolveConfig(snapshotsOf(config)),
+    undefined,
+    () => ctx.get('agents')?.currentInitiator()?.session.id,
+  )
+  // Drop all session-dedicated and global/profile-shared CDP connections on
+  // unload so restarts cannot strand sockets or owned browser contexts.
+  ctx.effect(() => () => { void provider.dispose() }, 'dsh-web-fetch-playwright: CDP connections')
   ctx.web.registerFetchProvider(provider)
 }
