@@ -153,6 +153,30 @@ beforeAll(async () => {
       res.end(REWRITE_PAGE)
       return
     }
+    if (url.startsWith('/widget-embed/')) {
+      // The linux.do shape: a NORMAL 200 article behind a Cloudflare edge
+      // (server: cloudflare + cf-ray open the suspicion gate) whose page
+      // embeds a REAL Turnstile widget — the Discourse Turnstile plugin
+      // mounts one into every topic page. The widget's iframe src strings a
+      // challenge-platform path, exactly like the real thing. With the
+      // challenge wait ON this must still fetch the article immediately:
+      // the widget alone is not interstitial proof.
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'server': 'cloudflare',
+        'cf-ray': 'a57a2100b917f23a',
+      })
+      res.end(`<!doctype html><html><head><title>Widget protected article - LINUX DO</title>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api/origin/refresh.js"></script>
+</head><body>
+<div id="main-outlet" class="wrap"><main><article><h1>Real widget-protected content</h1>
+<p>This page embeds a genuine Turnstile widget and is served at 200 behind a Cloudflare edge, exactly like a linux.do topic; the fetch must read it without ever entering the challenge wait.</p>
+<p>A second paragraph of real body text.</p></article></main></div>
+<div class="login-modal"><form><div class="cf-turnstile" data-sitekey="0x4AAAAAAA"><div id="cf-chl-widget-0001" class="cf-turnstile-wrap"><iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/if/ov2/av0/rcv/i1x0z/0x4AAAAAAA/dark/normal" title="Widget containing a Cloudflare security challenge"></div></div></form></div>
+<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js" defer></script>
+</body></html>`)
+      return
+    }
     if (url.startsWith('/guarded/')) {
       const cleared = (req.headers.cookie ?? '').includes('cf_clearance=')
       if (url.startsWith('/guarded/spa')) {
@@ -812,6 +836,28 @@ describe('PlaywrightFetchProvider challenge A/B (simulated Cloudflare edge)', ()
     const result = await provider.fetch({ url: `${baseUrl}guarded/spa` })
     expect(result.statusCode).toBe(200)
     expect(textOf(result)).toContain('Real protected content')
+    await provider.dispose()
+  })
+
+  it('a widget-embedding normal page behind a Cloudflare edge fetches clean (linux.do badcase)', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping challenge A/B (no launchable browser)')
+      return
+    }
+    // The full feature stack on: bounded wait + retries. Before the fix the
+    // widget marker read this page as a challenge, the DOM probe could never
+    // confirm a clear, and two 15s attempts died as WEB_FETCH_CHALLENGE
+    // (last status 200) — surfacing as the tool layer's 30s timeout. Now the
+    // article comes back on the first navigation, no wait round-trip at all.
+    const provider = new PlaywrightFetchProvider(localConfig({ challengeWaitMs: 15_000, challengeRetries: 1 }))
+    const started = Date.now()
+    const result = await provider.fetch({ url: `${baseUrl}widget-embed/` })
+    const text = textOf(result)
+    expect(result.statusCode).toBe(200)
+    expect(text).toContain('Real widget-protected content')
+    expect(text).not.toMatch(/just a moment/i)
+    // No challenge wait ran: far under even ONE wait window.
+    expect(Date.now() - started).toBeLessThan(15_000)
     await provider.dispose()
   })
 

@@ -14,14 +14,22 @@
  * 2. Content-level — the interstitial's localized `<title>` family
  *    ("Just a moment...", "请稍候…", ...) plus structural markers
  *    (`/cdn-cgi/challenge-platform/` scripts, `#challenge-*` elements,
- *    `cf-chl-widget-` Turnstile frames, `window._cf_chl_opt`). Markers are
- *    deliberately structural: a blog post that merely MENTIONS Cloudflare
- *    must not classify as a challenge, so the challenge-platform script
- *    check reads `<script src>` attributes only (never prose or escaped
- *    code samples) and identifies the runtime POSITIVELY by its
- *    `/orchestrate/` mount — the JSD/Precursor instrumentation Cloudflare
- *    injects into every NORMAL page of a protected zone, on several moving
- *    mounts, is not a challenge signal.
+ *    `window._cf_chl_opt`). Markers are deliberately structural: a blog
+ *    post that merely MENTIONS Cloudflare must not classify as a challenge,
+ *    so the challenge-platform script check reads `<script src>` attributes
+ *    only (never prose or escaped code samples) and identifies the runtime
+ *    POSITIVELY by its `/orchestrate/` mount — the JSD/Precursor
+ *    instrumentation Cloudflare injects into every NORMAL page of a
+ *    protected zone, on several moving mounts, is not a challenge signal.
+ *    The Turnstile widget id (`cf-chl-widget-…`) is deliberately NOT a
+ *    marker: sites embed real Turnstile widgets into normal pages
+ *    (linux.do — a Discourse forum with the Turnstile plugin mounts one on
+ *    every topic page), so the widget alone cannot distinguish an
+ *    interstitial from a normal page behind a Cloudflare edge. Every real
+ *    interstitial carries at least one independent signal beyond its
+ *    widget — the localized title, the orchestrate runtime script,
+ *    `window._cf_chl_opt`, or the `#challenge-*` scaffolding — and those
+ *    stay sufficient on their own (see {@link CHALLENGE_HTML_MARKERS}).
  *
  * The security stance (issue #2): this module only DETECTS and classifies.
  * Solving, spoofing, CAPTCHA answering, and cookie lifting live outside the
@@ -176,9 +184,21 @@ function isChallengeRuntimeScript(src: string): boolean {
  * The challenge-platform prefix is deliberately absent: script evidence goes
  * through {@link scriptSrcsOf} + {@link isChallengeRuntimeScript}, which
  * distinguish a real `src` from prose and runtime from instrumentation.
+ *
+ * The Turnstile widget id (`id="cf-chl-widget-…"`) is deliberately ABSENT
+ * (badcase: linux.do/t/topic/3143588 — a Discourse forum behind Cloudflare
+ * whose Turnstile plugin mounts a real widget, id and all, into every normal
+ * topic page it serves at HTTP 200). The widget is minted by the same
+ * Turnstile runtime whether it renders inside an interstitial or inside a
+ * site's own UI, so its presence proves only "this page embeds Turnstile".
+ * On a real interstitial the widget always co-occurs with independent proof
+ * — the localized title, the orchestrate runtime script,
+ * `window._cf_chl_opt`, or the `#challenge-*` scaffolding, each sufficient
+ * above — so dropping the widget loses no real interstitial while every
+ * widget-embedding normal page (linux.do, login portals, contact forms)
+ * stops dying as WEB_FETCH_CHALLENGE after a wait that can never clear.
  */
 const CHALLENGE_HTML_MARKERS = [
-  'id="cf-chl-widget-',
   'window._cf_chl_opt',
   'id="challenge-form"',
   'id="challenge-running"',
@@ -295,7 +315,13 @@ export function classifyChallengeHtml(html: string): ChallengeVerdict {
  * check uses, so the two can never drift apart. Script evidence follows the
  * same rule as {@link classifyChallengeHtml}: only the challenge runtime
  * counts, and the instrumentation Cloudflare injects into normal pages of a
- * protected zone is ignored.
+ * protected zone is ignored. The Turnstile widget selector is likewise
+ * absent for the same reason {@link CHALLENGE_HTML_MARKERS} omits it: a
+ * widget embedded in a NORMAL page (linux.do's Turnstile plugin) would keep
+ * the probe reporting "still challenged" forever, so a challenge that HAD
+ * cleared could never be confirmed — the wait burned its whole budget and
+ * the fetch died as WEB_FETCH_CHALLENGE (last status 200) or the tool
+ * layer's timeout.
  */
 export const CHALLENGE_DOM_PROBE = `(() => {
   const re = new RegExp(${JSON.stringify(CHALLENGE_TITLE_RE.source)}, ${JSON.stringify(CHALLENGE_TITLE_RE.flags)})
@@ -303,7 +329,6 @@ export const CHALLENGE_DOM_PROBE = `(() => {
   const runtime = ${JSON.stringify(CHALLENGE_RUNTIME_SEGMENT)}
   if (re.test(document.title.trim())) return true
   if (document.querySelector('#challenge-form, #challenge-running, #challenge-stage, #challenge-error-text')) return true
-  if (document.querySelector('[id^="cf-chl-widget-"]')) return true
   for (const script of Array.from(document.scripts)) {
     const src = (script.getAttribute('src') || '').toLowerCase()
     if (src.includes(platform) && src.includes(runtime)) return true

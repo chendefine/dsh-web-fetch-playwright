@@ -86,6 +86,29 @@ and /cdn-cgi/challenge-platform/scripts/precursor/main.js.</p>
 <p>An escaped code sample is just prose too: &lt;script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"&gt;&lt;/script&gt;</p>
 </article></main></body></html>`
 
+/**
+ * A NORMAL page embedding a real Turnstile widget — captured (minus noise)
+ * from https://linux.do/t/topic/3143588 (HTTP 200, `server: cloudflare`,
+ * `cf-ray`, no `cf-mitigated`, the user's logged-in profile): a Discourse
+ * forum with the Turnstile plugin, whose app mounts a genuine Turnstile
+ * widget — container id `cf-chl-widget-…` and all — into every topic page.
+ * The old marker scan read the widget as interstitial proof, the bounded
+ * wait could never confirm a clear (the probe's `[id^="cf-chl-widget-"]`
+ * matched the real page forever), and two 15s attempts turned a 4s page
+ * load into a WEB_FETCH_CHALLENGE (last status 200) — which the tool
+ * layer's 30s budget then surfaced as a plain timeout. The widget alone
+ * must not classify; the real interstitial's independent signals must.
+ */
+const TURNSTILE_EMBED_PAGE = `<!doctype html><html><head><title>小太阳过冬靠谱嘛 - 搞七捻三 - LINUX DO</title>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api/origin/refresh.js"></script>
+</head><body>
+<div id="main-outlet" class="wrap"><main><article><h1>小太阳过冬靠谱嘛</h1>
+<p>Real topic body text rendered server-side, long enough for the article extractor.</p>
+<p>A second paragraph of real body text.</p></article></main></div>
+<div class="login-modal"><form><div class="cf-turnstile" data-sitekey="0x4AAAAAAA"><div id="cf-chl-widget-0001" class="cf-turnstile-wrap"><iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/if/ov2/av0/rcv/i1x0z/0x4AAAAAAA/dark/normal" title="Widget containing a Cloudflare security challenge"></div></div></form></div>
+<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js" defer></script>
+</body></html>`
+
 describe('classifyChallengeResponse', () => {
   it('the documented header alone marks a challenge, whatever the status', () => {
     expect(classifyChallengeResponse(403, { 'cf-mitigated': 'challenge', 'content-type': 'text/html' })).toBe('challenge')
@@ -140,7 +163,13 @@ describe('classifyChallengeHtml', () => {
     expect(classifyChallengeHtml('<html><head><title>x</title></head><body><script src="/cdn-cgi/challenge-platform/h/b/orchestrate/x"></script></body></html>')).toBe('challenge')
     expect(classifyChallengeHtml('<html><body><div id="challenge-form"></div></body></html>')).toBe('challenge')
     expect(classifyChallengeHtml('<html><body><div id="challenge-running"></div></body></html>')).toBe('challenge')
-    expect(classifyChallengeHtml('<html><body><iframe id="cf-chl-widget-0001" src="https://challenges.cloudflare.com"></iframe></body></html>')).toBe('challenge')
+    // The Turnstile widget is NOT interstitial proof on its own: the same id
+    // is minted for widgets sites embed into normal pages (linux.do badcase).
+    expect(classifyChallengeHtml('<html><body><iframe id="cf-chl-widget-0001" src="https://challenges.cloudflare.com"></iframe></body></html>')).toBe('none')
+    // ...but a widget next to any independent interstitial signal still detects.
+    expect(classifyChallengeHtml('<html><body><iframe id="cf-chl-widget-0001"></iframe><script src="/cdn-cgi/challenge-platform/h/b/orchestrate/x"></script></body></html>')).toBe('challenge')
+    expect(classifyChallengeHtml('<html><body><iframe id="cf-chl-widget-0001"></iframe><script>window._cf_chl_opt={}</script></body></html>')).toBe('challenge')
+    expect(classifyChallengeHtml('<html><body><div id="cf-chl-widget-0001"></div><div id="challenge-stage"></div></body></html>')).toBe('challenge')
     expect(classifyChallengeHtml('<html><body><script>window._cf_chl_opt={}</script></body></html>')).toBe('challenge')
     expect(classifyChallengeHtml('<html><head><title>Just a moment...</title></head><body></body></html>')).toBe('challenge')
     expect(classifyChallengeHtml('<html><body>Checking your browser before accessing example.com.</body></html>')).toBe('challenge')
@@ -247,6 +276,18 @@ describe('classifyChallengeHtml', () => {
     expect(classifyChallengeHtml('<!doctype html><html><head><title>What to do when you have been blocked by a firewall</title></head><body><main><article><h1>When you have been blocked</h1><p>So you have been blocked by your proxy — here is how to tell.</p></article></main></body></html>')).toBe('none')
   })
 
+  it('a normal page embedding a real Turnstile widget is not a challenge (linux.do badcase)', () => {
+    // HTTP 200 + server: cloudflare opens the suspicion gate on linux.do, so
+    // the content-level check runs on every topic page; the Turnstile plugin
+    // mounts a genuine cf-chl-widget into each of them. The widget alone must
+    // not classify, or the bounded wait can never confirm a clear and the
+    // fetch burns its whole budget dying as WEB_FETCH_CHALLENGE.
+    expect(classifyChallengeHtml(TURNSTILE_EMBED_PAGE)).toBe('none')
+    // The widget iframe src strings a challenge-platform path — still passive:
+    // only a top-level <script src> counts, and only on the runtime mount.
+    expect(classifyChallengeHtml('<html><body><div id="cf-chl-widget-1"><iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/if/ov2/x"></iframe></div></body></html>')).toBe('none')
+  })
+
   it('empty html is none', () => {
     expect(classifyChallengeHtml('')).toBe('none')
   })
@@ -281,9 +322,12 @@ describe('CHALLENGE_DOM_PROBE', () => {
     expect(runProbe(fakeDocument({ title: 'Just a moment...' }))).toBe(true)
     expect(runProbe(fakeDocument({ title: '请稍候…' }))).toBe(true)
     expect(runProbe(fakeDocument({ selectors: { '#challenge-form, #challenge-running, #challenge-stage, #challenge-error-text': true } }))).toBe(true)
-    expect(runProbe(fakeDocument({ selectors: { '[id^="cf-chl-widget-"]': true } }))).toBe(true)
     expect(runProbe(fakeDocument({ scriptSrcs: ['/cdn-cgi/challenge-platform/h/b/orchestrate/x'] }))).toBe(true)
     expect(runProbe(fakeDocument({ selectors: { '.footer .footer-inner .ray-id': true } }))).toBe(true)
+    // The Turnstile widget alone is NOT a marker (linux.do badcase): a widget
+    // embedded in a normal page would keep the probe "still challenged"
+    // forever, so a challenge that HAD cleared could never be confirmed.
+    expect(runProbe(fakeDocument({ title: 'Real article', selectors: { '[id^="cf-chl-widget-"]': true } }))).toBe(false)
   })
 
   it('reports false once the real document replaced the challenge (SPA clear)', () => {
