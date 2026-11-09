@@ -1,9 +1,13 @@
 /**
  * The denoise pipeline against representative fixture pages: a docs-style
  * article wrapped in nav/sidebar/footer/ads chrome, a table page, a
- * non-article page that must fall back to whole-document conversion, and
+ * non-article page that must fall back to whole-document conversion,
  * list-shaped pages (portal/catalog) where Readability's link-density
- * scoring picks a noise fragment and the coverage gate must distrust it.
+ * scoring picks a noise fragment and the coverage gate must distrust it,
+ * and article pages whose extraction rides in a post-article
+ * recommendation rail (the 163.com dy-article badcase) that only the
+ * trailing link-dense prune can strip — plus the no-false-positive control
+ * for that prune.
  */
 import { describe, expect, it } from 'vitest'
 import { htmlToMarkdown } from '../src/markdown.ts'
@@ -137,6 +141,77 @@ ${RICH_ARTICLE_PARAGRAPHS.map(p => `<p>${p}</p>`).join('\n')}
 <footer>footer noise</footer>
 </body></html>`
 
+/**
+ * A dy-article page (the 163.com article badcase shape, minimized from the
+ * live page): the article wrapper Readability scores as the winner carries
+ * not just the body but the platform disclaimer and a recommendation rail
+ * of image/title/author/date cards. The rail's per-card link density
+ * (title-only links over title+author+date text, ~0.42–0.48) sits just
+ * under Readability's own "mostly links" removal bar (0.5), so every card
+ * survives its cleaning pass — measured on the live page the rail holds 84
+ * linked characters inside 183 (0.46) and dominated 60% of the returned
+ * markdown. Class vocabulary cannot rescue this later either: the extracted
+ * rail is bare-div markup, and `recommend` is absent from Readability's
+ * unlikely/negative regexes regardless.
+ */
+const REC_CARDS = [
+  ['轰动NBA！你好湖人！曝浓眉哥或施压交易离队', '篮球实战宝典', '2026-11-08 17:34:43'],
+  ['黄仁勋情人所属的Megaspeed公司什么背景', '修明札记', '2026-11-09 15:52:29'],
+  ['巅峰下滑！现在的约基奇值5年37亿吗', '篮球实录', '2026-11-09 17:11:58'],
+  ['就在今天詹姆斯刷新了3个NBA历史纪录', '篮球大视野', '2026-11-09 08:01:25'],
+] as const
+const REC_CARD_HTML = REC_CARDS.map(([title, source, time], index) => `<div class="post_recommend_new"><p><a href="/dy/article/B${String(index + 1)}" title="${title}" class="post_recommend_img"><img src="/thumb${String(index + 1)}.jpg" width="140" height="88" alt="${title}"></a></p><h3><a href="/dy/article/B${String(index + 1)}">${title}</a></h3><p><span class="post_recommend_source">${source}</span></p><p>${time}</p></div>`).join('')
+const DY_ARTICLE_RECOMMEND_RAIL = `<div class="post_recommends" data-event="click"><div class="post_recommends_titles"><p>相关推荐</p><p>热点推荐</p></div><div class="post_recommends_ulist">${REC_CARD_HTML}</div></div>`
+const DY_ARTICLE_PAGE = `<!doctype html>
+<html><head><title>广州最高医疗建筑来了</title></head><body>
+<nav>新闻 体育 财经 科技 娱乐 汽车 房产 教育 时尚 手机 数码</nav>
+<div class="post_main">
+<div class="post_title"><h1>130米！广州最高医疗建筑来了！预计2027年投用</h1></div>
+<div class="post_info">2026-11-09 15:38:15　来源: 21世纪经济报道 广东</div>
+<div class="post_content" id="contentBody"><div class="post_body" id="content">
+<p>广州最高的超高层医疗建筑，中山大学附属第一医院临床研究大楼，近日举行封顶仪式。该项目总建筑面积达5.4万平方米，建筑总高度130米，分为地上29层、地下4层，是目前广州最高的超高层医疗建筑。</p>
+<p>该大楼坐落于越秀区中山二路58号院本部，通过拆除后勤楼、行政楼、旧饭堂等老旧楼栋盘活原址土地。项目总占地面积5600平方米，总建筑面积达5.4万平方米，建筑总高度130米，分为地上29层、地下4层，是目前广州最高的超高层医疗建筑，预计2027年年底全面竣工投用。项目建成后将成为集临床研究、成果转化、学术交流于一体的综合性研究平台，为区域医疗资源配置提供新的支撑。</p>
+<div class="post_statement"><p>特别声明：以上内容(如有图片或视频亦包括在内)为自媒体平台“网易号”用户上传并发布，本平台仅提供信息存储服务。</p><p>Notice: The content above (including the pictures or videos if any) is uploaded and posted by a user of NetEase Hao, which is a social media platform providing information storage services.</p></div>
+${DY_ARTICLE_RECOMMEND_RAIL}
+</div></div>
+</div>
+<ul class="post_recommends_list">${Array.from({ length: 40 }, (_, i) => `<li class="post_recommend"><a href="/r/${String(i)}">第${String(i)}条推荐阅读标题某地发布最新政策引发广泛关注</a></li>`).join('')}</ul>
+<footer>关于网易 · 联系我们 · 客户端下载 · 意见反馈</footer>
+</body></html>`
+
+/**
+ * A sparse auto-trusted page (under the gate's 1,000-character body floor)
+ * whose extraction is dominated by the same rail: the trailing prune's
+ * dominant-share guard (a block holding over 60% of the article is the
+ * scorer's mistake to handle, not the prune's) must keep it untouched —
+ * the prune only strips APPENDED widgets, it never guts an extraction.
+ */
+const SPARSE_ARTICLE_WITH_RAIL = `<!doctype html>
+<html><head><title>短讯</title></head><body>
+<main><article>
+<h1>一句话短讯</h1>
+<p>这是一条足够短的正 文，只包含一个段落，用于验证稀疏页面上尾部推荐栏同样会被修剪而不是原样返回。补充一点文字让它像真的短文。</p>
+${DY_ARTICLE_RECOMMEND_RAIL}
+</article></main>
+</body></html>`
+
+/**
+ * The no-false-positive control for the trailing prune: a text-rich article
+ * whose closing paragraph carries three inline links. Its link density
+ * (~0.23) is far under the link-farm bar, and no earlier section is
+ * link-dense, so the prune must leave the article byte-intact.
+ */
+const RICH_ARTICLE_CLOSING_LINKS = `<!doctype html>
+<html><head><title>Notes on pools</title></head><body>
+<nav>nav noise</nav>
+<main><article>
+<h1>Notes on pools</h1>
+${RICH_ARTICLE_PARAGRAPHS.map(p => `<p>${p}</p>`).join('\n')}
+<p>For more on structured concurrency, see the <a href="/a">deadline guide</a>, the <a href="/b">lease design note</a>, and the <a href="/c">timeout taxonomy</a> written by the pool maintainers, each expanding the ideas above with worked diagrams.</p>
+</article></main>
+<footer>footer noise</footer>
+</body></html>`
+
 describe('htmlToMarkdown', () => {
   it('extracts the article and drops nav/sidebar/footer/ad chrome', () => {
     const { markdown, mode } = htmlToMarkdown(ARTICLE_PAGE, 'https://example.com/guide')
@@ -251,6 +326,51 @@ describe('htmlToMarkdown', () => {
     expect(markdown).not.toContain('nav noise')
     expect(markdown).not.toContain('footer noise')
     expect(markdown).not.toContain('LIMITED TIME')
+  })
+
+  it('prunes the post-article recommendation rail the scorer cannot name', () => {
+    const { markdown, mode } = htmlToMarkdown(DY_ARTICLE_PAGE, 'https://www.163.com/dy/article/LBA8924U05199NPP.html')
+    // Readability's winner wrapper carries the rail (verified: every card's
+    // ~0.42 density clears its own cleaning), so the extraction is accepted
+    // in article mode — the trailing link-dense prune then strips the rail.
+    expect(mode).toBe('article')
+    // The article and the platform disclaimer both survive.
+    expect(markdown).toContain('封顶仪式')
+    expect(markdown).toContain('中山大学附属第一医院')
+    expect(markdown).toContain('特别声明')
+    // The rail is gone wholesale: headers, card titles, thumbnails,
+    // authors, and timestamps — plus the out-of-extraction 40-link list.
+    expect(markdown).not.toContain('相关推荐')
+    expect(markdown).not.toContain('热点推荐')
+    expect(markdown).not.toContain('浓眉哥')
+    expect(markdown).not.toContain('篮球实战宝典')
+    expect(markdown).not.toContain('2026-11-08 17:34:43')
+    expect(markdown).not.toContain('/thumb1.jpg')
+    expect(markdown).not.toContain('条推荐阅读标题')
+  })
+
+  it('keeps a rail that dominates a sparse extraction (dominant-share guard)', () => {
+    const { markdown, mode } = htmlToMarkdown(SPARSE_ARTICLE_WITH_RAIL, 'https://example.com/brief')
+    // Under the gate's body-text floor the extraction is trusted however
+    // short — but the rail here holds over 60% of the article's text, and
+    // the prune never guts an extraction: Readability's pick is returned
+    // as delivered rather than second-guessed into a stub.
+    expect(mode).toBe('article')
+    expect(markdown).toContain('一句话短讯')
+    expect(markdown).toContain('相关推荐')
+  })
+
+  it('keeps a link-bearing closing paragraph that is not a link farm', () => {
+    const { markdown, mode } = htmlToMarkdown(RICH_ARTICLE_CLOSING_LINKS, 'https://example.com/pool-notes')
+    // Three inline citation links inside a ~190-character paragraph measure
+    // ~0.23 link density — nowhere near the link-farm bar; nothing earlier
+    // in the article is link-dense either, so the prune must be a no-op.
+    expect(mode).toBe('article')
+    // Readability resolves the relative hrefs against the page URL.
+    expect(markdown).toContain('[deadline guide](https://example.com/a)')
+    expect(markdown).toContain('[lease design note](https://example.com/b)')
+    expect(markdown).toContain('[timeout taxonomy](https://example.com/c)')
+    expect(markdown).toContain('worked diagrams')
   })
 
   it('survives pathological input without throwing', () => {

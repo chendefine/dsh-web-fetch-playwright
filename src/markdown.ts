@@ -8,11 +8,14 @@
  * footers, and ad chrome by scoring link density and text mass) — its result
  * must then pass a coverage gate that distrusts tiny or sliver-thin
  * extractions, which on list-shaped pages (portals, catalogs) is exactly
- * what the link-density penalty leaves behind; DOMPurify sanitizes whatever
- * HTML remains and forbids the layout tags noise lives in; Turndown with
- * the GFM plugin converts to markdown using the same style options and
- * span-safe table rules as the shipped `dsh-tool-web` renderer, so output
- * is consistent with what `web_fetch` produces elsewhere.
+ * what the link-density penalty leaves behind; an accepted extraction is
+ * then pruned of trailing link-dense sections — the post-article
+ * recommendation rails and share bars the scorer's vocabularies cannot name
+ * (they arrive as bare divs with no class to match); DOMPurify sanitizes
+ * whatever HTML remains and forbids the layout tags noise lives in;
+ * Turndown with the GFM plugin converts to markdown using the same style
+ * options and span-safe table rules as the shipped `dsh-tool-web` renderer,
+ * so output is consistent with what `web_fetch` produces elsewhere.
  *
  * Synchronous for its callers and unit-tested against fixture pages: jsdom
  * itself is loaded lazily on the first call — and, inside a dsh profile, only
@@ -281,6 +284,245 @@ export interface DenoiseResult {
 }
 
 /**
+ * Count non-whitespace characters under `root` that sit inside an anchor,
+ * skipping the same noise subtrees {@link visibleTextLength} skips so the
+ * numerator and denominator of a link-density ratio stay comparable.
+ *
+ * @param root - the subtree to measure; `null` counts as nothing.
+ * @returns the number of non-whitespace characters inside `<a>` descendants.
+ */
+function linkTextLength(root: Node | null): number {
+  if (root === null) return 0
+  let length = 0
+  const visit = (node: Node, insideAnchor: boolean): void => {
+    if (node.nodeType === 3) {
+      if (insideAnchor) length += (node.nodeValue ?? '').replace(/\s+/g, '').length
+      return
+    }
+    if (node.nodeType !== 1 || NOISE_SUBTREE_TAGS.has(node.nodeName.toLowerCase())) return
+    const anchor = insideAnchor || node.nodeName.toLowerCase() === 'a'
+    for (let child = node.firstChild; child !== null; child = child.nextSibling) visit(child, anchor)
+  }
+  visit(root, false)
+  return length
+}
+
+/**
+ * Minimum non-whitespace characters a block must carry before its link
+ * density is even evaluated. Blocks below this are spacers, empty wrappers,
+ * or one-line sign-offs — too small to be worth a removal decision, so the
+ * trailing walk skips past them instead of stopping at them.
+ */
+const TRAILING_MIN_TEXT_CHARS = 40
+
+/**
+ * Link-density share above which a trailing block reads as a link farm:
+ * recommendation feeds, related-article rails, tag clouds, share bars.
+ * Measured on the 163.com dy-article badcase the section's pick carried 84
+ * linked characters inside 183 total (0.46) — recommendation cards dilute
+ * their density with author/date lines, so a 0.5 bar would miss them by
+ * construction; an honest closing paragraph with a citation or two measures
+ * 0.1–0.3, leaving 0.4 in the empty band between.
+ */
+const TRAILING_LINK_DENSITY = 0.4
+
+/**
+ * A trailing block qualifies as a link farm only when it is link-heavy in
+ * aggregate too: at least {@link TRAILING_LINK_COUNT} anchors or
+ * {@link TRAILING_LINK_TEXT_CHARS} linked characters. Density alone would
+ * let a single long linked sentence (an inline citation) drag a legitimate
+ * paragraph under the knife.
+ */
+const TRAILING_LINK_COUNT = 3
+const TRAILING_LINK_TEXT_CHARS = 60
+
+/**
+ * A trailing block may never hold more than this share of the whole
+ * article's text. The prune targets *appended* widgets; a block that IS most
+ * of the extraction says the scorer picked the widget, which is the coverage
+ * gate's failure mode to handle, not this walk's.
+ */
+const TRAILING_MAX_ARTICLE_SHARE = 0.6
+
+/**
+ * A trailing run may never hold more than this share of its container's
+ * text — the aggregate form of the guard above, and the one that keeps
+ * list-shaped extractions whole. A recommendation rail is a *minority*
+ * appended to real content (the 163 rail is 44% of its container); a
+ * portal or feed whose extraction IS a list of link rows (measured on a
+ * Hacker News homepage capture: ~91 trailing rows, every one individually
+ * link-dense at 0.69–0.94) has a tail run holding ~97% of the container —
+ * there the tail IS the content, the walk declines wholesale, and only a
+ * run that is a minority of its container is removed.
+ */
+const TRAILING_MAX_RUN_SHARE = 0.6
+
+/**
+ * Link-density band within which a run and the block the walk stopped at
+ * read as the same material. When the content immediately before the run
+ * is itself as link-dense as the run — measured on a Hacker News homepage
+ * capture, the rows after the run's cut measure 0.94 against the run's
+ * 0.91 — the container is a *uniform list* (feed rows, portal headlines)
+ * and the tail is that list's own content, not a widget appended after it;
+ * a widget hangs after genuinely different material (the 163 rail's 0.44
+ * follows body text at 0.00). Only a run denser than what precedes it is
+ * removed.
+ */
+const TRAILING_UNIFORM_DENSITY_BAND = 0.25
+
+/**
+ * Prune trailing link-dense sections from an accepted Readability
+ * extraction — the post-article widget class the scorer itself cannot be
+ * taught to drop.
+ *
+ * Why this exists (badcase: `https://www.163.com/dy/article/…`): Chinese
+ * portal article pages append a recommendation feed inside the very wrapper
+ * Readability scores as the article (`#content` holds the body, the
+ * platform disclaimer, then a rail of image/title/author/date cards). Every
+ * existing noise layer misses it: Readability's `unlikelyCandidates` /
+ * `negative` vocabularies know `related` but not `recommend` (nor the
+ * pinyin families `tuijian`/`xiangguan`), and its own cleaning pass draws
+ * the "mostly links" line at per-block density 0.5 — these cards measure
+ * 0.42–0.48 (the title links over title+author+date text), so every card
+ * clears it; in the extracted HTML the rail is a *bare* div — class and id
+ * are gone — so no class-based rule can ever see it again; DOMPurify's
+ * FORBID_TAGS works on tags, and the rail is plain div/p/h3/a; and the
+ * coverage gate cannot help because the noise rides *inside* the
+ * extraction it measures (the badcase passed at 0.103 — the rail's text
+ * was in both numerator and denominator). Modern sites with CSS-module
+ * class names (`css-1b3x7r`) present the same shape with no vocabulary to
+ * match at all, so the only signal that survives all of this is
+ * structural: a *trailing* run of blocks whose text is mostly links.
+ *
+ * For every container in the extraction the walk gathers the maximal
+ * trailing run of qualifying children — link-farm blocks per the constants
+ * above, plus sub-threshold spacers (empty wrapper divs) — and removes the
+ * run only when BOTH structural guards say "appended widget, not content":
+ * the run is a minority of the container's text
+ * ({@link TRAILING_MAX_RUN_SHARE}), and the run is clearly denser than the
+ * block the walk stopped at ({@link TRAILING_UNIFORM_DENSITY_BAND}). The
+ * guards split the two worlds the per-block view cannot: a rail is
+ * one-or-few appended blocks after genuinely different material (the 163
+ * rail's 0.44 density follows body text at 0.00), while a link-list
+ * extraction — feed rows, portal headlines — is *uniform*: its rows before
+ * any cut measure the same density as the rows after it (0.91 vs 0.94 on
+ * the Hacker News capture), so no tail of it can be mistaken for a widget.
+ *
+ * Deliberately NOT applied to the whole-document fallback: that path
+ * exists for list-shaped pages where the links *are* the content (the
+ * 163.com homepage fix), and pruning link-dense regions there would
+ * re-introduce exactly the recall loss the coverage gate exists to
+ * prevent.
+ *
+ * @param container - parsed `article.content`; mutated in place.
+ */
+function pruneTrailingLinkDenseSections(container: Element): void {
+  const articleText = visibleTextLength(container)
+  if (articleText === 0) return
+  // The container itself leads the walk — Readability usually wraps its
+  // content in div#readability-page-1, but an unwrapped extraction's
+  // top-level blocks are the container's direct children and must be
+  // examined too. querySelectorAll snapshots before any removal; entries
+  // inside an already-removed subtree are skipped by the contains() check,
+  // and parents are visited before children, so a deeper run inside a block
+  // an outer run is taking never competes with it.
+  for (const element of [container, ...Array.from(container.querySelectorAll('*'))]) {
+    if (!container.contains(element) && element !== container) continue
+    removeTrailingLinkDenseRun(element, articleText)
+  }
+}
+
+/**
+ * Remove one container's maximal trailing run of link-dense children when
+ * that run is a minority of the container's text AND clearly different
+ * material from the content that precedes it.
+ *
+ * @param parent - the container whose element children are examined from
+ * the end.
+ * @param articleText - the whole article's text, for the per-block share
+ * guard.
+ */
+function removeTrailingLinkDenseRun(parent: Element, articleText: number): void {
+  const children = Array.from(parent.children)
+  if (children.length === 0) return
+  const containerText = visibleTextLength(parent)
+  if (containerText === 0) return
+  const run: Element[] = []
+  let runText = 0
+  let runLinked = 0
+  let stopIndex = -1
+  for (let index = children.length - 1; index >= 0; index--) {
+    const child = children[index]
+    if (child === undefined) break
+    const text = visibleTextLength(child)
+    // Too small to judge (spacer, empty wrapper): it belongs to the run
+    // but cannot extend it — keep walking toward earlier siblings.
+    if (text < TRAILING_MIN_TEXT_CHARS) {
+      run.push(child)
+      continue
+    }
+    const linked = linkTextLength(child)
+    const linkCount = child.querySelectorAll('a').length
+    if (
+      linked / text >= TRAILING_LINK_DENSITY
+      && (linkCount >= TRAILING_LINK_COUNT || linked >= TRAILING_LINK_TEXT_CHARS)
+      && text <= TRAILING_MAX_ARTICLE_SHARE * articleText
+    ) {
+      run.push(child)
+      runText += text
+      runLinked += linked
+      continue
+    }
+    // Real content that is not a link farm: everything before it is
+    // anchored by actual article flow — stop and compare against it.
+    stopIndex = index
+    break
+  }
+  if (runText === 0 || stopIndex === -1) {
+    // Nothing to remove — or the run reached the top of the container (no
+    // preceding content to differ from): a tail that IS the whole
+    // container is list content, never a widget.
+    return
+  }
+  // The tail is the same material as what precedes it (a uniform list's
+  // rows): decline wholesale.
+  const stopChild = children[stopIndex]
+  if (stopChild === undefined) return
+  const stopDensity = linkTextLength(stopChild) / Math.max(1, visibleTextLength(stopChild))
+  if (Math.abs(runLinked / runText - stopDensity) <= TRAILING_UNIFORM_DENSITY_BAND) return
+  // The tail holds most of the container (a link-list page's rows): decline
+  // wholesale.
+  if (runText > TRAILING_MAX_RUN_SHARE * containerText) return
+  for (const child of run) child.remove()
+}
+
+/**
+ * Run {@link pruneTrailingLinkDenseSections} over one extraction with a
+ * misfire guard: a prune that takes a healthy article below the gate's
+ * absolute floor ({@link GATE_MIN_ARTICLE_TEXT_CHARS}) or empties it
+ * entirely says the walk misread the page, and Readability's original pick
+ * is returned untouched. A *sparse* article (under the floor before the
+ * prune, auto-trusted by the gate) keeps its pruned form — its trailing
+ * links were noise all the same.
+ *
+ * @param articleHtml - the `article.content` HTML Readability produced.
+ * @param document - the live document, for parsing the fragment.
+ * @returns the pruned article HTML, or the original on a misfire.
+ */
+function prunedArticleContent(articleHtml: string, document: Document): string {
+  const container = document.createElement('div')
+  container.innerHTML = articleHtml
+  const before = visibleTextLength(container)
+  if (before === 0) return articleHtml
+  pruneTrailingLinkDenseSections(container)
+  const after = visibleTextLength(container)
+  if (after === 0 || (before >= GATE_MIN_ARTICLE_TEXT_CHARS && after < GATE_MIN_ARTICLE_TEXT_CHARS)) {
+    return articleHtml
+  }
+  return container.innerHTML
+}
+
+/**
  * Convert one rendered HTML document to denoised markdown.
  *
  * Readability failure (non-article pages, or extractions the coverage gate
@@ -323,7 +565,11 @@ export function htmlToMarkdown(html: string, url: string): DenoiseResult {
       article !== null && typeof article.content === 'string' && article.content !== ''
       && articleCoversPage(article.content, document)
     ) {
-      source = article.content
+      // Gate first, prune second, and in that order on purpose: the gate
+      // must judge Readability's pick as delivered (the widget rides inside
+      // it), and the prune then strips the post-article link farms the
+      // scorer could not be taught — see pruneTrailingLinkDenseSections.
+      source = prunedArticleContent(article.content, document)
       title = article.title ?? undefined
     }
   } catch {
