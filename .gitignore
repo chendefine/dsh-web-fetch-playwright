@@ -3,3 +3,4 @@ lib/
 *.tsbuildinfo
 .pnpm-store/
 test-results/
+benchmark/

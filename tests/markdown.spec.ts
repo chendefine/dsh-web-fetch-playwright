@@ -1,7 +1,9 @@
 /**
  * The denoise pipeline against representative fixture pages: a docs-style
- * article wrapped in nav/sidebar/footer/ads chrome, a table page, and a
- * non-article page that must fall back to whole-document conversion.
+ * article wrapped in nav/sidebar/footer/ads chrome, a table page, a
+ * non-article page that must fall back to whole-document conversion, and
+ * list-shaped pages (portal/catalog) where Readability's link-density
+ * scoring picks a noise fragment and the coverage gate must distrust it.
  */
 import { describe, expect, it } from 'vitest'
 import { htmlToMarkdown } from '../src/markdown.ts'
@@ -55,7 +57,6 @@ const NON_ARTICLE_PAGE = `<!doctype html>
 
 /** A build-tool-inlined data URI payload (4096 base64 chars = 3072 bytes). */
 const DATA_URI_3KB = `data:image/png;base64,${'A'.repeat(4096)}`
-
 /** A docs article whose build tool inlined its screenshots as data URIs. */
 const INLINE_IMAGE_PAGE = `<!doctype html>
 <html><head><title>Inline images</title></head><body>
@@ -67,6 +68,72 @@ const INLINE_IMAGE_PAGE = `<!doctype html>
 <p><img alt="big screenshot" title="The screenshot" src="${DATA_URI_3KB}"></p>
 <p><img alt="remote photo" src="https://example.com/photo.png"></p>
 </article></main>
+<footer>footer noise</footer>
+</body></html>`
+
+/**
+ * A portal homepage (the 163.com badcase shape, minimized): every column is
+ * short link-dense list items the scorer refuses to score (under 25 chars
+ * each) with list-tag penalties on top, so the only candidate Readability
+ * can credit is the low-link-density licensing block in the corner — 95
+ * characters that used to become the whole fetch result.
+ */
+const PORTAL_HEADLINES = Array.from(
+  { length: 70 },
+  (_, i) => `<li><a href="/n/${i + 1}">第${i + 1}条中超冠军属于大连英博队</a></li>`,
+)
+const PORTAL_PAGE = `<!doctype html>
+<html><head><title>门户首页</title></head><body>
+<nav>新闻 体育 财经 科技 娱乐 汽车</nav>
+<div class="wrap">
+<div class="col"><h2>新闻</h2><ul>${PORTAL_HEADLINES.slice(0, 35).join('')}</ul></div>
+<div class="col"><h2>体育</h2><ul>${PORTAL_HEADLINES.slice(35).join('')}</ul></div>
+</div>
+<div class="subfoot_zbdw"><p>工业和信息化部备案管理系统网站 粤B2-20090191-18</p><p>主办单位：广州某计算机系统有限公司</p><p>Operated by Guangzhou Example Computer System Co., Ltd.</p></div>
+</body></html>`
+
+/**
+ * A channel page with an editorial preamble (the sina.com.cn badcase shape):
+ * the 480-character link-free block is long enough to clear the absolute
+ * floor but covers under a tenth of the 5.2k visible characters, so the
+ * coverage ratio — not the length check — must reject it.
+ */
+const CHANNEL_EDITORIAL = Array.from(
+  { length: 3 },
+  () => '<p>这是一段没有任何链接的编辑导语文字，用来模拟频道页顶部的编辑荐读区域。它必须足够长以便 Readability 把它当作最佳候选，同时相对整页只占很小的比例，从而触发覆盖率判定而不是绝对字数判定。这段文字还需要超过两百五十个字符的长度，因此在这里继续补充关于覆盖率门设计动机的说明文字，确保长度条件被稳定满足而不依赖边界值。</p>',
+)
+const CHANNEL_ITEMS = Array.from(
+  { length: 160 },
+  (_, i) => `<li><a href="/c/${i + 1}">频道列表第${i + 1}条标题某地发布最新政策引发广泛关注与讨论${i + 1}</a></li>`,
+)
+const CHANNEL_PAGE = `<!doctype html>
+<html><head><title>频道页</title></head><body>
+<nav>频道导航词</nav>
+<div class="editorial">${CHANNEL_EDITORIAL.join('')}</div>
+<div class="list"><ul>${CHANNEL_ITEMS.join('')}</ul></div>
+</body></html>`
+
+/**
+ * A text-rich article page (the no-false-demotion control): well over a
+ * thousand visible characters, the article covering the vast majority of
+ * them, so the coverage gate must accept the extraction untouched.
+ */
+const RICH_ARTICLE_PARAGRAPHS = [
+  'Structured concurrency gives every fetch a deadline that propagates through the whole call tree, so a slow subrequest cannot quietly outlive the navigation that spawned it.',
+  'The pool hands out leases rather than bare browsers: a lease owns one tab inside a shared context, and releasing it closes exactly that tab even when the surrounding context stays warm for the next caller.',
+  'Timeouts are budgets, not alarms. Each stage of a fetch reserves a slice of the total deadline, and a stage that runs long shrinks the slices that follow instead of silently borrowing from the caller.',
+  'Recovery paths matter as much as happy paths: a navigation that fails because the browser declined to render the response is turned back into a result carrying the tracked status code.',
+  'Concurrency limits price the expensive resource, not the request: local slots are whole browsers, remote slots are tabs in a browser that already exists, and queue wait is bounded so callers fail fast.',
+  'Every layer is observable: the tracker records the last main-frame response, the pool records lease lifetimes, and the denoise pipeline reports which extraction path produced the markdown.',
+]
+const RICH_ARTICLE_PAGE = `<!doctype html>
+<html><head><title>Browsers as a fetch backend</title></head><body>
+<nav>nav noise</nav>
+<main><article>
+<h1>Browsers as a fetch backend</h1>
+${RICH_ARTICLE_PARAGRAPHS.map(p => `<p>${p}</p>`).join('\n')}
+</article></main>
+<div class="ad banner-ad">LIMITED TIME — upgrade today and save fifty percent on the annual plan, offer ends Sunday</div>
 <footer>footer noise</footer>
 </body></html>`
 
@@ -146,6 +213,44 @@ describe('htmlToMarkdown', () => {
     expect(mode).toBe('document')
     expect(markdown).toContain('![inline diagram](data:image/png;base64,...3.0KB)')
     expect(markdown).not.toContain('A'.repeat(64))
+  })
+
+  it('distrusts a noise-fragment extraction of a portal page and keeps the lists', () => {
+    const { markdown, mode } = htmlToMarkdown(PORTAL_PAGE, 'https://example.com/')
+    // Readability's pick on this shape is the 95-character licensing block
+    // (verified against the 163.com homepage it was minimized from); the
+    // coverage gate must reject it so the sanitized whole document — with
+    // every column of headlines — is returned instead.
+    expect(mode).toBe('document')
+    expect(markdown).toContain('第1条中超冠军属于大连英博队')
+    expect(markdown).toContain('第35条中超冠军属于大连英博队')
+    expect(markdown).toContain('第70条中超冠军属于大连英博队')
+    // The licensing text is still page content; it is kept, just no longer
+    // allowed to be the ONLY thing kept.
+    expect(markdown).toContain('粤B2-20090191-18')
+  })
+
+  it('distrusts an editorial fragment that covers a sliver of a list page', () => {
+    const { markdown, mode } = htmlToMarkdown(CHANNEL_PAGE, 'https://example.com/')
+    // The 480-character link-free preamble clears the 250-character floor
+    // but covers 480/5229 ≈ 9% of the page; only the coverage ratio can
+    // catch this shape (the sina.com.cn badcase).
+    expect(mode).toBe('document')
+    expect(markdown).toContain('编辑导语文字')
+    expect(markdown).toContain('频道列表第1条标题某地发布最新政策引发广泛关注与讨论1')
+    expect(markdown).toContain('频道列表第160条标题某地发布最新政策引发广泛关注与讨论160')
+  })
+
+  it('still trusts the article on text-rich article pages', () => {
+    const { markdown, mode } = htmlToMarkdown(RICH_ARTICLE_PAGE, 'https://example.com/notes')
+    // ~1.6k visible characters with the article covering the overwhelming
+    // majority: the gate must stay out of the article path's way.
+    expect(mode).toBe('article')
+    expect(markdown).toContain('Structured concurrency gives every fetch a deadline')
+    expect(markdown).toContain('which extraction path produced the markdown')
+    expect(markdown).not.toContain('nav noise')
+    expect(markdown).not.toContain('footer noise')
+    expect(markdown).not.toContain('LIMITED TIME')
   })
 
   it('survives pathological input without throwing', () => {

@@ -9,7 +9,7 @@
 ## 特性
 
 - **真实浏览器渲染** —— 以用户视角加载页面，SPA 客户端渲染内容也能抓到，而非只有原始 HTML。
-- **降噪管线** —— Mozilla Readability 提取正文，DOMPurify 移除布局/噪音标签（导航、侧边栏、页脚、广告、表单），Turndown + GFM 插件按与内置 `tool-web` 渲染器一致的风格转成 Markdown。内联 `data:` 图片（Docusaurus 等构建工具会把截图以 base64 内嵌进 HTML）会被替换为带大小的占位符，如 `![alt](data:image/png;base64,...8.9KB)`，避免 base64 字符流刷屏。
+- **降噪管线** —— Mozilla Readability 提取正文，DOMPurify 移除布局/噪音标签（导航、侧边栏、页脚、广告、表单），Turndown + GFM 插件按与内置 `tool-web` 渲染器一致的风格转成 Markdown。内联 `data:` 图片（Docusaurus 等构建工具会把截图以 base64 内嵌进 HTML）会被替换为带大小的占位符，如 `![alt](data:image/png;base64,...8.9KB)`，避免 base64 字符流刷屏。对列表型页面（门户首页、商品目录——正文本身就是链接），Readability 的链接密度打分会误选出噪声碎片（实测 163.com 首页：96 字符的页脚备案块胜出，320 条新闻标题得分趋零），因此抽取结果需通过**覆盖率置信门**——不足 250 字符、或占页面可见文本不足 10% 即不予采信，转而回退到整页消毒转换，此类页面上可基本完整保留列表内容。
 - **两种后端** —— 本地启动 Playwright 浏览器，或通过 DevTools 协议（CDP）驱动一个已在运行的浏览器。
 - **浏览器解析** —— 配置路径 → `$PATH` 上的 `playwright` CLI → 插件自带的 `playwright-core`；CDP 模式完全不需要本地浏览器。
 - **共享 profile 或复用隔离上下文（CDP）** —— 每次抓取通过共享 CDP 连接创建自己的标签页，用完即关。默认复用浏览器已有默认 context 与登录态（`connectOverCDP` → `browser.contexts()[0]`，类似关闭隔离后的 CLI CDP attach，而不是 `playwright-cli open`）。会话隔离按需创建独立的内存 context，仅在同一会话的抓取或其他标签页仍在使用时复用；全局隔离则在同一插件实例内跨会话保留并复用一个固定的隔离 context。本地后端仍每次抓取启动并关闭浏览器。
@@ -30,7 +30,7 @@ web_fetch (tool-web)
         ├─ local: 解析（路径 → $PATH → 内置 playwright-core）→ chromium.launch
         ├─ cdp:   connectOverCDP(endpoint)
         ├─ page.goto → 等待稳定（networkidle，尽力而为）→ 在活 DOM 中剥离脚本子树 → page.content()
-        ├─ 降噪：jsdom → 内联 data: 图片改占位符 → Readability → DOMPurify → Turndown(GFM)
+        ├─ 降噪：jsdom → 内联 data: 图片改占位符 → Readability → 覆盖率置信门 → DOMPurify → Turndown(GFM)
         └─ Markdown（关闭降噪时返回原始 HTML）
 ```
 

@@ -9,7 +9,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plug
 ## Features
 
 - **Real browser rendering** — loads the page the way a user sees it, so client-side rendered (SPA) content is captured, not just the raw HTML.
-- **Denoise pipeline** — Mozilla Readability extracts the article, DOMPurify removes layout/noise tags (nav, sidebar, footer, ads, forms), and Turndown with the GFM plugin converts to Markdown with the same style options as the shipped `tool-web` renderer. Inline `data:` images (build tools like Docusaurus embed screenshots as base64) are elided to size placeholders such as `![alt](data:image/png;base64,...8.9KB)` so they cannot flood the body.
+- **Denoise pipeline** — Mozilla Readability extracts the article, DOMPurify removes layout/noise tags (nav, sidebar, footer, ads, forms), and Turndown with the GFM plugin converts to Markdown with the same style options as the shipped `tool-web` renderer. Inline `data:` images (build tools like Docusaurus embed screenshots as base64) are elided to size placeholders such as `![alt](data:image/png;base64,...8.9KB)` so they cannot flood the body. On list-shaped pages (portals, catalogs) where the content *is* the links, Readability's link-density scoring picks a noise fragment — a coverage gate therefore distrusts an extraction under 250 characters or covering under 10% of the page's visible text (measured on the 163.com homepage: 96 characters of footer licensing won while 320 headlines scored near zero), and the pipeline falls back to the sanitized whole document, which on such pages keeps effectively all list content.
 - **Two backends** — launch a local Playwright browser, or drive an already-running browser over its DevTools Protocol (CDP) endpoint.
 - **Browser resolution** — a configured path, a `playwright` CLI on `$PATH`, or the bundled `playwright-core`; CDP needs no local browser at all.
 - **Shared profile or reusable isolation (CDP)** — each fetch opens and closes its own tab; session isolation uses a dedicated CDP connection per DSH session, while global/profile modes share one connection. By default it uses the browser's existing default context and logins (`connectOverCDP` → `browser.contexts()[0]`, like CLI CDP attach with isolation disabled, not `playwright-cli open`). Session isolation creates an in-memory context on demand and shares it only while same-session fetches or other tabs keep it in use; global isolation retains one fixed isolated context across all sessions within the same plugin instance. Local launches still close their browser per fetch.
@@ -30,7 +30,7 @@ web_fetch (tool-web)
         ├─ local: resolve (path → $PATH → bundled playwright-core) → chromium.launch
         ├─ cdp:   connectOverCDP(endpoint)
         ├─ page.goto → settle (networkidle, best-effort) → strip scripting subtrees in the live DOM → page.content()
-        ├─ denoise: jsdom → elide data-URI images → Readability → DOMPurify → Turndown(GFM)
+        ├─ denoise: jsdom → elide data-URI images → Readability → coverage gate → DOMPurify → Turndown(GFM)
         └─ Markdown (or raw HTML when denoise is off)
 ```
 
