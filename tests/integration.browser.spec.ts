@@ -57,6 +57,44 @@ const GUARDED_ARTICLE_BODY = `<main><article><h1>Real protected content</h1>
 </article></main>`
 
 /**
+ * The `#__NEXT_DATA__` runtime-rewrite badcase (techcommunity.microsoft.com
+ * shape), end to end in a real browser: the server serves a wire-correct
+ * page whose data script is properly closed, then the page's own script
+ * writes its "Apollo cache" back into that script's text WITHOUT
+ * re-escaping — planting a literal `</script>` (and a JSON tail full of
+ * widget markup) inside script text that `page.content()` serializes
+ * verbatim. Fetching this page must still return the article: the provider
+ * strips scripting subtrees in the live DOM, where the script element still
+ * holds its full textual content, so the corruption never reaches the
+ * HTML string the pipeline re-parses. The page also carries the two things
+ * the strip deliberately KEEPS — a schema.org JSON-LD metadata script
+ * (Readability reads it for the title, so the strip must defuse, not
+ * delete, it) and a noscript-wrapped lazy-load image (Readability salvages
+ * the real image out of it) — locking the output-neutral carve-outs.
+ * `<\/script>` keeps the inline script from terminating itself in the
+ * SERVER's response.
+ */
+const REWRITE_PAGE = `<!doctype html><html><head><title>Rewrite page - Some Site Suffix</title>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","name":"Rewrite clean JSON-LD title","author":{"name":"Ada"}}</script>
+</head><body>
+<main><article><h1>Rewrite safe heading</h1>
+<p>The body text that must survive a data script rewritten at runtime, with enough prose for the article extractor to lock onto the main content region.</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="placeholder"><noscript><img src="https://img.example.com/real-photo.jpg" alt="The real photo"></noscript></p>
+<p>A second paragraph of real body text.</p>
+</article></main>
+<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"placeholder":true}}}</script>
+<script>
+  var soup = '';
+  for (var i = 0; i < 40; i++) {
+    soup += '<div class="lia-quilt-column-alley lia-content">CachedAsset:text:en_US-components/messages/MessageBanner-' + i
+      + ' {"value":{"messageRejectedWithReason@board:BLOG":"This post was rejected: {reason}","messageMarkedAsSpam":"This post has been marked as spam"}}</div>';
+  }
+  document.getElementById('__NEXT_DATA__').textContent =
+    '{"props":{"apolloState":{"CachedAsset:widget:MicrosoftFooter":{"css":".custom_widget_social-share > div {\\r\\n  position: absolute;\\r\\n  top: 50%;\\r\\n}\\r\\n"}}' + '<\\/script>' + soup + '"page":"/blogs/BlogMessagePage"}}';
+</script>
+</body></html>`
+
+/**
  * A realistic interstitial: the localized title, the challenge-platform
  * script, the `#challenge-*` stage, the Turnstile-era footer — and an
  * in-page script that clears the way a real managed challenge does. With
@@ -108,6 +146,11 @@ beforeAll(async () => {
     if (url.startsWith('/cdn-cgi/')) {
       res.writeHead(200, { 'content-type': 'application/javascript' })
       res.end('// simulated challenge platform script')
+      return
+    }
+    if (url.startsWith('/rewrite/')) {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      res.end(REWRITE_PAGE)
       return
     }
     if (url.startsWith('/guarded/')) {
@@ -266,6 +309,42 @@ describe('PlaywrightFetchProvider integration', () => {
     const result = await provider.fetch({ url: baseUrl })
     expect(result.body.kind).toBe('html')
     if (result.body.kind === 'html') expect(result.body.content).toContain('<article>')
+  })
+
+  it('keeps a runtime-rewritten data script from corrupting the fetched article', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping browser smoke (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'local',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
+      shareBrowserContext: true,
+      denoise: true,
+      maxConcurrency: 4,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
+    }))
+    const result = await provider.fetch({ url: `${baseUrl}rewrite/` })
+    expect(result.statusCode).toBe(200)
+    expect(result.body.kind).toBe('text')
+    const content = result.body.kind === 'text' ? result.body.content : ''
+    // The article wins over the rewritten cache payload...
+    expect(content).toMatch(/^# Rewrite /m)
+    expect(content).toContain('The body text that must survive')
+    // ...whose CSS/JSON soup — had it serialized inside script text — would
+    // have re-parsed as phantom markup and swamped the extraction.
+    expect(content).not.toContain('CachedAsset')
+    expect(content).not.toContain('messageRejectedWithReason')
+    // The strip's carve-outs stay output-neutral: the JSON-LD metadata
+    // script is defused (not deleted), so the title keeps coming from it
+    // (not the site-suffix <title>), and the noscript lazy-load image is
+    // salvaged by Readability as usual.
+    expect(content).toContain('# Rewrite clean JSON-LD title')
+    expect(content).not.toContain('- Some Site Suffix')
+    expect(content).toContain('real-photo.jpg')
   })
 
   it('maps an unreachable page to a structured WebError', { timeout: 120_000 }, async () => {

@@ -9,6 +9,8 @@
  * aborts).
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { WebError } from '@deepseek-ai/dsh-web'
 import { resolveConfig } from '../src/config.ts'
 import type { ResolvedConfig } from '../src/config.ts'
@@ -82,6 +84,15 @@ interface FakePageSpec {
   emitOnClear?: { status?: number; contentType?: string }
   /** Omit `evaluate` so the provider's probe falls back to content polling. */
   noEvaluate?: boolean
+  /**
+   * Serialization-corruption semantics (the `#__NEXT_DATA__` rewrite
+   * badcase): `corrupted` is what the page serializes when a data script's
+   * text embeds a literal `</script>` (the page's own JS rewrote it), and
+   * `clean` is what it serializes after the provider strips scripting
+   * subtrees in the live DOM first. Until that strip runs, `content()`
+   * serves the corrupted string.
+   */
+  serializationCorruption?: { corrupted: string; clean: string }
 }
 
 const ARTICLE_HTML = `<!doctype html><html><head><title>Fake page</title></head><body>
@@ -89,6 +100,34 @@ const ARTICLE_HTML = `<!doctype html><html><head><title>Fake page</title></head>
 <main><article><h1>Hello</h1><p>World</p><p>A second paragraph gives the article scorer enough text mass to find the main region.</p></article></main>
 <footer>footer noise</footer>
 </body></html>`
+
+/**
+ * The techcommunity.microsoft.com `#__NEXT_DATA__` rewrite badcase, captured
+ * from a real render (404KB corrupted / 125KB stripped; the whole documents,
+ * so the fixture stays immune to drift in Readability's scorer):
+ *
+ * - `techcommunity-corrupted.html` — what `page.content()` returns when the
+ *   page's runtime JS has written its Apollo cache back into
+ *   `script#__NEXT_DATA__` WITHOUT re-escaping, planting a literal
+ *   `</script>` inside the JSON (the wire response escapes `<` 712 times as
+ *   `\u003c`; the rewrite turns them back into raw `<`). Serialized script
+ *   text is emitted verbatim, so any spec-compliant re-parse ends the script
+ *   at that embedded end tag and parses the remaining ~270KB of JSON as
+ *   markup — phantom elements (unknown tags like `<id>`, anchors full of
+ *   CSS/i18n text) that Readability then scores ABOVE the real article
+ *   (measured: 126 vs 45), so the fetch returned CSS rules and
+ *   `CachedAsset` strings instead of the RDP 10 AVC/H.264 body.
+ * - `techcommunity-stripped.html` — the same live DOM after the provider's
+ *   strip ran IN THE BROWSER: non-JSON-LD scripts and templates removed (so
+ *   the corruptible script text never reaches the serialization), the
+ *   JSON-LD metadata scripts kept but defused (`</` rewritten to `<\/` —
+ *   still valid JSON, so Readability's metadata pass reads the same object
+ *   and keeps the site-suffix-free title), and `noscript` kept (Readability
+ *   salvages lazy-load images out of it before removing it). The pipeline
+ *   extracts the article (H.264 ×25, zero cache strings).
+ */
+const CORRUPTED_HTML = readFileSync(fileURLToPath(new URL('./fixtures/techcommunity-corrupted.html', import.meta.url)), 'utf8')
+const STRIPPED_HTML = readFileSync(fileURLToPath(new URL('./fixtures/techcommunity-stripped.html', import.meta.url)), 'utf8')
 
 /** The interstitial a challenged navigation serves (markers must classify). */
 const CHALLENGE_HTML = `<!doctype html><html lang="en"><head><title>Just a moment...</title></head><body>
@@ -149,6 +188,7 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, listeners: FakeP
   const scripted = spec.gotoScript ?? []
   let reads = 0
   let cleared = false
+  let scriptingStripped = false
 
   const entryAt = (index: number): NonNullable<FakePageSpec['gotoScript']>[number] | undefined =>
     scripted.length === 0 ? undefined : scripted[Math.min(index, scripted.length - 1)]
@@ -252,6 +292,9 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, listeners: FakeP
     content: async () => {
       noteRead()
       if (onChallenge()) return CHALLENGE_HTML
+      if (spec.serializationCorruption !== undefined) {
+        return scriptingStripped ? spec.serializationCorruption.clean : spec.serializationCorruption.corrupted
+      }
       return currentEntry()?.html ?? spec.html ?? ARTICLE_HTML
     },
     close: async () => {
@@ -265,8 +308,13 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, listeners: FakeP
       else downloadListeners.push(listener as (download: PlaywrightDownload) => void)
     },
     ...(spec.noEvaluate === true ? {} : {
-      evaluate: async (): Promise<unknown> => {
+      evaluate: async (script: string): Promise<unknown> => {
         noteRead()
+        // The provider's live-DOM strip: recognize it by its JSON-LD carve-out
+        // (the challenge probe carries no 'ld+json') and model its effect —
+        // the stripped scripting subtrees are gone, so the page serializes
+        // differently.
+        if (spec.serializationCorruption !== undefined && script.includes('ld+json')) scriptingStripped = true
         return onChallenge()
       },
     }),
@@ -496,6 +544,46 @@ describe('PlaywrightFetchProvider', () => {
       expect(result.body.content).toContain('<article>')
       expect(result.body.content).toContain('nav noise')
     }
+  })
+
+  it('strips runtime-rewritten scripts in the live DOM before serialization (the techcommunity #__NEXT_DATA__ badcase)', async () => {
+    const result = await new FakeProvider({}, { serializationCorruption: { corrupted: CORRUPTED_HTML, clean: STRIPPED_HTML } })
+      .fetch({ url: 'https://example.com/t5/blog/remote-desktop-protocol-rdp-10-avch-264/249588' })
+    expect(result.statusCode).toBe(200)
+    expect(result.body.kind).toBe('text')
+    const content = result.body.kind === 'text' ? result.body.content : ''
+    // The real RDP 10 AVC/H.264 body survives intact...
+    expect(content).toContain('Hello Everyone')
+    expect((content.match(/H\.264/g) ?? []).length).toBeGreaterThanOrEqual(10)
+    // ...while the Apollo-cache CSS and i18n payloads that the corrupted
+    // serialization parses into are gone entirely.
+    expect(content).not.toContain('CachedAsset')
+    expect(content).not.toContain('custom_widget')
+  })
+
+  it('returns the serialization-safe document raw when denoise is off', async () => {
+    const result = await new FakeProvider({ denoise: false }, { serializationCorruption: { corrupted: CORRUPTED_HTML, clean: STRIPPED_HTML } })
+      .fetch({ url: 'https://example.com/t5/blog/remote-desktop-protocol-rdp-10-avch-264/249588' })
+    expect(result.body.kind).toBe('html')
+    if (result.body.kind === 'html') {
+      // The strip runs on the live DOM regardless of the denoise toggle: the
+      // corruptible data scripts are gone from the raw serialization, while
+      // the JSON-LD metadata scripts (defused) may remain — the tool layer's
+      // renderer drops script elements wholesale either way.
+      expect(result.body.content).not.toContain('__NEXT_DATA__')
+      expect(result.body.content).not.toMatch(/<script(?![^>]*application\/ld\+json)/)
+      expect(result.body.content).toContain('Hello Everyone')
+    }
+  })
+
+  it('still fetches, best-effort, when the backend exposes no evaluate and the strip is skipped', async () => {
+    const result = await new FakeProvider({}, { noEvaluate: true, serializationCorruption: { corrupted: CORRUPTED_HTML, clean: STRIPPED_HTML } })
+      .fetch({ url: 'https://example.com/t5/blog/remote-desktop-protocol-rdp-10-avch-264/249588' })
+    // The strip is skipped, the corrupted string flows on, and the fetch
+    // still returns a result — degraded, never a failure.
+    expect(result.statusCode).toBe(200)
+    expect(result.truncated).toBe(false)
+    expect(typeof result.body.content).toBe('string')
   })
 
   it('decodes non-html text bodies verbatim', async () => {
