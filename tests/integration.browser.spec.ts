@@ -151,13 +151,23 @@ beforeAll(async () => {
     if (url.startsWith('/virtualized/')) {
       // The deep-capture badcase page (built at the bottom of this file).
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-      res.end(virtualizedTopicPage())
+      const query = new URL(url, 'http://fixture.invalid').searchParams
+      res.end(virtualizedTopicPage({
+        quantum: Number(query.get('quantum') ?? '0'),
+        nextData: query.has('nextdata'),
+      }))
+      return
+    }
+    if (url.startsWith('/longstatic/')) {
+      // A long, plain, NON-virtualized article: the walk's cost control.
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      res.end(longStaticArticlePage())
       return
     }
     if (url.startsWith('/appshell/')) {
       // The app-shell deep-capture badcase page (built at the bottom of this file).
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-      res.end(appShellDocPage())
+      res.end(appShellDocPage({ anchored: (req.url ?? '').includes('anchored') }))
       return
     }
     if (url.startsWith('/rewrite/')) {
@@ -914,7 +924,7 @@ describe('PlaywrightFetchProvider challenge A/B (simulated Cloudflare edge)', ()
  * they were content while every reply body vanishes. The deep-capture walk
  * must return the whole topic instead.
  */
-function virtualizedTopicPage(): string {
+function virtualizedTopicPage(opts: { quantum: number; nextData: boolean }): string {
   return `<!doctype html><html lang="en"><head><title>Virtualized topic - Test Forum</title>
 <style>
   body { margin: 0; font-family: sans-serif; }
@@ -931,8 +941,15 @@ function virtualizedTopicPage(): string {
   <div id="post-stream"></div>
 </main>
 <footer id="site-footer">footer noise</footer>
+${opts.nextData ? '<script id="__NEXT_DATA__" type="application/json">{"props":{}}</script>' : ''}
 <script>
-  var TOTAL = 40, CHUNK = 20, loaded = 20;
+  var TOTAL = 40, CHUNK = 20, loaded = 20, QUANTUM = ${String(opts.quantum)}, anchorY = 0;
+  if (${String(opts.nextData)}) {
+    // The runtime data-script rewrite (techcommunity shape): a literal
+    // closing script tag plus a markup tail planted inside script text.
+    document.getElementById('__NEXT_DATA__').textContent =
+      '{"apollo":"' + '<\\/script>' + '<div class="lia-content">NEXTDATA-SOUP-NOISE</div>' + '"}';
+  }
   var stream = document.getElementById('post-stream');
   function postHtml(n) {
     return '<article class="post" id="post_' + n + '" data-post-number="' + n + '">'
@@ -957,9 +974,13 @@ function virtualizedTopicPage(): string {
   for (var n = 1; n <= CHUNK; n++) appendPost(n);
 
   // Discourse's cloak/uncloak: render only within a window around the scroll.
+  // QUANTUM > 0: a coarse virtualizer with a huge overscan that only
+  // re-renders once the scroll has moved QUANTUM viewports from where it
+  // last rendered — a short walk sees NO reaction at all.
   function refresh() {
-    var lo = window.scrollY - window.innerHeight * 1.2;
-    var hi = window.scrollY + window.innerHeight * 2.2;
+    if (QUANTUM === 0 || Math.abs(window.scrollY - anchorY) >= window.innerHeight * QUANTUM) anchorY = window.scrollY;
+    var lo = anchorY - window.innerHeight * 1.2;
+    var hi = anchorY + window.innerHeight * (2.2 + QUANTUM);
     var children = stream.children;
     for (var i = 0; i < children.length; i++) {
       var el = children[i];
@@ -1008,7 +1029,7 @@ function virtualizedTopicPage(): string {
  * returns only the statically rendered first screen: the walk must detect
  * the inner scroll container, drive IT, and splice the removed blocks back.
  */
-function appShellDocPage(): string {
+function appShellDocPage(opts: { anchored: boolean } = { anchored: false }): string {
   return `<!doctype html><html lang="en"><head><title>App-shell document - Bocha Wiki</title>
 <style>
   html, body { height: 100%; margin: 0; overflow: hidden; }
@@ -1090,12 +1111,33 @@ function appShellDocPage(): string {
   }
   scroller.addEventListener('scroll', function () { refresh(); });
   refresh();
+  // anchored: the link pointed mid-document (a #heading deep link), so the
+  // editor opens scrolled — the first window holds neither the first block
+  // nor the last.
+  if (${String(opts.anchored)}) { scroller.scrollTop = 1000; refresh(); }
 </script>
 </body></html>`
 }
 
+/**
+ * A long, plain article with NO virtualization (~30 viewports of static
+ * prose, id-anchored headings): the shape of most of the web. Nothing here
+ * reacts to scrolling, so the deep-capture walk can only cost latency —
+ * the cost control for the walk's scroll-inert fast path.
+ */
+function longStaticArticlePage(): string {
+  const sections: string[] = []
+  for (let n = 1; n <= 60; n++) {
+    sections.push(`<h2 id="sec-${String(n)}">Section ${String(n)}</h2>`
+      + `<p>${'Static prose that never reacts to scrolling. '.repeat(18)}STATIC-MARKER-${String(n)}.</p>`)
+  }
+  return `<!doctype html><html lang="en"><head><title>Long static article</title>
+<style>body { margin: 0 auto; max-width: 720px; font-family: sans-serif; } h2 { margin-top: 140px; }</style></head>
+<body><main><article><h1 id="title">Long static article</h1>${sections.join('\n')}</article></main></body></html>`
+}
+
 describe('PlaywrightFetchProvider deep capture (viewport-virtualized topic)', () => {
-  function localConfig(over: { scrollBudgetMs?: number }) {
+  function localConfig(over: { scrollBudgetMs?: number; denoise?: boolean }) {
     return () => ({
       backend: 'local' as const,
       playwrightPath: '',
@@ -1171,6 +1213,56 @@ describe('PlaywrightFetchProvider deep capture (viewport-virtualized topic)', ()
     await provider.dispose()
   })
 
+  it('cost control: a long static article pays the scroll-inert fast path, not a full slow walk', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping deep-capture cost control (no launchable browser)')
+      return
+    }
+    const legacy = new PlaywrightFetchProvider(localConfig({ scrollBudgetMs: 0 }))
+    const legacyStart = Date.now()
+    await legacy.fetch({ url: `${baseUrl}longstatic/` })
+    const legacyMs = Date.now() - legacyStart
+    await legacy.dispose()
+    const provider = new PlaywrightFetchProvider(localConfig({}))
+    const start = Date.now()
+    const result = await provider.fetch({ url: `${baseUrl}longstatic/` })
+    const walkMs = Date.now() - start
+    const text = result.body.kind === 'text' ? result.body.content : ''
+    expect(text).toContain('STATIC-MARKER-1.')
+    expect(text).toContain('STATIC-MARKER-60.')
+    // ~30 viewports at the careful cadence would be ~25 steps x 600ms; the
+    // walk must notice the page never reacts and stop stepping.
+    expect(walkMs - legacyMs).toBeLessThan(6_000)
+    await provider.dispose()
+  })
+
+  it('a coarse virtualizer that ignores the first steps is still walked whole (fast path rewinds)', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping deep-capture rewind case (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(localConfig({}))
+    const result = await provider.fetch({ url: `${baseUrl}virtualized/?quantum=3` })
+    const text = result.body.kind === 'text' ? result.body.content : ''
+    for (let n = 1; n <= 40; n++) expect(text).toContain(`MARKER-POST-${String(n)} `)
+    await provider.dispose()
+  })
+
+  it('a runtime-rewritten data script cannot corrupt the merged document', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping deep-capture rewrite case (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(localConfig({ denoise: false }))
+    const result = await provider.fetch({ url: `${baseUrl}virtualized/?nextdata=1` })
+    const html = result.body.kind === 'html' ? result.body.content : ''
+    expect(html).toContain('MARKER-POST-1 ')
+    expect(html).toContain('MARKER-POST-40 ')
+    // The data script's planted markup must never surface as document markup.
+    expect(html).not.toContain('NEXTDATA-SOUP-NOISE')
+    await provider.dispose()
+  })
+
   it('control: a plain article still fetches whole (the walk cannot lose content)', { timeout: 120_000 }, async () => {
     if (!browserAvailable) {
       console.warn('skipping deep-capture control (no launchable browser)')
@@ -1187,7 +1279,7 @@ describe('PlaywrightFetchProvider deep capture (viewport-virtualized topic)', ()
 })
 
 describe('PlaywrightFetchProvider deep capture (app-shell inner scroll container)', () => {
-  function localConfig(over: { scrollBudgetMs?: number }) {
+  function localConfig(over: { scrollBudgetMs?: number; denoise?: boolean }) {
     return () => ({
       backend: 'local' as const,
       playwrightPath: '',
@@ -1235,6 +1327,25 @@ describe('PlaywrightFetchProvider deep capture (app-shell inner scroll container
     }
     // No block was duplicated by the splice (blocks appear exactly once).
     expect(text.split('MARKER-BLOCK-16').length - 1).toBe(1)
+    await provider.dispose()
+  })
+
+  it('an anchored open (mid-document start) splices removed blocks back in DOCUMENT order', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping app-shell anchored case (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(localConfig({}))
+    const result = await provider.fetch({ url: `${baseUrl}appshell/?anchored` })
+    const text = result.body.kind === 'text' ? result.body.content : ''
+    let last = -1
+    for (let n = 1; n <= 40; n++) {
+      const marker = `MARKER-BLOCK-${String(n)} `
+      expect(text.split(marker).length - 1, marker).toBe(1)
+      const at = text.indexOf(marker)
+      expect(at, `${marker} out of document order`).toBeGreaterThan(last)
+      last = at
+    }
     await provider.dispose()
   })
 

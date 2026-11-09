@@ -87,6 +87,7 @@ import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, effectiveCh
 import type { ResolvedConfig } from './config.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
 import { htmlToMarkdown } from './markdown.ts'
+import { STRIP_SCRIPTING_ELEMENTS } from './strip.ts'
 import { resolveCdpBackend, resolvePlaywrightBackend } from './playwright-resolve.ts'
 import type { PlaywrightBrowser, PlaywrightContext, PlaywrightDownload, PlaywrightPage, PlaywrightResponse, PlaywrightRoute } from './types.ts'
 
@@ -561,29 +562,31 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     // what domcontentloaded already produced.
     await page.waitForLoadState('networkidle', { timeout: Math.min(SETTLE_MS, deadline.remainingMs()) }).catch(() => {})
 
-    // Deep capture (issue: viewport-virtualized feeds lose their content at
-    // rest): Discourse-class pages keep only the posts near the scroll
-    // position in the DOM — everything else is an empty placeholder carrying
-    // the post's id — so a single-instant capture returns a skeleton. The
-    // walk steps through the document, stashes what each window renders, and
-    // rehydrates the placeholders from those snapshots before serialization
-    // (see `src/autoscroll.ts`). HTML documents only, always inside the
-    // deadline with a decode reserve, silently degrading to the legacy
-    // capture; `scrollBudgetMs: 0` skips it entirely.
+    // Deep capture (viewport-virtualized feeds and app-shell documents lose
+    // their off-window content at rest — see `src/autoscroll.ts`): a bounded
+    // walk stashes what each rendered window shows and, when it restored
+    // anything, hands back its own merged, already-stripped serialization.
+    // HTML documents only, inside the deadline with a decode reserve,
+    // silently degrading to the legacy capture; `scrollBudgetMs: 0` skips it.
     const scrollBudgetMs = Math.min(
       effectiveScrollBudgetMs(config),
       deadline.remainingMs() - SCROLL_FINISH_RESERVE_MS,
     )
-    if (scrollBudgetMs > 0) await deepCaptureWalk(page, scrollBudgetMs)
+    const captured = scrollBudgetMs > 0 ? await deepCaptureWalk(page, scrollBudgetMs) : undefined
 
-    // Serialization safety: the document is about to be flattened into an
-    // HTML string and re-parsed by jsdom, and scripting elements are the one
-    // place that round-trip can break — see {@link STRIP_SCRIPTING_ELEMENTS}
-    // for exactly what is removed, what is kept (JSON-LD, noscript), and why
-    // each removal cannot change what the pipeline extracts.
-    await stripScriptingElements(page)
-
-    const html = await page.content()
+    // Serialization safety for the live read: the document is about to be
+    // flattened into an HTML string and re-parsed by jsdom, and scripting
+    // elements are the one place that round-trip can break — see
+    // `src/strip.ts` for exactly what is removed, what is kept (JSON-LD,
+    // noscript), and why each removal cannot change what the pipeline
+    // extracts. (The walk's merged capture went through the same strip.)
+    let html: string
+    if (captured?.html !== undefined) {
+      html = captured.html
+    } else {
+      await stripScriptingElements(page)
+      html = await page.content()
+    }
     if (!config.denoise) {
       // The tool layer's own turndown renders raw HTML; the checkbox only
       // governs the Readability/DOMPurify stage this provider owns.
@@ -949,67 +952,12 @@ async function probeStillOnChallenge(page: PlaywrightPage): Promise<boolean> {
 }
 
 /**
- * In-page script that removes non-content scripting subtrees from the live
- * document before `page.content()` reads it as an HTML string.
- *
- * WHAT goes, and why each removal is output-neutral versus the old pipeline:
- *
- * - `script` — three consumers ever saw script text before, and none loses
- *   it here: Readability's `parse()` deletes script/noscript nodes BEFORE
- *   extraction and scoring (so script text never reached the article or
- *   influenced the scorer); DOMPurify's default allowlist drops script; the
- *   tool layer's renderer removes SCRIPT wholesale on the raw path. What the
- *   removal buys is the reason this exists: a page's runtime JS may rewrite
- *   a data script's text with a literal `</script>` embedded — measured on
- *   techcommunity.microsoft.com (Khoros/Aurora), whose client writes its
- *   Apollo cache back into `script#__NEXT_DATA__` via `JSON.stringify`,
- *   turning the wire's 712 `\u003c` escapes back into raw `<` — and
- *   browsers serialize script text verbatim, so the flattened string ends
- *   that script at the FIRST embedded end tag and re-parses the remaining
- *   ~270KB of JSON as markup. The phantom elements that survive (unknown
- *   tags like `<id>`, anchors full of JSON text) are exactly what
- *   Readability's scorer reads as article mass, so the extracted "article"
- *   is CSS and i18n strings while the real body — still present in the DOM —
- *   loses. No string-level patch can undo this after serialization (the
- *   string is genuinely ambiguous); only the browser's own parse holds the
- *   document's true structure.
- * - `script[type="application/ld+json"]` — KEPT, but defused: Readability
- *   extracts metadata (title/byline/excerpt — e.g. the site-suffix-free
- *   "Remote Desktop Protocol" instead of "… - Wikipedia") from JSON-LD
- *   scripts before removing them, so deleting them would regress the title
- *   on every JSON-LD-carrying page. Rewriting `</` as `<\/` keeps the text
- *   valid JSON (`\/` is a legal escape, so the re-parsed text parses to the
- *   same object) while making the serialization harmless: the tokenizer
- *   only terminates on a literal `</script`.
- * - `noscript` — KEPT: Readability's `_unwrapNoscriptImages` salvages the
- *   real image out of lazy-load `<noscript><img …>` wrappers before
- *   `_removeScripts` deletes the noscript; pre-stripping it would silently
- *   drop those images from the markdown.
- * - `template` — removed: its children parse into the inert `.content`
- *   fragment (invisible to Readability's traversal), DOMPurify's
- *   FORBID_TAGS drops it, and the tool layer's renderer removes it too.
- * - `style` stays — its text cannot terminate a re-parse except at its own
- *   end tag, and the pipeline already drops it.
- */
-const STRIP_SCRIPTING_ELEMENTS = `(() => {
-  for (const el of Array.from(document.querySelectorAll('script, template'))) {
-    if (el.tagName === 'SCRIPT' && (el.getAttribute('type') || '').trim().toLowerCase() === 'application/ld+json') {
-      // '<\\/' is still valid JSON, so the re-parsed textContent parses to
-      // the same object — while the serialized form can no longer close the
-      // script element early.
-      el.textContent = el.textContent.replace(/<\\//g, '<\\\\/')
-      continue
-    }
-    el.remove()
-  }
-})()`
-
-/**
  * Remove non-content scripting subtrees from the live document before
- * serialization. Best-effort, mirroring {@link probeStillOnChallenge}: a
- * backend without `evaluate` (fakes, minimal engines) simply keeps the
- * document as-is — the fetch never fails here, and the pipeline degrades to
- * whatever the serialized string itself says.
+ * serialization (see `stripScriptingElementsIn` in `src/strip.ts` for exactly
+ * what goes and why). Best-effort, mirroring {@link probeStillOnChallenge}: a backend
+ * without `evaluate` (fakes, minimal engines) simply keeps the document
+ * as-is — the fetch never fails here, and the pipeline degrades to whatever
+ * the serialized string itself says.
  */
 async function stripScriptingElements(page: PlaywrightPage): Promise<void> {
   if (typeof page.evaluate !== 'function') return

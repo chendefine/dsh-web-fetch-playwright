@@ -95,6 +95,8 @@ interface FakePageSpec {
    * serves the corrupted string.
    */
   serializationCorruption?: { corrupted: string; clean: string }
+  /** What the page resolves for the deep-capture walk (default: the challenge probe's answer). */
+  deepCapture?: unknown
 }
 
 const ARTICLE_HTML = `<!doctype html><html><head><title>Fake page</title></head><body>
@@ -317,6 +319,8 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, listeners: FakeP
         // (the challenge probe carries no 'ld+json') and model its effect —
         // the stripped scripting subtrees are gone, so the page serializes
         // differently.
+        // The walk embeds the same strip by source, so it is told apart first.
+        if (script.includes('dsh-deep-capture')) return 'deepCapture' in spec ? spec.deepCapture : onChallenge()
         if (spec.serializationCorruption !== undefined && script.includes('ld+json')) scriptingStripped = true
         return onChallenge()
       },
@@ -1377,9 +1381,21 @@ describe('PlaywrightFetchProvider deep-capture walk', () => {
     const result = await provider.fetch({ url: 'https://example.com/feed' })
     expect(result.statusCode).toBe(200)
     const walkAt = recordEvaluates.findIndex(script => script.includes('dsh-deep-capture'))
-    const stripAt = recordEvaluates.findIndex(script => script.includes('ld+json'))
+    const stripAt = recordEvaluates.findIndex(script => script.includes('ld+json') && !script.includes('dsh-deep-capture'))
     expect(walkAt).toBeGreaterThanOrEqual(0)
     expect(stripAt).toBeGreaterThan(walkAt)
+  })
+
+  it('a walk that restored content hands over its merged capture: no live strip, no live read', async () => {
+    const recordEvaluates: string[] = []
+    const merged = '<!DOCTYPE html><html><head><title>Merged</title></head><body><main>MERGED-CAPTURE</main></body></html>'
+    const provider = new FakeProvider({ denoise: false }, {
+      recordEvaluates,
+      deepCapture: { steps: 4, stashed: 9, rehydrated: 3, html: merged },
+    })
+    const result = await provider.fetch({ url: 'https://example.com/feed' })
+    expect(result.body).toEqual({ kind: 'html', content: merged })
+    expect(recordEvaluates.some(script => script.includes('ld+json') && !script.includes('dsh-deep-capture'))).toBe(false)
   })
 
   it('scrollBudgetMs: 0 (the legacy escape hatch) never hands the page a walk script', async () => {

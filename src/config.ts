@@ -15,11 +15,19 @@
 
 import type { Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { DEFAULT_SCROLL_BUDGET_MS, MAX_SCROLL_BUDGET_MS } from './autoscroll.ts'
 
-// Re-exported for consumers that read the settings surface (the schema's
-// bounds belong with the schema, the walk's knobs with the walk).
-export { DEFAULT_SCROLL_BUDGET_MS, MAX_SCROLL_BUDGET_MS } from './autoscroll.ts'
+/**
+ * Default bounded budget (ms) for the deep-capture scroll walk
+ * (`src/autoscroll.ts`). Sized so long topics stay fully covered at the
+ * careful cadence (300ms motion + 300ms rest per ~0.7-viewport step, plus
+ * the bottom patience window): 20s walks ~25kpx with pagination, covering
+ * the measured linux.do badcase (~18kpx, 51 replies) with headroom.
+ * Scroll-inert pages take the walk's fast path and spend a few seconds.
+ */
+export const DEFAULT_SCROLL_BUDGET_MS = 20_000
+
+/** Ceiling the schema accepts for `scrollBudgetMs`. */
+export const MAX_SCROLL_BUDGET_MS = 30_000
 
 /** Default CDP endpoint when the settings section leaves it blank. */
 export const DEFAULT_CDP_ENDPOINT = '127.0.0.1:9222'

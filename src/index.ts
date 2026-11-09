@@ -26,6 +26,8 @@ export {
   DEFAULT_CDP_ENDPOINT,
   DEFAULT_CHALLENGE_RETRIES,
   DEFAULT_CHALLENGE_WAIT_MS,
+  DEFAULT_SCROLL_BUDGET_MS,
+  MAX_SCROLL_BUDGET_MS,
   effectiveChallengeRetries,
   effectiveChallengeWaitMs,
   effectiveContextMode,
@@ -46,23 +48,8 @@ export { CdpConnectionPool } from './cdp-pool.ts'
 export type { CdpAcquireMode, CdpConnect, CdpLease } from './cdp-pool.ts'
 export { CHALLENGE_DOM_PROBE, CHALLENGE_FINISH_RESERVE_MS, CHALLENGE_POLL_INTERVAL_MS, CHALLENGE_TITLE_RE, classifyChallengeHtml, classifyChallengeResponse, isChallengeCompatibleResponse } from './challenge.ts'
 export type { ChallengeVerdict } from './challenge.ts'
-export {
-  DEFAULT_SCROLL_BUDGET_MS,
-  MAX_SCROLL_BUDGET_MS,
-  SCROLL_BOTTOM_PATIENCE_MS,
-  SCROLL_BOTTOM_POLL_MS,
-  SCROLL_CONTAINER_MIN_RANGE_PX,
-  SCROLL_CONTAINER_MIN_RANGE_RATIO,
-  SCROLL_FINISH_RESERVE_MS,
-  SCROLL_MAX_STEPS,
-  SCROLL_MIN_BUDGET_MS,
-  SCROLL_STEP_RATIO,
-  SCROLL_STEP_SETTLE_MS,
-  SCROLL_STASH_MAX_ENTRY_CHARS,
-  deepCaptureScript,
-  deepCaptureWalk,
-} from './autoscroll.ts'
-export type { DeepCaptureStats } from './autoscroll.ts'
+export { deepCaptureWalk } from './autoscroll.ts'
+export type { DeepCapture, DeepCaptureStats } from './autoscroll.ts'
 export { PLAYWRIGHT_FETCH_PROVIDER_ID, PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE } from './provider.ts'
 export { htmlToMarkdown } from './markdown.ts'
 export type { DenoiseMode, DenoiseResult } from './markdown.ts'
