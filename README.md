@@ -16,6 +16,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plug
 - **Live configuration** — the Plugins page (侧边栏 → 插件 → *dsh-web-fetch-playwright*, dsh ≥ 0.1.7) shows the full form right on the plugin's package page (and on the row's own page via its configure control); it edits the backend, context mode, denoise toggle, and concurrency, and a committed change reaches the next fetch without a restart.
 - **Budget-aware** — per-fetch deadline (45s); concurrency is backend-priced (`maxConcurrency`, default 4 local browsers / **50 CDP tabs**; queued fetches fail fast with a retry hint after 20s instead of hanging); image/font/media subrequests aborted; body capped at 100k chars.
 - **Bounded Cloudflare-challenge wait** — when a navigation lands on a challenge interstitial ("Just a moment…" and its localized siblings, recognized via the documented `cf-mitigated: challenge` response header plus structural page markers), the fetch keeps the **same tab and context** and waits for the browser's own verification to clear it — tracking the *last* main-frame response (the real page reloads in) and watching the live DOM so SPA-style clears are caught too. Bounded and configurable (`challengeWaitMs`, default 15s; 0 restores the legacy first-response behavior), with a bounded same-tab retry (`challengeRetries`, default 1). When the budget runs out, the fetch fails with the distinct `WEB_FETCH_CHALLENGE` error code instead of returning the interstitial as content. It never clicks, never injects CAPTCHA answers, never fakes browser state, and never exports or copies cookies.
+- **Deep capture for viewport-virtualized feeds** — forum topics, comment threads, and timelines increasingly render only the items near the scroll position (Discourse topic streams keep every other post as an empty height-only placeholder that carries the post's id but none of its content), so a resting snapshot returns the skeleton while the bodies silently vanish. The fetch therefore runs one bounded in-page scroll walk before serialization: it stashes what each rendered window shows (richest snapshot per id), steps to the bottom — the only place "the page has stopped growing" means anything — then rehydrates every degraded id-bearing element from its stashed snapshot in a freshly reparsed document and transplants the merged tree in, severing the app's listeners so nothing can re-virtualize it. Bounded by `scrollBudgetMs` (default 20s; 0 restores the legacy single-instant behavior); any failure silently degrades to the legacy capture.
 
 ## How it works
 
@@ -29,7 +30,7 @@ web_fetch (tool-web)
    └─ ctx.web.fetchProvider = playwright
         ├─ local: resolve (path → $PATH → bundled playwright-core) → chromium.launch
         ├─ cdp:   connectOverCDP(endpoint)
-        ├─ page.goto → settle (networkidle, best-effort) → strip scripting subtrees in the live DOM → page.content()
+        ├─ page.goto → settle (networkidle, best-effort) → deep-capture scroll walk (virtualized feeds) → strip scripting subtrees in the live DOM → page.content()
         ├─ denoise: jsdom → elide data-URI images → Readability → coverage gate → DOMPurify → Turndown(GFM)
         └─ Markdown (or raw HTML when denoise is off)
 ```
@@ -79,6 +80,7 @@ The Plugins page (侧边栏 → 插件) opens the form one click from the list: 
 | `maxConcurrency` | *(auto)* | How many fetches may render at once (1–200). Blank = backend default: **4** for local (each slot launches a browser) / **50** for CDP (each slot is just a tab in the already-running remote browser). Beyond the limit, fetches wait briefly; if no slot frees within 20s they fail with `WEB_FETCH_TIMEOUT` and a hint to retry or raise this setting, rather than hanging until the tool budget aborts. |
 | `challengeWaitMs` | `15000` | Bounded wait (ms, 0–60000) for a Cloudflare challenge to clear naturally in the same tab. `0` disables the whole challenge path — the first response is returned as-is (the pre-0.2.5 behavior). |
 | `challengeRetries` | `1` | Same-tab re-navigation attempts after a wait window runs out (0–3); any clearance cookies the browser earned stay in the context for the retry. Everything stays inside the 45s per-fetch deadline. |
+| `scrollBudgetMs` | `20000` | Bounded budget (ms, 0–30000) for the deep-capture scroll walk. `0` disables it — the page is captured as it rests (the pre-walk behavior), which loses the bodies of viewport-virtualized feeds. |
 
 Local backend resolution order:
 
@@ -129,6 +131,26 @@ With the wait on (default):
 4. **Clear failure** — `WEB_FETCH_CHALLENGE` (a provider-specific code the web seam's open-string `code` allows) naming the site, the budget spent, and the last challenge status.
 
 Security boundary (deliberate): no clicking through Turnstile, no CAPTCHA solving or token injection, no fingerprint/UA spoofing, no proxy rotation, and no cookie export — in CDP isolated mode clearance remains within its session/global context until that context is discarded (local contexts still end with each fetch); in profile mode it stays in the remote browser's own profile, which this plugin never copies or cleans. The wait is always bounded by `challengeWaitMs` and the 45s per-fetch deadline; nothing blocks forever.
+
+### Deep capture (viewport-virtualized feeds)
+
+Feed-shaped pages — Discourse topic streams (linux.do, meta.discourse.org), comment threads, timelines — render only the items near the current scroll position. At rest the live DOM holds a window's worth of real content while every item outside it is a height-only placeholder that keeps the item's identity but none of it:
+
+```html
+<div class="post-stream--cloaked" data-post-number="1" id="post_1" style="height:297.9px !important;…">
+  <h2 class="sr-only">由 Diver-QC 于 2 小时前 发布</h2>
+</div>
+```
+
+A fetch that renders, never scrolls, and serializes one instant of that DOM hands back the skeleton — the screen-reader-only "posted by" headings survive the pipeline as if they were content, the bodies vanish, and even the denoise pipeline's coverage gate cannot notice (the page's own visible text is the same windowed fragment as the extraction). Scrolling to the bottom once does not help either: the render window *moves* — measured on a 40-reply linux.do topic, the resting DOM held only the first ~6 replies, a bottom jump left only the last 10, and replies past the first chunk were not in the DOM at all until a load-more sentinel near the bottom fetched them.
+
+The fix is a bounded in-page scroll walk (`src/autoscroll.ts`), run after the settle and before the serialization strip for every HTML document:
+
+1. **Stash** what each rendered window shows, keyed by element id, keeping the *richest* snapshot per id (a row first seen as its placeholder is upgraded when its rendered form appears — the walk starts at the top, outside most rows' windows).
+2. **Walk** down one step at a time — 70% of the viewport per step, each step a smooth 300ms-animated descent (time-interpolated ticks, so background-tab throttling self-corrects) followed by a 300ms quiet settle for the feed engine's debounced uncloak — with a bottom *patience window* (2.5s of no height growth while holding at the bottom — real feed engines fetch their next chunk with network latency far beyond a re-render settle, and growth at any poll restarts the clock) until the page is complete; height stability anywhere else proves nothing (it was final at half-page on the measured badcase), and the step/budget caps close the walk regardless. Stashed entries are also size-capped (~64KB each): a virtualized row is a few KB, while an element tens of KB big is a container whose serialization embeds the whole stream (measured on linux.do: six nested wrappers plus `data-preloaded` and `svg-sprites` ballooned one pass to 1.9MB of the 2MB budget before any post row was reached).
+3. **Merge** in three synchronous phases with no `await` between them: reparse the live document into a fresh `createHTMLDocument` (a deterministic parse that sidesteps every stale-closure hazard a walk's worth of app mutations can leave behind), rehydrate every id-bearing element that is degraded versus its snapshot — fewer child elements, or meaningfully less text — by swapping the snapshot in, except *containers* (elements with a descendant the merge would itself restore; Discourse's placeholder embeds an id-bearing screen-reader heading, so the container test must be dynamic, not "has an id-descendant"), which are assembled from those descendants instead; then transplant the merged root into the live document. The transplant severs the app's listeners, so no late scroll/rAF/timer reaction can re-virtualize what the walk restored.
+
+The walk runs in both denoise modes, costs well under a second on a plain article (the bottom-exit patience check passes immediately when the height has been stable through the walk), and is bounded by `scrollBudgetMs` (default 20s; `0` restores the legacy single-instant behavior) and by the remaining fetch deadline minus a decode reserve. Any failure — a page without `evaluate`, a rejected evaluation, an engine that refuses the walk — silently degrades to the legacy capture; a walk can only add content, never fail a fetch. In CDP profile mode the walk scrolls the fetch-owned tab in the remote browser, exactly where the fetch already renders it.
 
 ## Development
 

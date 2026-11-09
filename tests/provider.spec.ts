@@ -84,6 +84,8 @@ interface FakePageSpec {
   emitOnClear?: { status?: number; contentType?: string }
   /** Omit `evaluate` so the provider's probe falls back to content polling. */
   noEvaluate?: boolean
+  /** Every script handed to `evaluate`, in call order (deep-capture ordering). */
+  recordEvaluates?: string[]
   /**
    * Serialization-corruption semantics (the `#__NEXT_DATA__` rewrite
    * badcase): `corrupted` is what the page serializes when a data script's
@@ -310,6 +312,7 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, listeners: FakeP
     ...(spec.noEvaluate === true ? {} : {
       evaluate: async (script: string): Promise<unknown> => {
         noteRead()
+        spec.recordEvaluates?.push(script)
         // The provider's live-DOM strip: recognize it by its JSON-LD carve-out
         // (the challenge probe carries no 'ld+json') and model its effect —
         // the stripped scripting subtrees are gone, so the page serializes
@@ -1357,5 +1360,45 @@ describe('PlaywrightFetchProvider cloudflare challenge wait', () => {
     expect(result.statusCode).toBe(200)
     expect(bodyOf(result)).toContain('World')
     expect(counters(provider).gotos).toBe(2)
+  })
+})
+
+/**
+ * The deep-capture scroll walk's seat in the fetch pipeline: it runs for
+ * every HTML document AFTER the settle and BEFORE the serialization strip
+ * (so the DOM it rehydrates is the one `page.content()` serializes), and
+ * `scrollBudgetMs: 0` skips it entirely — the challenge knobs' legacy
+ * escape-hatch pattern.
+ */
+describe('PlaywrightFetchProvider deep-capture walk', () => {
+  it('runs the walk after the settle and before the serialization strip', async () => {
+    const recordEvaluates: string[] = []
+    const provider = new FakeProvider({}, { recordEvaluates })
+    const result = await provider.fetch({ url: 'https://example.com/feed' })
+    expect(result.statusCode).toBe(200)
+    const walkAt = recordEvaluates.findIndex(script => script.includes('dsh-deep-capture'))
+    const stripAt = recordEvaluates.findIndex(script => script.includes('ld+json'))
+    expect(walkAt).toBeGreaterThanOrEqual(0)
+    expect(stripAt).toBeGreaterThan(walkAt)
+  })
+
+  it('scrollBudgetMs: 0 (the legacy escape hatch) never hands the page a walk script', async () => {
+    const recordEvaluates: string[] = []
+    const provider = new FakeProvider({ scrollBudgetMs: 0 }, { recordEvaluates })
+    const result = await provider.fetch({ url: 'https://example.com/feed' })
+    expect(result.statusCode).toBe(200)
+    expect(recordEvaluates.some(script => script.includes('dsh-deep-capture'))).toBe(false)
+  })
+
+  it('a text document never triggers the walk (nothing in the DOM to capture)', async () => {
+    const recordEvaluates: string[] = []
+    const provider = new FakeProvider({}, {
+      recordEvaluates,
+      contentType: 'application/json',
+      textBody: '{"ok":true}',
+    })
+    const result = await provider.fetch({ url: 'https://example.com/data.json' })
+    expect(result.body.kind).toBe('text')
+    expect(recordEvaluates.some(script => script.includes('dsh-deep-capture'))).toBe(false)
   })
 })

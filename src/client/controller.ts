@@ -46,6 +46,11 @@ export interface PlaywrightSettings {
    * same tab (0–60000); 0 = off (return the first response as-is).
    */
   challengeWaitMs?: number
+  /**
+   * Bounded budget (ms) for the deep-capture scroll walk (0–30000); 0 = off
+   * (capture the document as it rests, the legacy single-instant behavior).
+   */
+  scrollBudgetMs?: number
 }
 
 /** What the Playwright card renders. */
@@ -65,6 +70,8 @@ export interface PlaywrightCardState extends CardShell {
   maxConcurrency: CardFieldState
   /** Challenge wait input (draft decimal integer of milliseconds). */
   challengeWaitMs: CardFieldState
+  /** Scroll-walk budget input (draft decimal integer of milliseconds). */
+  scrollBudgetMs: CardFieldState
 }
 
 /** The registration-side face the card's slot entry injects. */
@@ -97,6 +104,7 @@ export class PlaywrightCardController {
         checkboxField('denoise'),
         numberField('maxConcurrency', 1, 200),
         numberField('challengeWaitMs', 0, 60_000),
+        numberField('scrollBudgetMs', 0, 30_000),
       ],
     )
     this.store = this.form.bind(() => this.projection())
@@ -113,6 +121,7 @@ export class PlaywrightCardController {
       denoise: this.form.field('denoise'),
       maxConcurrency: this.form.field('maxConcurrency'),
       challengeWaitMs: this.form.field('challengeWaitMs'),
+      scrollBudgetMs: this.form.field('scrollBudgetMs'),
     }
   }
 

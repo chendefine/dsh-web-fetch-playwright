@@ -15,13 +15,16 @@ import {
   DEFAULT_CHALLENGE_WAIT_MS,
   DEFAULT_MAX_CONCURRENCY_CDP,
   DEFAULT_MAX_CONCURRENCY_LOCAL,
+  DEFAULT_SCROLL_BUDGET_MS,
   MAX_CHALLENGE_RETRIES,
   MAX_CHALLENGE_WAIT_MS,
   MAX_CONCURRENCY_CEILING,
+  MAX_SCROLL_BUDGET_MS,
   effectiveChallengeRetries,
   effectiveChallengeWaitMs,
   effectiveContextMode,
   effectiveMaxConcurrency,
+  effectiveScrollBudgetMs,
   normalizeCdpEndpoint,
   resolveConfig,
   snapshotsOf,
@@ -40,6 +43,7 @@ describe('Config', () => {
       denoise: true,
       challengeWaitMs: DEFAULT_CHALLENGE_WAIT_MS,
       challengeRetries: DEFAULT_CHALLENGE_RETRIES,
+      scrollBudgetMs: DEFAULT_SCROLL_BUDGET_MS,
     })
   })
 
@@ -62,6 +66,7 @@ describe('Config', () => {
       maxConcurrency: 50,
       challengeWaitMs: 30_000,
       challengeRetries: 2,
+      scrollBudgetMs: 12_000,
     })
     expect(resolved).toEqual({
       backend: 'cdp',
@@ -73,6 +78,7 @@ describe('Config', () => {
       maxConcurrency: 50,
       challengeWaitMs: 30_000,
       challengeRetries: 2,
+      scrollBudgetMs: 12_000,
     })
   })
 
@@ -94,6 +100,14 @@ describe('Config', () => {
     expect(() => resolveConfig({ challengeRetries: -1 })).toThrow()
     expect(() => resolveConfig({ challengeRetries: MAX_CHALLENGE_RETRIES + 1 })).toThrow()
   })
+
+  it('accepts the scroll-walk budget across its range, rejects outside it', () => {
+    expect(resolveConfig({ scrollBudgetMs: 0 }).scrollBudgetMs).toBe(0)
+    expect(resolveConfig({ scrollBudgetMs: MAX_SCROLL_BUDGET_MS }).scrollBudgetMs).toBe(MAX_SCROLL_BUDGET_MS)
+    expect(() => resolveConfig({ scrollBudgetMs: -1 })).toThrow()
+    expect(() => resolveConfig({ scrollBudgetMs: MAX_SCROLL_BUDGET_MS + 1 })).toThrow()
+    expect(() => resolveConfig({ scrollBudgetMs: 2.5 })).toThrow()
+  })
 })
 
 describe('the volatile configuration face', () => {
@@ -114,6 +128,7 @@ describe('the volatile configuration face', () => {
       maxConcurrency: 8,
       challengeWaitMs: DEFAULT_CHALLENGE_WAIT_MS,
       challengeRetries: DEFAULT_CHALLENGE_RETRIES,
+      scrollBudgetMs: DEFAULT_SCROLL_BUDGET_MS,
     })
   })
 
@@ -146,6 +161,14 @@ describe('effective challenge knobs', () => {
     expect(effectiveChallengeRetries({ challengeRetries: 0 })).toBe(0)
     expect(effectiveChallengeRetries({ challengeRetries: 3 })).toBe(3)
     expect(effectiveChallengeRetries({})).toBe(DEFAULT_CHALLENGE_RETRIES)
+  })
+})
+
+describe('effectiveScrollBudgetMs', () => {
+  it('an explicit budget wins (0 = the walk is off); a missing one falls back to the schema default', () => {
+    expect(effectiveScrollBudgetMs({ scrollBudgetMs: 0 })).toBe(0)
+    expect(effectiveScrollBudgetMs({ scrollBudgetMs: 7_500 })).toBe(7_500)
+    expect(effectiveScrollBudgetMs({})).toBe(DEFAULT_SCROLL_BUDGET_MS)
   })
 })
 

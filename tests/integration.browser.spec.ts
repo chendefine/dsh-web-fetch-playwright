@@ -148,6 +148,12 @@ beforeAll(async () => {
       res.end('// simulated challenge platform script')
       return
     }
+    if (url.startsWith('/virtualized/')) {
+      // The deep-capture badcase page (built at the bottom of this file).
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      res.end(virtualizedTopicPage())
+      return
+    }
     if (url.startsWith('/rewrite/')) {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
       res.end(REWRITE_PAGE)
@@ -886,6 +892,191 @@ describe('PlaywrightFetchProvider challenge A/B (simulated Cloudflare edge)', ()
     // The second fetch's fresh browser was challenged again — nothing leaked.
     expect(challengeState.challengesServed).toBe(served + 1)
     expect(textOf(second)).toContain('Real protected content')
+    await provider.dispose()
+  })
+})
+
+/**
+ * The viewport-virtualization badcase (linux.do / Discourse topic streams),
+ * rebuilt as a deterministic fixture: only the posts near the scroll
+ * position exist in the DOM — everything outside the render window is an
+ * empty height-only placeholder that keeps the post's id (exactly
+ * Discourse's `.post-stream--cloaked`), and posts beyond the first chunk
+ * are only appended when a bottom sentinel nears the viewport (Discourse's
+ * load-more). A resting single-instant capture returns the skeleton: the
+ * screen-reader-only "Reply N by userN" headings survive the pipeline as if
+ * they were content while every reply body vanishes. The deep-capture walk
+ * must return the whole topic instead.
+ */
+function virtualizedTopicPage(): string {
+  return `<!doctype html><html lang="en"><head><title>Virtualized topic - Test Forum</title>
+<style>
+  body { margin: 0; font-family: sans-serif; }
+  header, footer { height: 60px; background: #eee; }
+  main { max-width: 720px; margin: 0 auto; }
+  .post { min-height: 150px; padding: 8px 0; border-bottom: 1px solid #ddd; }
+  .post-stream--cloaked { min-height: 150px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style></head>
+<body>
+<header id="site-header"><span>Test Forum — header noise</span></header>
+<main id="main-outlet">
+  <h1 id="topic-title">Virtualized topic</h1>
+  <div id="post-stream"></div>
+</main>
+<footer id="site-footer">footer noise</footer>
+<script>
+  var TOTAL = 40, CHUNK = 20, loaded = 20;
+  var stream = document.getElementById('post-stream');
+  function postHtml(n) {
+    return '<article class="post" id="post_' + n + '" data-post-number="' + n + '">'
+      + '<h2>Reply ' + n + ' by user' + n + '</h2>'
+      + '<div class="cooked"><p>Reply body ' + n + ' says: the quick brown fox jumps over the lazy dog, '
+      + 'and enough prose follows so the article extractor scores the stream as the main region. '
+      + 'MARKER-POST-' + n + ' ends this reply.</p></div></article>';
+  }
+  function placeholderHtml(n) {
+    return '<div class="post-stream--cloaked" id="post_' + n + '" data-post-number="' + n + '">'
+      + '<h2 class="sr-only">Reply ' + n + ' by user' + n + '</h2></div>';
+  }
+  var sentinel = document.createElement('div');
+  sentinel.id = 'load-more-sentinel';
+  sentinel.style.height = '1px';
+  function appendPost(n) {
+    var wrap = document.createElement('div');
+    wrap.innerHTML = postHtml(n);
+    stream.insertBefore(wrap.firstElementChild, sentinel);
+  }
+  stream.appendChild(sentinel);
+  for (var n = 1; n <= CHUNK; n++) appendPost(n);
+
+  // Discourse's cloak/uncloak: render only within a window around the scroll.
+  function refresh() {
+    var lo = window.scrollY - window.innerHeight * 1.2;
+    var hi = window.scrollY + window.innerHeight * 2.2;
+    var children = stream.children;
+    for (var i = 0; i < children.length; i++) {
+      var el = children[i];
+      var num = parseInt(el.getAttribute('data-post-number') || '0', 10);
+      if (num < 1) continue;
+      var top = el.getBoundingClientRect().top + window.scrollY;
+      var wantRendered = top >= lo && top <= hi;
+      var isRendered = el.tagName === 'ARTICLE';
+      if (wantRendered !== isRendered) el.outerHTML = wantRendered ? postHtml(num) : placeholderHtml(num);
+    }
+  }
+
+  // Discourse's load-more: a sentinel nearing the viewport appends the next
+  // chunk after a network-like delay.
+  var loading = false;
+  function maybeLoadMore() {
+    if (loading || loaded >= TOTAL) return;
+    var rect = sentinel.getBoundingClientRect();
+    if (rect.top < window.innerHeight + 200) {
+      loading = true;
+      setTimeout(function () {
+        for (var k = 0; k < 5 && loaded < TOTAL; k++) { loaded++; appendPost(loaded); }
+        loading = false;
+        refresh();
+      }, 250);
+    }
+  }
+
+  window.addEventListener('scroll', function () { requestAnimationFrame(refresh); maybeLoadMore(); });
+  maybeLoadMore();
+  refresh();
+</script>
+</body></html>`
+}
+
+describe('PlaywrightFetchProvider deep capture (viewport-virtualized topic)', () => {
+  function localConfig(over: { scrollBudgetMs?: number }) {
+    return () => ({
+      backend: 'local' as const,
+      playwrightPath: '',
+      cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
+      shareBrowserContext: true,
+      denoise: true,
+      maxConcurrency: 4,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
+      ...over,
+    })
+  }
+
+  it('baseline (scrollBudgetMs 0): the resting capture is the skeleton — headings without bodies', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping deep-capture baseline (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(localConfig({ scrollBudgetMs: 0 }))
+    const result = await provider.fetch({ url: `${baseUrl}virtualized/` })
+    const text = result.body.kind === 'text' ? result.body.content : ''
+    // The resting window renders the early posts...
+    expect(text).toContain('MARKER-POST-2')
+    // ...but a post past the window comes back as the skeleton: the
+    // placeholder's screen-reader heading survives the pipeline, its body
+    // does not — exactly the linux.do symptom.
+    expect(text).toContain('Reply 15 by user15')
+    expect(text).not.toContain('MARKER-POST-15')
+    // And nothing past the first chunk is even loaded without scrolling.
+    expect(text).not.toContain('MARKER-POST-21')
+    await provider.dispose()
+  })
+
+  it('feature on: the walk captures every reply across windows and load-more chunks', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping deep-capture feature case (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(localConfig({}))
+    const result = await provider.fetch({ url: `${baseUrl}virtualized/` })
+    const text = result.body.kind === 'text' ? result.body.content : ''
+    for (const marker of ['MARKER-POST-1', 'MARKER-POST-11', 'MARKER-POST-20', 'MARKER-POST-21', 'MARKER-POST-30', 'MARKER-POST-40']) {
+      expect(text).toContain(marker)
+    }
+    await provider.dispose()
+  })
+
+  it('feature on with denoise off: the raw HTML path keeps the rehydrated stream too', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping deep-capture raw-html case (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'local',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
+      shareBrowserContext: true,
+      denoise: false,
+      maxConcurrency: 4,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
+      scrollBudgetMs: 10_000,
+    }))
+    const result = await provider.fetch({ url: `${baseUrl}virtualized/` })
+    const html = result.body.kind === 'html' ? result.body.content : ''
+    expect(html).toContain('MARKER-POST-40')
+    // And no cloaked placeholder ELEMENT remains in the serialized document
+    // (the .post-stream--cloaked SELECTOR text in the page's <style> is fine):
+    // the stream is whole, not a mix of articles and cloaks.
+    expect(html).not.toMatch(/<div class="post-stream--cloaked/)
+    await provider.dispose()
+  })
+
+  it('control: a plain article still fetches whole (the walk cannot lose content)', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping deep-capture control (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(localConfig({}))
+    const result = await provider.fetch({ url: baseUrl })
+    const text = result.body.kind === 'text' ? result.body.content : ''
+    expect(text).toContain('The rendered body text.')
+    expect(text).not.toContain('nav link')
+    expect(text).not.toContain('footer noise')
     await provider.dispose()
   })
 })

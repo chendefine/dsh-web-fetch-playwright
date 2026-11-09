@@ -190,6 +190,19 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
         onEdit={(text) => { props.edit('challengeWaitMs', text) }}
         onReset={() => { props.resetField('challengeWaitMs') }}
       />
+      <ValueField
+        id="plugin-config-playwright-scroll-budget"
+        label={t('scrollBudgetMs')}
+        hint={t('scrollBudgetMsHint')}
+        placeholder={t('scrollBudgetMsPlaceholder')}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        invalidLabel={t('invalidText')}
+        disabled={disabled}
+        {...state.scrollBudgetMs}
+        onEdit={(text) => { props.edit('scrollBudgetMs', text) }}
+        onReset={() => { props.resetField('scrollBudgetMs') }}
+      />
     </CardForm>
   )
 }

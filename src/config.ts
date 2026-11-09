@@ -15,6 +15,11 @@
 
 import type { Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { DEFAULT_SCROLL_BUDGET_MS, MAX_SCROLL_BUDGET_MS } from './autoscroll.ts'
+
+// Re-exported for consumers that read the settings surface (the schema's
+// bounds belong with the schema, the walk's knobs with the walk).
+export { DEFAULT_SCROLL_BUDGET_MS, MAX_SCROLL_BUDGET_MS } from './autoscroll.ts'
 
 /** Default CDP endpoint when the settings section leaves it blank. */
 export const DEFAULT_CDP_ENDPOINT = '127.0.0.1:9222'
@@ -110,6 +115,15 @@ export interface Config {
    */
   challengeRetries?: number
   /**
+   * Bounded budget (ms) for the deep-capture scroll walk — the in-page pass
+   * that defeats viewport virtualization on feed-shaped pages (Discourse
+   * topic streams: replies outside the render window are empty height-only
+   * placeholders carrying the post's id; see `src/autoscroll.ts`). `0`
+   * restores the legacy single-instant capture.
+   * Schema default: {@link DEFAULT_SCROLL_BUDGET_MS}.
+   */
+  scrollBudgetMs?: number
+  /**
    * How many fetches may render at once. Blank = backend default (4 for
    * local — each slot launches a browser; 50 for CDP — each slot is a tab in
    * the already-running remote browser).
@@ -135,6 +149,8 @@ export const Config = z.object({
   // The bounded natural-wait knobs; 0 disables the whole challenge path.
   challengeWaitMs: z.number().step(100).min(0).max(MAX_CHALLENGE_WAIT_MS).default(DEFAULT_CHALLENGE_WAIT_MS).volatile(),
   challengeRetries: z.number().step(1).min(0).max(MAX_CHALLENGE_RETRIES).default(DEFAULT_CHALLENGE_RETRIES).volatile(),
+  // The deep-capture scroll walk's bounded budget; 0 disables the walk.
+  scrollBudgetMs: z.number().step(100).min(0).max(MAX_SCROLL_BUDGET_MS).default(DEFAULT_SCROLL_BUDGET_MS).volatile(),
 })
 
 /**
@@ -164,6 +180,8 @@ export interface PlaywrightPluginConfig {
   challengeWaitMs: Volatile<number>
   /** Challenge retry count as a live reference. */
   challengeRetries: Volatile<number>
+  /** Deep-capture scroll-walk budget (ms) as a live reference. */
+  scrollBudgetMs: Volatile<number>
 }
 
 /**
@@ -185,6 +203,7 @@ export function snapshotsOf(config: PlaywrightPluginConfig): Config {
     maxConcurrency: config.maxConcurrency.get(),
     challengeWaitMs: config.challengeWaitMs.get(),
     challengeRetries: config.challengeRetries.get(),
+    scrollBudgetMs: config.scrollBudgetMs.get(),
   }
 }
 
@@ -210,15 +229,19 @@ export function resolveConfig(config: Partial<Config>): ResolvedConfig {
     maxConcurrency: resolved.maxConcurrency.get(),
     challengeWaitMs: resolved.challengeWaitMs.get(),
     challengeRetries: resolved.challengeRetries.get(),
+    scrollBudgetMs: resolved.scrollBudgetMs.get(),
   }
 }
 
 /**
  * Complete config after schemastery applies the field defaults it owns.
- * `maxConcurrency` stays optional — {@link effectiveMaxConcurrency} resolves
- * it against the backend.
+ * `maxConcurrency` and `scrollBudgetMs` stay optional — the former because
+ * its effective default depends on `backend`, the latter so hand-built
+ * resolved configs (tests) may omit it and let
+ * {@link effectiveScrollBudgetMs} supply the default the schema would have.
  */
-export type ResolvedConfig = Omit<Required<Config>, 'maxConcurrency'> & { maxConcurrency?: number }
+export type ResolvedConfig = Omit<Required<Config>, 'maxConcurrency' | 'scrollBudgetMs'>
+  & { maxConcurrency?: number; scrollBudgetMs?: number }
 
 /**
  * The concurrency limit a fetch actually runs with: an explicit setting
@@ -255,6 +278,18 @@ export function effectiveChallengeWaitMs(config: Pick<Config, 'challengeWaitMs'>
 export function effectiveChallengeRetries(config: Pick<Config, 'challengeRetries'>): number {
   if (typeof config.challengeRetries === 'number') return config.challengeRetries
   return DEFAULT_CHALLENGE_RETRIES
+}
+
+/**
+ * The scroll-walk budget a fetch actually runs with: an explicit setting
+ * wins, else the schema default. `0` means the deep-capture walk is off.
+ *
+ * @param config - the resolved settings section (or any partial of it).
+ * @returns the bounded walk budget in milliseconds.
+ */
+export function effectiveScrollBudgetMs(config: Pick<Config, 'scrollBudgetMs'>): number {
+  if (typeof config.scrollBudgetMs === 'number') return config.scrollBudgetMs
+  return DEFAULT_SCROLL_BUDGET_MS
 }
 
 /**

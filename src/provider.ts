@@ -50,6 +50,24 @@
  * fails with {@link WEB_FETCH_CHALLENGE_CODE} instead of returning the
  * interstitial as content.
  *
+ * Deep capture (viewport-virtualized feeds): feed-shaped pages — Discourse
+ * topic streams, comment threads, timelines — render only the items near the
+ * scroll position; everything else is an empty, height-only placeholder that
+ * keeps the item's id but none of its content, so a single-instant capture
+ * hands back the skeleton while the bodies silently vanish (and the denoise
+ * pipeline's coverage gate cannot notice: the page's own visible text is the
+ * same windowed fragment as the extraction). Before serialization the fetch
+ * therefore runs one bounded in-page scroll walk — stashing what each
+ * rendered window shows, terminating only AT the bottom with the height
+ * stable (that is what pages load-more sentinels; height stability elsewhere
+ * proves nothing), then rehydrating degraded id-bearing elements from their
+ * stashed snapshots so the final DOM holds the union of every window in
+ * document order. The existing pipeline then runs unchanged. Bounded by
+ * `scrollBudgetMs` (default 20s; 0 restores the legacy single-instant
+ * behavior) and by the remaining fetch deadline; any walk failure silently
+ * degrades to the legacy capture (see `src/autoscroll.ts` for the measured
+ * linux.do badcase).
+ *
  * @module dsh-web-fetch-playwright/provider
  */
 
@@ -57,7 +75,8 @@ import { WebError } from '@deepseek-ai/dsh-web'
 import type { WebFetchProvider, WebFetchRequest, WebFetchResult } from '@deepseek-ai/dsh-web'
 import { CHALLENGE_DOM_PROBE, CHALLENGE_FINISH_RESERVE_MS, CHALLENGE_POLL_INTERVAL_MS, classifyChallengeHtml, classifyChallengeResponse, isChallengeCompatibleResponse } from './challenge.ts'
 import type { ChallengeVerdict } from './challenge.ts'
-import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveMaxConcurrency, normalizeCdpEndpoint } from './config.ts'
+import { deepCaptureWalk, SCROLL_FINISH_RESERVE_MS } from './autoscroll.ts'
+import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveMaxConcurrency, effectiveScrollBudgetMs, normalizeCdpEndpoint } from './config.ts'
 import type { ResolvedConfig } from './config.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
 import { htmlToMarkdown } from './markdown.ts'
@@ -534,6 +553,21 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     // Best-effort settle for client-rendered content; a timeout just keeps
     // what domcontentloaded already produced.
     await page.waitForLoadState('networkidle', { timeout: Math.min(SETTLE_MS, deadline.remainingMs()) }).catch(() => {})
+
+    // Deep capture (issue: viewport-virtualized feeds lose their content at
+    // rest): Discourse-class pages keep only the posts near the scroll
+    // position in the DOM — everything else is an empty placeholder carrying
+    // the post's id — so a single-instant capture returns a skeleton. The
+    // walk steps through the document, stashes what each window renders, and
+    // rehydrates the placeholders from those snapshots before serialization
+    // (see `src/autoscroll.ts`). HTML documents only, always inside the
+    // deadline with a decode reserve, silently degrading to the legacy
+    // capture; `scrollBudgetMs: 0` skips it entirely.
+    const scrollBudgetMs = Math.min(
+      effectiveScrollBudgetMs(config),
+      deadline.remainingMs() - SCROLL_FINISH_RESERVE_MS,
+    )
+    if (scrollBudgetMs > 0) await deepCaptureWalk(page, scrollBudgetMs)
 
     // Serialization safety: the document is about to be flattened into an
     // HTML string and re-parsed by jsdom, and scripting elements are the one
