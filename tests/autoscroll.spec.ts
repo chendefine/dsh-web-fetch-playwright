@@ -9,6 +9,8 @@ import {
   DEFAULT_SCROLL_BUDGET_MS,
   SCROLL_BOTTOM_PATIENCE_MS,
   SCROLL_BOTTOM_POLL_MS,
+  SCROLL_CONTAINER_MIN_RANGE_PX,
+  SCROLL_CONTAINER_MIN_RANGE_RATIO,
   SCROLL_MAX_STEPS,
   SCROLL_MIN_BUDGET_MS,
   SCROLL_STEP_MOTION_MS,
@@ -46,9 +48,20 @@ describe('deepCaptureScript', () => {
     expect(script).toContain(`BOTTOM_PATIENCE_MS = ${String(SCROLL_BOTTOM_PATIENCE_MS)}`)
     expect(script).toContain(`MAX_STEPS = ${String(SCROLL_MAX_STEPS)}`)
     expect(script).toContain(`STASH_MAX_ENTRY_CHARS = ${String(SCROLL_STASH_MAX_ENTRY_CHARS)}`)
+    expect(script).toContain(`CONTAINER_MIN_RANGE_PX = ${String(SCROLL_CONTAINER_MIN_RANGE_PX)}`)
+    expect(script).toContain(`CONTAINER_MIN_RATIO = ${String(SCROLL_CONTAINER_MIN_RANGE_RATIO)}`)
     // The walk's load-bearing invariants, stated where a maintainer will read them.
     expect(script).toContain('BOTTOM_PATIENCE_MS) {')
     expect(script).toContain('grown !== lastHeight')
+    // The app-shell rails: walk the dominant inner scroll container when the
+    // document itself does not scroll (the Feishu badcase), key the stash by
+    // data-block-id where blocks carry no id, and splice REMOVED keys back.
+    expect(script).toContain('function findScrollContainer()')
+    expect(script).toContain('getComputedStyle(el).overflowY')
+    expect(script).toContain("querySelectorAll('[id], [data-block-id]')")
+    expect(script).toContain("'data-block-id:' + raw")
+    expect(script).toContain('insertAdjacentHTML')
+    expect(script).toContain('spliced += chosen.length')
     // An async IIFE expression is what page.evaluate accepts as a string.
     expect(script.startsWith('(async () => {')).toBe(true)
     expect(script.endsWith('})()')).toBe(true)
@@ -62,7 +75,7 @@ describe('deepCaptureScript', () => {
 
 describe('deepCaptureWalk', () => {
   it('returns the stats object the page resolved', async () => {
-    const stats = { steps: 9, stashed: 44, rehydrated: 31, elapsedMs: 4_100, height: 8_955 }
+    const stats = { steps: 9, stashed: 44, rehydrated: 31, spliced: 27, elapsedMs: 4_100, height: 8_955 }
     const { page, scripts } = fakePage({ result: stats })
     await expect(deepCaptureWalk(page, DEFAULT_SCROLL_BUDGET_MS)).resolves.toEqual(stats)
     expect(scripts).toHaveLength(1)

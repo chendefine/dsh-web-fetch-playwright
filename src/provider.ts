@@ -50,23 +50,30 @@
  * fails with {@link WEB_FETCH_CHALLENGE_CODE} instead of returning the
  * interstitial as content.
  *
- * Deep capture (viewport-virtualized feeds): feed-shaped pages — Discourse
- * topic streams, comment threads, timelines — render only the items near the
- * scroll position; everything else is an empty, height-only placeholder that
- * keeps the item's id but none of its content, so a single-instant capture
- * hands back the skeleton while the bodies silently vanish (and the denoise
- * pipeline's coverage gate cannot notice: the page's own visible text is the
- * same windowed fragment as the extraction). Before serialization the fetch
- * therefore runs one bounded in-page scroll walk — stashing what each
- * rendered window shows, terminating only AT the bottom with the height
- * stable (that is what pages load-more sentinels; height stability elsewhere
- * proves nothing), then rehydrating degraded id-bearing elements from their
- * stashed snapshots so the final DOM holds the union of every window in
- * document order. The existing pipeline then runs unchanged. Bounded by
+ * Deep capture (viewport-virtualized feeds and app-shell documents): feed-
+ * shaped pages — Discourse topic streams, comment threads, timelines —
+ * render only the items near the scroll position; everything else is an
+ * empty, height-only placeholder that keeps the item's id but none of its
+ * content, so a single-instant capture hands back the skeleton while the
+ * bodies silently vanish (and the denoise pipeline's coverage gate cannot
+ * notice: the page's own visible text is the same windowed fragment as the
+ * extraction). App-shell document editors (Feishu docs) push the same
+ * pathology one level down: the body never scrolls, blocks are keyed by
+ * data-block-id with no id, and off-window blocks are REMOVED behind an
+ * anonymous height spacer — the fetch would return just the statically
+ * rendered first screen. Before serialization the fetch therefore runs one
+ * bounded in-page scroll walk — over the window or, when the document does
+ * not scroll, the page's dominant inner scroll container — stashing what
+ * each rendered window shows, terminating only AT the bottom with the
+ * height stable (that is what pages load-more sentinels; height stability
+ * elsewhere proves nothing), then rehydrating degraded keyed elements from
+ * their stashed snapshots and splicing removed keys back at their document
+ * position so the final DOM holds the union of every window in document
+ * order. The existing pipeline then runs unchanged. Bounded by
  * `scrollBudgetMs` (default 20s; 0 restores the legacy single-instant
  * behavior) and by the remaining fetch deadline; any walk failure silently
  * degrades to the legacy capture (see `src/autoscroll.ts` for the measured
- * linux.do badcase).
+ * linux.do and Feishu badcases).
  *
  * @module dsh-web-fetch-playwright/provider
  */

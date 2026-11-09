@@ -154,6 +154,12 @@ beforeAll(async () => {
       res.end(virtualizedTopicPage())
       return
     }
+    if (url.startsWith('/appshell/')) {
+      // The app-shell deep-capture badcase page (built at the bottom of this file).
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      res.end(appShellDocPage())
+      return
+    }
     if (url.startsWith('/rewrite/')) {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
       res.end(REWRITE_PAGE)
@@ -989,6 +995,105 @@ function virtualizedTopicPage(): string {
 </body></html>`
 }
 
+/**
+ * The app-shell deep-capture badcase (a Feishu wiki document —
+ * bocha-ai.feishu.cn — is the measured shape), rebuilt deterministically:
+ * html/body are locked at exactly one viewport so the DOCUMENT never
+ * scrolls — all content lives inside ONE overflow-y container — blocks are
+ * keyed ONLY by data-block-id (no id attributes at all, exactly like the
+ * real bear editor), off-window blocks are REMOVED from the DOM (the
+ * un-rendered regions held open by anonymous explicit-height spacers,
+ * Feishu's .bear-virtual-renderUnit-placeholder), and further chunks load
+ * lazily as the bottom nears. A resting single-instant capture therefore
+ * returns only the statically rendered first screen: the walk must detect
+ * the inner scroll container, drive IT, and splice the removed blocks back.
+ */
+function appShellDocPage(): string {
+  return `<!doctype html><html lang="en"><head><title>App-shell document - Bocha Wiki</title>
+<style>
+  html, body { height: 100%; margin: 0; overflow: hidden; }
+  #shell { display: flex; height: 100%; font-family: sans-serif; }
+  #side { width: 200px; overflow-y: auto; background: #f2f2f2; }
+  #bear-web-x-container { flex: 1; overflow-y: auto; }
+  .block { height: 130px; box-sizing: border-box; padding: 8px; border-bottom: 1px solid #ddd; }
+  .bear-virtual-renderUnit-placeholder { border: 0; }
+</style></head>
+<body>
+<div id="shell">
+  <aside id="side"><div style="height:1400px">side panel noise</div></aside>
+  <main id="bear-web-x-container"><div id="render-unit-wrapper"></div></main>
+</div>
+<script>
+  var TOTAL = 40, loaded = 15, H = 130;
+  var scroller = document.getElementById('bear-web-x-container');
+  var wrap = document.getElementById('render-unit-wrapper');
+  var spacerTop = document.createElement('div');
+  spacerTop.className = 'bear-virtual-renderUnit-placeholder';
+  var spacerBottom = document.createElement('div');
+  spacerBottom.className = 'bear-virtual-renderUnit-placeholder';
+  wrap.appendChild(spacerTop);
+  wrap.appendChild(spacerBottom);
+  var rendered = {};
+  function blockEl(n) {
+    var el = document.createElement('div');
+    el.className = 'block docx-text-block';
+    el.setAttribute('data-block-id', String(n));
+    el.innerHTML = '<h2>Doc block ' + n + ' by author' + n + '</h2>'
+      + '<p>Body prose for block ' + n + ': the quick brown fox jumps over the lazy dog, '
+      + 'and enough text follows so the article extractor scores the document stream as the main region. '
+      + 'MARKER-BLOCK-' + n + ' ends this block.</p>';
+    return el;
+  }
+  // The bear engine's windowed rendering: blocks whose fixed-height offsets
+  // fall outside [scrollTop - 1.2 viewports, scrollTop + 2.2 viewports] are
+  // REMOVED; two anonymous spacers hold the un-rendered regions' heights.
+  function refresh() {
+    var top = scroller.scrollTop, vh = scroller.clientHeight;
+    var lo = top - vh * 1.2, hi = top + vh * 2.2;
+    var want = {};
+    for (var n = 1; n <= loaded; n++) {
+      var y = (n - 1) * H;
+      if (y + H >= lo && y <= hi) want[n] = true;
+    }
+    for (var k in rendered) {
+      if (!want[k]) { rendered[k].remove(); delete rendered[k]; }
+    }
+    var anchor = spacerBottom;
+    for (var n2 = loaded; n2 >= 1; n2--) {
+      if (!want[n2]) continue;
+      if (!rendered[n2]) {
+        var el = blockEl(n2);
+        rendered[n2] = el;
+        wrap.insertBefore(el, anchor);
+      }
+      anchor = rendered[n2];
+    }
+    var above = 0, below = 0, seen = false;
+    for (var m = 1; m <= loaded; m++) {
+      if (want[m]) { seen = true; continue; }
+      if (seen) below += H; else above += H;
+    }
+    spacerTop.style.height = above + 'px';
+    spacerBottom.style.height = below + 'px';
+    if (loaded < TOTAL && top + vh >= loaded * H - 300) maybeLoadMore();
+  }
+  // Lazy chunk loading, like the real editor fetching more of the document.
+  var loading = false;
+  function maybeLoadMore() {
+    if (loading) return;
+    loading = true;
+    setTimeout(function () {
+      for (var j = 0; j < 10 && loaded < TOTAL; j++) loaded++;
+      loading = false;
+      refresh();
+    }, 250);
+  }
+  scroller.addEventListener('scroll', function () { refresh(); });
+  refresh();
+</script>
+</body></html>`
+}
+
 describe('PlaywrightFetchProvider deep capture (viewport-virtualized topic)', () => {
   function localConfig(over: { scrollBudgetMs?: number }) {
     return () => ({
@@ -1077,6 +1182,83 @@ describe('PlaywrightFetchProvider deep capture (viewport-virtualized topic)', ()
     expect(text).toContain('The rendered body text.')
     expect(text).not.toContain('nav link')
     expect(text).not.toContain('footer noise')
+    await provider.dispose()
+  })
+})
+
+describe('PlaywrightFetchProvider deep capture (app-shell inner scroll container)', () => {
+  function localConfig(over: { scrollBudgetMs?: number }) {
+    return () => ({
+      backend: 'local' as const,
+      playwrightPath: '',
+      cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
+      shareBrowserContext: true,
+      denoise: true,
+      maxConcurrency: 4,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
+      ...over,
+    })
+  }
+
+  it('baseline (scrollBudgetMs 0): the resting capture is the statically rendered first screen', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping app-shell baseline (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(localConfig({ scrollBudgetMs: 0 }))
+    const result = await provider.fetch({ url: `${baseUrl}appshell/` })
+    const text = result.body.kind === 'text' ? result.body.content : ''
+    // The document never scrolls and the render window holds only the first
+    // ~13 blocks; everything past it was REMOVED from the DOM, not cloaked.
+    expect(text).toContain('MARKER-BLOCK-3')
+    expect(text).not.toContain('MARKER-BLOCK-15')
+    // Nothing past the first lazy chunk is even loaded without scrolling.
+    expect(text).not.toContain('MARKER-BLOCK-30')
+    await provider.dispose()
+  })
+
+  it('feature on: the walk drives the inner container and splices every removed block back', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping app-shell feature case (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(localConfig({}))
+    const result = await provider.fetch({ url: `${baseUrl}appshell/` })
+    const text = result.body.kind === 'text' ? result.body.content : ''
+    // First screen, a block the engine removed mid-walk, a lazily loaded
+    // chunk, and the final block of the document — the splice restored the
+    // union of every window in document order.
+    for (const marker of ['MARKER-BLOCK-1', 'MARKER-BLOCK-16', 'MARKER-BLOCK-26', 'MARKER-BLOCK-40']) {
+      expect(text).toContain(marker)
+    }
+    // No block was duplicated by the splice (blocks appear exactly once).
+    expect(text.split('MARKER-BLOCK-16').length - 1).toBe(1)
+    await provider.dispose()
+  })
+
+  it('feature on with denoise off: the raw HTML path carries the spliced blocks too', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping app-shell raw-html case (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'local',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
+      shareBrowserContext: true,
+      denoise: false,
+      maxConcurrency: 4,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
+      scrollBudgetMs: 10_000,
+    }))
+    const result = await provider.fetch({ url: `${baseUrl}appshell/` })
+    const html = result.body.kind === 'html' ? result.body.content : ''
+    expect(html).toContain('MARKER-BLOCK-40')
+    expect(html).toContain('data-block-id="38"')
     await provider.dispose()
   })
 })
