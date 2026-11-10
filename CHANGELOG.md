@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Deep capture now restores virtualized rows that have no DOM identity.** Until now the walk could restore only elements keyed by `id` or `data-block-id`. Lists whose rows carry no key (react-window, X-style timelines, where the framework key never reaches the DOM) came back as just the walk's final window. The walk now harvests such rows when the engine removes them: the `MutationObserver` record holds the detached row intact, plus the sibling nodes it sat between. The merge then splices each row back into its list, using no layout. Measured on the public react-window demo (1,000 unkeyed rows): rows 129–142 before, rows 1–155 in order with no duplicates after (stopped by the 20s budget). Details in the README's deep-capture section. New stats: `restored`, `rewound`.
+- **Framework-generated ids are no longer treated as keys.** Ember's `emberN` and React `useId` values (`:r1:`, `«r1»`, `_r_1_`) change on every render, so they only ever stashed snapshots that could never match. Elements with these ids now take the unkeyed path.
+- **A walk that restores nothing no longer hands the provider the bottom of the page.** The live read used to happen wherever the walk stopped. On a virtualizer the merge cannot rebuild (rows without text, canvas), that meant the last window replaced the opening screen the legacy capture returned. When the page reacted to scrolling, the walk now scrolls back to where it opened and waits for the page to settle before the read.
+- A keyed wrapper around a restored list is never swapped for its one-window snapshot. The swap treats restored lists and their ancestors as containers.
 - **The denoise input cap now applies on every path into the pipeline.** Previously only the live-render path capped the input. The unrenderable-loader fallback and the download/attachment refetch passed the whole body, and a multi-MB page could exhaust the heap. A cut input marks the result `truncated`.
 
 ### Added

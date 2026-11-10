@@ -165,6 +165,12 @@ beforeAll(async () => {
       }))
       return
     }
+    if (url.startsWith('/unkeyed/')) {
+      // The unkeyed-row deep-capture case (built at the bottom of this file).
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      res.end(unkeyedTimelinePage({ wholesale: url.includes('wholesale') }))
+      return
+    }
     if (url.startsWith('/longstatic/')) {
       // A long, plain, NON-virtualized article: the walk's cost control.
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
@@ -1230,6 +1236,78 @@ function appShellDocPage(opts: { anchored: boolean } = { anchored: false }): str
 }
 
 /**
+ * The unkeyed virtualizer shape (react-window rows, X-style timeline cells):
+ * rows carry NO id and no per-row attribute — every cell shares the same
+ * `data-testid`, because the framework key never reaches the DOM — and are
+ * absolutely positioned by `transform`, so their DOM order says nothing
+ * about layout. Rows outside the render window are REMOVED and re-created
+ * as new nodes on re-entry. `wholesale`: the engine re-renders the whole
+ * window via innerHTML on every scroll (no row survives to anchor others).
+ */
+function unkeyedTimelinePage(opts: { wholesale: boolean }): string {
+  return `<!doctype html><html lang="en"><head><title>Unkeyed timeline - Test Social</title>
+<style>
+  body { margin: 0; font-family: sans-serif; }
+  header { height: 60px; background: #eee; }
+  main { max-width: 640px; margin: 0 auto; }
+  #timeline { position: relative; }
+  .cell { position: absolute; left: 0; right: 0; height: 140px; box-sizing: border-box; padding: 8px; border-bottom: 1px solid #ddd; }
+</style></head>
+<body>
+<header><span>Test Social — header noise</span></header>
+<main>
+  <h1>Unkeyed timeline</h1>
+  <div id="timeline" aria-label="Timeline"><div class="list"></div></div>
+</main>
+<script>
+  var TOTAL = 60, H = 140, WHOLESALE = ${String(opts.wholesale)};
+  var timeline = document.getElementById('timeline');
+  var list = timeline.firstElementChild;
+  timeline.style.height = (TOTAL * H) + 'px';
+  function cellHtml(n) {
+    return '<div class="cell" data-testid="cellInnerDiv" style="transform: translateY(' + ((n - 1) * H) + 'px)">'
+      + '<article><h2>Post ' + n + ' by handle' + n + '</h2>'
+      + '<p>Post body ' + n + ': the quick brown fox jumps over the lazy dog, and enough prose '
+      + 'follows so the extractor scores the timeline as the main region. MARKER-ROW-' + n + ' ends it.</p>'
+      + '</article></div>';
+  }
+  var live = {};
+  function refresh() {
+    var origin = timeline.getBoundingClientRect().top + window.scrollY;
+    var lo = window.scrollY - origin - window.innerHeight, hi = window.scrollY - origin + window.innerHeight * 2;
+    var want = [];
+    for (var n = 1; n <= TOTAL; n++) {
+      var y = (n - 1) * H;
+      if (y + H >= lo && y <= hi) want.push(n);
+    }
+    if (WHOLESALE) { list.innerHTML = want.map(cellHtml).join(''); return; }
+    var keep = {};
+    want.forEach(function (n) { keep[n] = true; });
+    for (var k in live) if (!keep[k]) { live[k].remove(); delete live[k]; }
+    var anchor = null;
+    for (var i = want.length - 1; i >= 0; i--) {
+      var m = want[i];
+      if (!live[m]) {
+        var t = document.createElement('template');
+        t.innerHTML = cellHtml(m);
+        live[m] = t.content.firstElementChild;
+        list.insertBefore(live[m], anchor);
+      }
+      anchor = live[m];
+    }
+  }
+  var queued = false;
+  window.addEventListener('scroll', function () {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(function () { queued = false; refresh(); });
+  });
+  refresh();
+</script>
+</body></html>`
+}
+
+/**
  * A long, plain article with NO virtualization (~30 viewports of static
  * prose, id-anchored headings): the shape of most of the web. Nothing here
  * reacts to scrolling, so the deep-capture walk can only cost latency —
@@ -1480,6 +1558,70 @@ describe('PlaywrightFetchProvider deep capture (app-shell inner scroll container
     const html = result.body.kind === 'html' ? result.body.content : ''
     expect(html).toContain('MARKER-BLOCK-40')
     expect(html).toContain('data-block-id="38"')
+    await provider.dispose()
+  })
+})
+
+describe('PlaywrightFetchProvider deep capture (unkeyed virtualized rows)', () => {
+  function localConfig(over: { scrollBudgetMs?: number; denoise?: boolean }) {
+    return () => ({
+      backend: 'local' as const,
+      playwrightPath: '',
+      cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
+      shareBrowserContext: true,
+      denoise: true,
+      maxConcurrency: 4,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
+      ...over,
+    })
+  }
+
+  /** Every MARKER-ROW-n exactly once, in document order. */
+  function expectWholeTimeline(text: string): void {
+    let last = -1
+    for (let n = 1; n <= 60; n++) {
+      const marker = `MARKER-ROW-${String(n)} `
+      expect(text.split(marker).length - 1, marker).toBe(1)
+      const at = text.indexOf(marker)
+      expect(at, `${marker} out of document order`).toBeGreaterThan(last)
+      last = at
+    }
+  }
+
+  it('baseline (scrollBudgetMs 0): the resting capture holds only the opening window', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping unkeyed baseline (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(localConfig({ scrollBudgetMs: 0 }))
+    const result = await provider.fetch({ url: `${baseUrl}unkeyed/` })
+    const text = result.body.kind === 'text' ? result.body.content : ''
+    expect(text).toContain('MARKER-ROW-1 ')
+    expect(text).not.toContain('MARKER-ROW-30 ')
+    await provider.dispose()
+  })
+
+  it('feature on: rows with no DOM identity are restored whole, once each, in order', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping unkeyed feature case (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(localConfig({}))
+    const result = await provider.fetch({ url: `${baseUrl}unkeyed/` })
+    expectWholeTimeline(result.body.kind === 'text' ? result.body.content : '')
+    await provider.dispose()
+  })
+
+  it('a window re-rendered wholesale via innerHTML is restored whole too', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping unkeyed wholesale case (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(localConfig({}))
+    const result = await provider.fetch({ url: `${baseUrl}unkeyed/?wholesale` })
+    expectWholeTimeline(result.body.kind === 'text' ? result.body.content : '')
     await provider.dispose()
   })
 })

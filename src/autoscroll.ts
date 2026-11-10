@@ -72,6 +72,14 @@
  *    jumped over may hold content that never rendered, so the walk rewinds
  *    to where it jumped from and finishes carefully. Correctness never
  *    rests on the warm-up guess; only the cost of a scroll-inert page does.
+ *
+ *    The same observer HARVESTS UNKEYED ROWS — the third shape: react-window
+ *    lists and X-style timelines give rows no DOM identity at all (the
+ *    framework key never reaches the DOM), and framework-generated ids
+ *    (`ember123`, React useId's `:r1:`) change per render so they are not
+ *    keys either. When the engine removes such a row, the record still
+ *    holds it whole plus the sibling nodes it sat between; that is the row's
+ *    stash and its splice anchor, with no layout read at all.
  * 4. MERGE into a structural clone (`document.cloneNode(true)`: no
  *    serialize/re-parse round trip — a runtime-rewritten data script with a
  *    literal `</script>` in its text cannot corrupt it — and, having no
@@ -85,11 +93,21 @@
  *      spliced parent is already present and skipped. Placement is
  *      structural, so it is right whatever order the walk SAW rows in (an
  *      anchored open starts mid-document).
+ *    - RESTORE (unkeyed rows): in every list the engine both removed text-
+ *      bearing rows from and added to during the walk, each removed row the
+ *      list no longer holds goes back beside the sibling it was removed
+ *      next to (chains through removed anchors; rows with no surviving
+ *      anchor at all — a wholesale innerHTML re-render — go above the final
+ *      window, which is the only place a top-down walk loses them). Rows
+ *      still present are recognised by a per-list identity attribute
+ *      (data-index, aria-rowindex, …) or by text; in-place stubs are
+ *      absorbed.
  *    - SWAP: every keyed element emptier than its snapshot (fewer child
  *      elements, or meaningfully less text — the Discourse placeholder) is
  *      replaced by that snapshot, except containers (ancestors of another
  *      element being swapped), which are assembled from those descendants
- *      instead: a container's own snapshot is one window's partial view.
+ *      instead: a container's own snapshot is one window's partial view. A
+ *      restored list and its ancestors are containers too.
  *    The clone is then stripped of scripting elements and serialized; the
  *    provider reads that string instead of the live page. The live document
  *    is never rewritten, so no late scroll/rAF/timer reaction can touch the
@@ -99,7 +117,9 @@
  * error, or an engine that rejects the walk just keeps the legacy
  * single-instant capture — a walk can only add content, never fail a fetch.
  * A walk that restored nothing returns no HTML, and the provider reads the
- * live page exactly as before.
+ * live page exactly as before — scrolled back to where it opened when the
+ * page reacted, so a virtualizer the merge could not rebuild hands over its
+ * opening window rather than the walk's last one.
  *
  * The walk runs in BOTH denoise modes (the raw-HTML path serializes the same
  * cloaked placeholders) but never for non-HTML documents. It is bounded by
@@ -225,6 +245,14 @@ export interface DeepCaptureStats {
   rehydrated: number
   /** Removed keyed elements spliced back (container walks only). */
   spliced?: number
+  /** Unkeyed rows a virtualizer removed, restored into their list. */
+  restored?: number
+  /**
+   * True when nothing could be restored on a page that reacted, so the walk
+   * scrolled back to where the page opened before handing it to the
+   * provider's live read.
+   */
+  rewound?: boolean
   /**
    * Whether the page reacted to scrolling (added/removed elements). False
    * means the walk took the scroll-inert fast path to the bottom.
@@ -340,8 +368,13 @@ export async function deepCaptureInPage(p: DeepCaptureParams, strip: (doc: Docum
   // ── Identity ────────────────────────────────────────────────────────────
   // id, else data-block-id (namespaced so the two can never collide): app-
   // shell editors key their blocks that way and carry no id at all.
+  // Framework-GENERATED ids are per-render, not identities: a row re-rendered
+  // by Ember (`ember123`) or React's useId (`:r1:`, `«r1»`, `_r_1_`) comes
+  // back under a new id, so keying on one only ever stashes dead snapshots.
+  // Such elements count as unkeyed and take the unkeyed-row path below.
+  const GENERATED_ID = /^ember\d+$|:r[0-9a-z]*:|«r[0-9a-z]*»|^_r_[0-9a-z]+_$/
   function keyOf(el: Element): string | null {
-    if (el.id !== '') return el.id
+    if (el.id !== '' && !GENERATED_ID.test(el.id)) return el.id
     const block = el.getAttribute('data-block-id')
     return block !== null && block !== '' ? `data-block-id:${block}` : null
   }
@@ -370,10 +403,11 @@ export async function deepCaptureInPage(p: DeepCaptureParams, strip: (doc: Docum
   const tally = (records: MutationRecord[]): void => {
     for (const record of records) {
       if (counts(record.addedNodes) || counts(record.removedNodes)) reactions++
+      harvest(record)
     }
   }
-  const observer = new MutationObserver(tally)
-  observer.observe(body, { childList: true, subtree: true })
+  // (The observer itself starts below, once the unkeyed-row harvest it
+  // feeds is declared.)
   const reacted = (): boolean => { tally(observer.takeRecords()); return reactions > 0 }
   // Data requests (fetch/XHR): the other sign of a feed loading more.
   // Images, fonts and beacons are not. Observed rather than read from the
@@ -416,6 +450,118 @@ export async function deepCaptureInPage(p: DeepCaptureParams, strip: (doc: Docum
   const stash = new Map<string, Snapshot>()
   const oversized = new Set<string>()
   let stashChars = 0
+
+  // ── Unkeyed rows ───────────────────────────────────────────────────────
+  // Many virtualizers give their rows no DOM identity at all (react-window
+  // rows, X-style timeline cells: the framework key never reaches the DOM).
+  // Such a row is harvested at the instant the engine REMOVES it: the
+  // MutationObserver record hands over the detached row, still whole, plus
+  // the sibling nodes it sat between — enough to splice it back into the
+  // same list at merge without reading any layout (absolute positioning and
+  // transforms do not matter). Nodes are tracked by object identity, so
+  // even an anonymous spacer or a row filtered out as noise still anchors
+  // its neighbors.
+  const ROW_IDENT_ATTRS = [
+    'data-index', 'data-item-index', 'data-row-index', 'data-rowindex', 'aria-rowindex', 'aria-posinset',
+    'data-key', 'data-row-key', 'data-item-key', 'data-id', 'data-item-id',
+  ]
+  // Transient UI — toasts, live status, spinners, menus — is never content.
+  const NOISE_ROLES = new Set(['status', 'alert', 'alertdialog', 'dialog', 'tooltip', 'progressbar', 'menu', 'listbox', 'timer', 'marquee'])
+  const squash = (s: string): string => s.replace(/\s+/g, ' ').trim()
+  // Identity for de-duplication against the rows still live: a per-LIST
+  // attribute when the engine sets one (scoped to the list, so data-index
+  // values repeating across lists cannot collide), else the row's text.
+  function rowIdent(el: Element): string | null {
+    for (const attr of ROW_IDENT_ATTRS) {
+      const value = el.getAttribute(attr)
+      if (value !== null && value !== '') return `${attr}=${value}`
+    }
+    return null
+  }
+  function rowText(el: Element): string | null {
+    if (keyOf(el) !== null || INERT_TAGS.has(el.nodeName) || el.namespaceURI === SVG_NS) return null
+    if (el.hasAttribute('hidden') || el.getAttribute('aria-hidden') === 'true' || el.getAttribute('aria-busy') === 'true') return null
+    const role = el.getAttribute('role')
+    if (role !== null && NOISE_ROLES.has(role)) return null
+    const text = squash(el.textContent ?? '')
+    return text === '' ? null : text
+  }
+  interface Removal {
+    row: { node: Element; text: string; ident: string | null; len: number } | null // null: anchor-only ghost
+    /** A ghost repeating an already-stashed row: the node that holds its copy. */
+    same?: Node
+    parent: Node
+    prev: Node | null
+    next: Node | null
+    seq: number
+  }
+  const removals = new Map<Node, Removal>()
+  // Per list: the one stashed copy of each row identity. An engine that
+  // re-renders every frame removes the same row thousands of times; only
+  // the first sighting (richest wins) is stashed, the rest only anchor.
+  const rowsSeen = new Map<Node, Map<string, Node>>()
+  const lists = new Map<Node, { rows: number; added: number }>()
+  const addedNodes = new WeakSet<Node>()
+  let removalSeq = 0
+  let rowsStashed = 0
+  // Its OWN character budget: rows churned inside keyed content (a forum
+  // engine re-rendering post internals) must never starve the keyed stash,
+  // which is what the established feed shapes rely on.
+  let rowChars = 0
+  // Anchor-only bookkeeping is cheap but holds detached nodes alive.
+  const MAX_REMOVALS = 50_000
+  function harvest(record: MutationRecord): void {
+    const parent = record.target
+    if (record.type !== 'childList' || parent.nodeType !== 1 || parent === body || !parent.isConnected) return
+    if (scroller !== null ? !scroller.contains(parent) : !body.contains(parent)) return
+    let list = lists.get(parent)
+    if (list === undefined) { list = { rows: 0, added: 0 }; lists.set(parent, list) }
+    for (const node of Array.from(record.addedNodes)) {
+      addedNodes.add(node)
+      if (node.nodeType === 1 && !INERT_TAGS.has(node.nodeName)) list.added++
+    }
+    // One record may remove a whole run (innerHTML, replaceChildren): its
+    // members anchor on each other, the run's ends on the record's siblings.
+    const gone = Array.from(record.removedNodes)
+    let seen = rowsSeen.get(parent)
+    if (seen === undefined) { seen = new Map(); rowsSeen.set(parent, seen) }
+    gone.forEach((node, i) => {
+      if (removals.size >= MAX_REMOVALS) return
+      const removal: Removal = {
+        row: null,
+        parent,
+        prev: i > 0 ? gone[i - 1]! : record.previousSibling,
+        next: i < gone.length - 1 ? gone[i + 1]! : record.nextSibling,
+        seq: removalSeq++,
+      }
+      removals.set(node, removal)
+      const text = node.nodeType === 1 ? rowText(node as Element) : null
+      if (text === null) return
+      const el = node as Element
+      const ident = rowIdent(el)
+      const identity = ident ?? `${el.nodeName}|${text}`
+      const priorNode = seen.get(identity)
+      const prior = priorNode === undefined ? undefined : removals.get(priorNode)
+      if (priorNode !== undefined) removal.same = priorNode
+      if (prior?.row != null && prior.row.text.length >= text.length) return
+      if (prior === undefined && rowsStashed >= p.stashMaxEntries) return
+      const len = el.outerHTML.length
+      const freed = prior?.row?.len ?? 0
+      if (len > p.stashMaxEntryChars || rowChars - freed + len > p.stashMaxChars) return
+      rowChars += len - freed
+      const row = { node: stashDoc.importNode(el, true), text, ident, len }
+      if (prior !== undefined) {
+        prior.row = row // a richer sighting, kept at the FIRST sighting's place
+      } else {
+        removal.row = row
+        seen.set(identity, node)
+        rowsStashed++
+        list.rows++
+      }
+    })
+  }
+  const observer = new MutationObserver(tally)
+  observer.observe(body, { childList: true, subtree: true })
   const host: HTMLElement = body
   function collect(): void {
     for (const el of Array.from(host.querySelectorAll(KEYED))) {
@@ -457,6 +603,7 @@ export async function deepCaptureInPage(p: DeepCaptureParams, strip: (doc: Docum
   // ── Walk ───────────────────────────────────────────────────────────────
   // Stash whatever the (possibly anchored) start renders, then restart from
   // the top so the walk covers the whole target.
+  const startY = curY()
   collect()
   if (curY() > 0) {
     scrollToY(0)
@@ -528,6 +675,9 @@ export async function deepCaptureInPage(p: DeepCaptureParams, strip: (doc: Docum
       noteHeight()
     }
   } finally {
+    // Flush first: disconnect() drops queued records, and the last batch of
+    // removals is exactly what the unkeyed-row merge needs.
+    tally(observer.takeRecords())
     observer.disconnect()
     requestObserver?.disconnect()
   }
@@ -536,6 +686,53 @@ export async function deepCaptureInPage(p: DeepCaptureParams, strip: (doc: Docum
 
   // ── Merge into a structural clone (synchronous from here on) ──────────
   const fresh = document.cloneNode(true) as Document
+
+  // Unkeyed lists to restore, mapped into the clone NOW — the clone is an
+  // exact structural copy only until the merge starts editing it. A list
+  // qualifies when the engine both removed text-bearing rows from it and
+  // added elements to it during the walk (a virtualizer's churn; a lone
+  // toast or a load-more append does not), and it is not a live/status
+  // region or carousel whose churn is rotation rather than windowing.
+  interface ListPlan {
+    live: Node
+    fresh: Element
+    childOf: Map<Node, Node> // live child → its clone twin
+    added: Set<Node> // clone twins of children the engine added during the walk
+  }
+  const NOISE_REGION = '[aria-live="assertive"], [role="alert"], [role="status"], [role="timer"], [role="marquee"], [aria-roledescription~="carousel"]'
+  function freshOf(live: Node): Node | null {
+    const path: number[] = []
+    for (let at: Node = live; at !== document;) {
+      const up = at.parentNode
+      if (up === null) return null
+      path.push(Array.prototype.indexOf.call(up.childNodes, at) as number)
+      at = up
+    }
+    let at: Node = fresh
+    for (let i = path.length - 1; i >= 0; i--) {
+      const child = at.childNodes[path[i]!]
+      if (child === undefined) return null
+      at = child
+    }
+    return at
+  }
+  const plans: ListPlan[] = []
+  for (const [live, list] of lists) {
+    if (list.rows < 2 || list.added < 1 || !live.isConnected || (live as Element).closest(NOISE_REGION) !== null) continue
+    const twin = freshOf(live)
+    if (twin === null || twin.nodeType !== 1) continue
+    const liveKids = Array.from(live.childNodes)
+    const freshKids = Array.from(twin.childNodes)
+    if (liveKids.length !== freshKids.length) continue
+    const childOf = new Map<Node, Node>()
+    const added = new Set<Node>()
+    liveKids.forEach((child, i) => {
+      childOf.set(child, freshKids[i]!)
+      if (addedNodes.has(child)) added.add(freshKids[i]!)
+    })
+    plans.push({ live, fresh: twin as Element, childOf, added })
+  }
+
   const present = new Map<string, Element>()
   const index = (node: Element): void => {
     const key = keyOf(node)
@@ -574,8 +771,21 @@ export async function deepCaptureInPage(p: DeepCaptureParams, strip: (doc: Docum
     }
   }
 
+  // RESTORE unkeyed rows into their lists, oldest removal first — before the
+  // swap, which must see each list already whole.
+  // Clone nodes the merge replaced, so a list anchor on one still resolves.
+  const replacedBy = new Map<Node, Node>()
+  let restored = 0
+  const restoredLists: Element[] = []
+  for (const plan of plans) {
+    const count = restoreList(plan)
+    if (count > 0) { restored += count; restoredLists.push(plan.fresh) }
+  }
+
   // SWAP degraded leaves for their snapshots; their ancestors are
-  // containers, assembled from them rather than swapped wholesale.
+  // containers, assembled from them rather than swapped wholesale. So is a
+  // restored list and everything around it: a keyed wrapper's snapshot is
+  // one window's partial view of the rows the restore just made whole.
   const degraded: Array<{ el: Element; snap: Snapshot }> = []
   for (const el of Array.from(fresh.querySelectorAll(KEYED))) {
     const key = keyOf(el)
@@ -589,6 +799,9 @@ export async function deepCaptureInPage(p: DeepCaptureParams, strip: (doc: Docum
   for (const { el } of degraded) {
     for (let up = el.parentElement; up !== null && !containers.has(up); up = up.parentElement) containers.add(up)
   }
+  for (const list of restoredLists) {
+    for (let up: Element | null = list; up !== null && !containers.has(up); up = up.parentElement) containers.add(up)
+  }
   let rehydrated = 0
   for (const { el, snap } of degraded) {
     if (containers.has(el)) continue
@@ -596,22 +809,211 @@ export async function deepCaptureInPage(p: DeepCaptureParams, strip: (doc: Docum
     rehydrated++
   }
 
+  function restoreList(plan: ListPlan): number {
+    const follow = (node: Node | undefined): Node | null => {
+      let at = node
+      while (at !== undefined && replacedBy.has(at)) at = replacedBy.get(at)
+      return at !== undefined && at.parentNode === plan.fresh ? at : null
+    }
+    // What the list holds now, for de-duplication: identity attribute and
+    // text of every element child (live rows, spliced or swapped ones).
+    const byIdent = new Map<string, Element>()
+    const byText = new Map<string, Element>()
+    const textOf = new Map<Element, string>()
+    const note = (el: Element): void => {
+      const text = squash(el.textContent ?? '')
+      textOf.set(el, text)
+      const ident = rowIdent(el)
+      if (ident !== null && !byIdent.has(ident)) byIdent.set(ident, el)
+      if (text !== '' && !byText.has(`${el.nodeName}|${text}`)) byText.set(`${el.nodeName}|${text}`, el)
+    }
+    const forget = (el: Element): void => {
+      const text = textOf.get(el) ?? ''
+      const ident = rowIdent(el)
+      if (ident !== null && byIdent.get(ident) === el) byIdent.delete(ident)
+      if (byText.get(`${el.nodeName}|${text}`) === el) byText.delete(`${el.nodeName}|${text}`)
+    }
+    for (const child of Array.from(plan.fresh.children)) note(child)
+
+    const placed = new Map<Node, Node>() // live removed node → clone node it became
+    const rows = Array.from(removals.entries())
+      .filter(([node, r]) => r.parent === plan.live && r.row !== null && !node.isConnected)
+      .sort((a, b) => a[1].seq - b[1].seq)
+    const pending = new Set(rows.map(([node]) => node))
+    // Later removals of the same row (ghosts pointing at its stashed copy).
+    const repeats = new Map<Node, Removal[]>()
+    for (const removal of removals.values()) {
+      if (removal.row !== null || removal.same === undefined || removal.parent !== plan.live) continue
+      const list = repeats.get(removal.same)
+      if (list === undefined) repeats.set(removal.same, [removal])
+      else list.push(removal)
+    }
+    let allowPending = false
+    const PENDING = 1
+    // Walk an anchor chain to a node of the clone list: a live sibling, a
+    // row already restored, or — through rows that will never come back
+    // (ghosts, duplicates) — whatever THEY sat next to.
+    function resolve(start: Node | null, dir: 'prev' | 'next'): Node | null | typeof PENDING {
+      let anchor = start
+      for (let hops = 0; anchor !== null && hops <= removals.size; hops++) {
+        const done = placed.get(anchor)
+        if (done !== undefined) return follow(done)
+        if (anchor.parentNode === plan.live) return follow(plan.childOf.get(anchor))
+        const removal = removals.get(anchor)
+        if (removal === undefined || removal.parent !== plan.live) return null
+        if (pending.has(anchor) && !allowPending) return PENDING
+        // A repeat of a stashed row stands where that row is restored.
+        if (removal.row === null && removal.same !== undefined && removal.same !== anchor) { anchor = removal.same; continue }
+        anchor = dir === 'prev' ? removal.prev : removal.next
+      }
+      return null
+    }
+    let count = 0
+    // A row already in the list is not restored again; one whose live twin
+    // (same identity attribute) is a far emptier placeholder replaces it.
+    function dedupe(live: Node, row: NonNullable<Removal['row']>): boolean {
+      const sameIdent = row.ident === null ? undefined : byIdent.get(row.ident)
+      const twin = sameIdent ?? byText.get(`${row.node.nodeName}|${row.text}`)
+      if (twin === undefined) return false
+      const twinText = textOf.get(twin) ?? ''
+      if (sameIdent !== undefined && twinText.length * 4 <= row.text.length && row.text.length - twinText.length > p.textDegradeTolerance) {
+        const node = fresh.importNode(row.node, true)
+        twin.replaceWith(node)
+        forget(twin)
+        replacedBy.set(twin, node)
+        note(node)
+        placed.set(live, node)
+        count++
+      } else {
+        placed.set(live, twin)
+      }
+      return true
+    }
+    // Stubs: the placeholder an unkeyed cloak puts in a row's place carries
+    // a short piece of the row's own text ("posted by …"). Whichever of the
+    // two the merge meets second, only the row survives.
+    const restoredHere = new Set<Element>()
+    const stubOf = (stub: string, full: string): boolean => stub !== '' && stub.length * 4 <= full.length && full.includes(stub)
+    function insert(live: Node, row: NonNullable<Removal['row']>, place: (node: Element) => void): void {
+      const node = fresh.importNode(row.node, true)
+      place(node)
+      const sides = [node.previousElementSibling, node.nextElementSibling]
+      // A restored stub beside the row it stood in for adds nothing.
+      for (const side of sides) {
+        if (side !== null && stubOf(row.text, textOf.get(side) ?? '')) {
+          node.remove()
+          placed.set(live, side)
+          return
+        }
+      }
+      note(node)
+      placed.set(live, node)
+      restoredHere.add(node)
+      count++
+      // A stub beside the restored row goes — one the engine ADDED during the
+      // walk, or one restored earlier; never a row the page had all along.
+      for (const side of sides) {
+        if (side === null || keyOf(side) !== null || !(plan.added.has(side) || restoredHere.has(side))) continue
+        if (!stubOf(textOf.get(side) ?? '', row.text)) continue
+        forget(side)
+        side.remove()
+        replacedBy.set(side, node)
+        if (restoredHere.delete(side)) count--
+      }
+    }
+    let queue = rows
+    while (queue.length > 0) {
+      const later: typeof rows = []
+      let progressed = false
+      for (const entry of queue) {
+        const [live, removal] = entry
+        const row = removal.row!
+        if (dedupe(live, row)) { pending.delete(live); progressed = true; continue }
+        // Every sighting of the row knows where it sat at that instant; the
+        // first that resolves wins (an anchored open's first window, say,
+        // was removed beside rows only a later pass ever pinned down).
+        let place: ((node: Element) => void) | null = null
+        for (const sighting of [removal, ...(repeats.get(live) ?? [])]) {
+          const before = resolve(sighting.next, 'next')
+          if (before !== null && before !== PENDING) { place = node => { (before as ChildNode).before(node) }; break }
+          const after = resolve(sighting.prev, 'prev')
+          if (after !== null && after !== PENDING) { place = node => { (after as ChildNode).after(node) }; break }
+        }
+        if (place === null) {
+          later.push(entry)
+          continue
+        }
+        insert(live, row, place)
+        pending.delete(live)
+        progressed = true
+      }
+      queue = later
+      if (!progressed) {
+        if (allowPending) break
+        allowPending = true
+      }
+    }
+    // Rows with no surviving relative (a list re-rendered wholesale leaves no
+    // anchor behind): a walk runs top-down and ends at the bottom, so what
+    // the engine removed and did not render again lay ABOVE the final
+    // window — before the first text-bearing row, in removal order.
+    if (queue.length > 0) {
+      const first = Array.from(plan.fresh.children).find(el => (textOf.get(el) ?? '') !== '') ?? null
+      for (const [live, removal] of queue) {
+        const row = removal.row!
+        if (dedupe(live, row)) continue
+        insert(live, row, node => { plan.fresh.insertBefore(node, first) })
+      }
+    }
+    return count
+  }
+
   const stats: DeepCapture = {
     steps,
     stashed: stash.size,
     rehydrated,
     spliced,
+    restored,
     reactive,
     elapsedMs: Date.now() - started,
     height: finalHeight,
   }
-  if ((rehydrated > 0 || spliced > 0) && fresh.documentElement !== null) {
+  if ((rehydrated > 0 || spliced > 0 || restored > 0) && fresh.documentElement !== null) {
     strip(fresh)
     // page.content()'s own serialization: doctype, then the root element.
     const doctype = fresh.doctype === null ? '' : new XMLSerializer().serializeToString(fresh.doctype)
     stats.html = doctype + fresh.documentElement.outerHTML
+  } else if (reactive && curY() !== startY) {
+    // Nothing restored on a page that reacted: the provider reads the LIVE
+    // page, which now shows the walk's last (bottom) window. A virtualizer
+    // the merge could not rebuild (rows without text, canvas) would then
+    // hand over the tail instead of the opening screen the legacy capture
+    // read, so return to where the page opened and let it re-render there.
+    scrollToY(startY)
+    await settleQuiet()
+    stats.rewound = true
   }
+  stats.elapsedMs = Date.now() - started
   return stats
+
+  // Wait until the page stops adding or removing elements (bounded).
+  async function settleQuiet(): Promise<void> {
+    let churn = 0
+    const watch = new MutationObserver(records => {
+      for (const record of records) if (counts(record.addedNodes) || counts(record.removedNodes)) churn++
+    })
+    watch.observe(body!, { childList: true, subtree: true })
+    try {
+      for (let round = 0; round < 5; round++) {
+        await sleep(p.stepSettleMs)
+        for (const record of watch.takeRecords()) if (counts(record.addedNodes) || counts(record.removedNodes)) churn++
+        if (churn === 0) break
+        churn = 0
+      }
+    } finally {
+      watch.disconnect()
+    }
+  }
 }
 
 /**
@@ -683,6 +1085,8 @@ export async function deepCaptureWalk(page: PlaywrightPage, budgetMs: number): P
       stashed: raw.stashed,
       rehydrated: raw.rehydrated,
       ...(typeof raw.spliced === 'number' ? { spliced: raw.spliced } : {}),
+      ...(typeof raw.restored === 'number' ? { restored: raw.restored } : {}),
+      ...(typeof raw.rewound === 'boolean' ? { rewound: raw.rewound } : {}),
       ...(typeof raw.reactive === 'boolean' ? { reactive: raw.reactive } : {}),
       ...(typeof raw.elapsedMs === 'number' ? { elapsedMs: raw.elapsedMs } : {}),
       ...(typeof raw.height === 'number' ? { height: raw.height } : {}),

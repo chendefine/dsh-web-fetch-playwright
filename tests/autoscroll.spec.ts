@@ -130,6 +130,119 @@ function containerDoc(total: number, anchorAt = 0): JSDOM {
   return dom
 }
 
+interface UnkeyedOpts {
+  /** Scroll an overflow container instead of the window. */
+  container?: boolean
+  /** Open scrolled to this offset (a deep link). */
+  anchorAt?: number
+  /** Rows carry data-index; their text carries a per-render counter. */
+  ident?: boolean
+  /** Rows carry a per-render framework id (Ember's `emberN`). */
+  generatedIds?: boolean
+  /** A row leaving the window is replaced in place by a short unkeyed stub. */
+  placeholder?: boolean
+  /** Rows hold only an image: nothing the merge could restore. */
+  textless?: boolean
+  /** The engine re-renders the whole list via innerHTML on every refresh. */
+  wholesale?: boolean
+  /** The list sits inside a KEYED wrapper (`<div id="timeline">`). */
+  keyedWrapper?: boolean
+}
+
+/**
+ * react-window / X-timeline shape: rows carry NO key (the framework key never
+ * reaches the DOM); rows outside [y - 1vh, y + 2vh] are REMOVED, and come
+ * back as NEW nodes when re-entered.
+ */
+function unkeyedFeed(total: number, opts: UnkeyedOpts = {}): JSDOM {
+  const shell = opts.container === true
+    ? '<div class="app"><div class="viewport" style="overflow-y: auto"><div class="list"></div></div></div>'
+    : `<div class="app"${opts.keyedWrapper === true ? ' id="timeline"' : ''}><div class="list"></div></div>`
+  const dom = new JSDOM(`<!doctype html><html><body><header>Site header</header>${shell}</body></html>`, { runScripts: 'outside-only' })
+  const { window } = dom
+  const doc = window.document
+  const list = doc.querySelector('.list')!
+  let y = 0
+  let renders = 0
+  let emberSeq = 100
+  const everRendered = new Set<number>()
+  const rowHtml = (n: number): string => {
+    renders++
+    const attrs = (opts.ident === true ? ` data-index="${String(n - 1)}"` : '') + (opts.generatedIds === true ? ` id="ember${String(emberSeq++)}"` : '')
+    const body = opts.textless === true
+      ? `<img src="r${String(n)}.png">`
+      : `<p>Row ${String(n)} ROW-${String(n)} body text${opts.ident === true ? ` render ${String(renders)}` : ''}.</p>`
+    return `<div class="row"${attrs}>${body}</div>`
+  }
+  const make = (html: string): Element => {
+    const t = doc.createElement('template')
+    t.innerHTML = html
+    return t.content.firstElementChild!
+  }
+  const slots = new Map<number, Element>()
+  const wanted = (n: number): boolean => {
+    const at = (n - 1) * ROW_H
+    return at + ROW_H >= y - VIEW_H && at <= y + VIEW_H * 2
+  }
+  const refresh = (): void => {
+    if (opts.wholesale === true) {
+      const parts: string[] = []
+      for (let n = 1; n <= total; n++) if (wanted(n)) parts.push(rowHtml(n))
+      list.innerHTML = parts.join('')
+      return
+    }
+    for (let n = 1; n <= total; n++) {
+      const want = wanted(n)
+      const current = slots.get(n)
+      const kind = want ? 'row' : opts.placeholder === true && everRendered.has(n) ? 'ph' : 'none'
+      const currentKind = current === undefined ? 'none' : current.classList.contains('row') ? 'row' : 'ph'
+      if (kind === currentKind) continue
+      const next = kind === 'row' ? make(rowHtml(n)) : kind === 'ph' ? make(`<div class="ph">Row ${String(n)}</div>`) : null
+      if (want) everRendered.add(n)
+      if (current !== undefined && next !== null) current.replaceWith(next)
+      else if (current !== undefined) current.remove()
+      else if (next !== null) {
+        let before: Element | null = null
+        for (let m = n + 1; m <= total && before === null; m++) before = slots.get(m) ?? null
+        list.insertBefore(next, before)
+      }
+      if (next === null) slots.delete(n)
+      else slots.set(n, next)
+    }
+  }
+  const height = total * ROW_H
+  Object.defineProperty(window, 'innerHeight', { configurable: true, get: () => VIEW_H })
+  if (opts.container === true) {
+    const viewport = doc.querySelector('.viewport')!
+    Object.defineProperty(doc.documentElement, 'scrollHeight', { configurable: true, get: () => VIEW_H })
+    Object.defineProperty(viewport, 'clientHeight', { configurable: true, get: () => VIEW_H })
+    Object.defineProperty(viewport, 'scrollHeight', { configurable: true, get: () => height })
+    Object.defineProperty(viewport, 'scrollTop', {
+      configurable: true,
+      get: () => y,
+      set: (v: number) => { y = Math.max(0, Math.min(height - VIEW_H, v)); refresh() },
+    })
+  } else {
+    Object.defineProperty(window, 'scrollY', { configurable: true, get: () => y })
+    Object.defineProperty(doc.documentElement, 'scrollHeight', { configurable: true, get: () => height })
+    window.scrollTo = ((arg: ScrollToOptions) => {
+      y = Math.max(0, Math.min(height - VIEW_H, arg.top ?? 0))
+      refresh()
+    }) as typeof window.scrollTo
+  }
+  y = opts.anchorAt ?? 0
+  refresh()
+  return dom
+}
+
+/** Each `ROW-n ` marker appears exactly once, in ascending order. */
+function expectWholeOrderedRows(html: string, total: number): void {
+  const at = order(html, 'ROW', total)
+  expect(at.every(i => i >= 0)).toBe(true)
+  expect([...at].sort((a, b) => a - b)).toEqual(at)
+  for (let n = 1; n <= total; n++) expect(html.split(`ROW-${String(n)} `).length - 1).toBe(1)
+}
+
 /** A long page that never reacts to scrolling. */
 function inertDoc(rows: number): { dom: JSDOM; scrolls: number[] } {
   const parts: string[] = []
@@ -244,6 +357,125 @@ describe('deepCaptureInPage (evaluated by source in jsdom)', () => {
     const result = await runWalk(dom, fastParams({ bottomPatienceMs: 400, inertPatienceMs: 10 }))
     expect(result.reactive).toBe(true)
     expect(result.elapsedMs).toBeGreaterThanOrEqual(400)
+  })
+
+  it('unkeyed window list: restores every removed row in order, exactly once', async () => {
+    const dom = unkeyedFeed(30)
+    const result = await runWalk(dom, fastParams())
+    expect(result.reactive).toBe(true)
+    expect(result.restored).toBeGreaterThan(0)
+    expectWholeOrderedRows(result.html ?? '', 30)
+    expect(result.html).toContain('Site header')
+  })
+
+  it('a keyed wrapper around an unkeyed list is not swapped for its one-window snapshot', async () => {
+    const dom = unkeyedFeed(30, { keyedWrapper: true })
+    const result = await runWalk(dom, fastParams())
+    expect(result.rehydrated).toBe(0)
+    expectWholeOrderedRows(result.html ?? '', 30)
+  })
+
+  it('unkeyed container list opened mid-document: restores rows on both sides of the start', async () => {
+    const dom = unkeyedFeed(30, { container: true, anchorAt: 1_200 })
+    const result = await runWalk(dom, fastParams())
+    expect(result.restored).toBeGreaterThan(0)
+    expectWholeOrderedRows(result.html ?? '', 30)
+  })
+
+  it('a per-list identity attribute (data-index) de-duplicates rows whose text changed between renders', async () => {
+    const dom = unkeyedFeed(30, { ident: true })
+    const result = await runWalk(dom, fastParams())
+    expectWholeOrderedRows(result.html ?? '', 30)
+  })
+
+  it('framework-generated ids are not identities: per-render ember ids take the unkeyed path', async () => {
+    const dom = unkeyedFeed(30, { generatedIds: true })
+    const result = await runWalk(dom, fastParams())
+    expect(result.restored).toBeGreaterThan(0)
+    expectWholeOrderedRows(result.html ?? '', 30)
+  })
+
+  it('an unkeyed in-place stub is absorbed by the row it stood in for', async () => {
+    const dom = unkeyedFeed(30, { placeholder: true })
+    const result = await runWalk(dom, fastParams())
+    const html = result.html ?? ''
+    expectWholeOrderedRows(html, 30)
+    expect(html).not.toContain('class="ph"')
+  })
+
+  it('a list re-rendered wholesale (no surviving anchors) still comes back whole and in order', async () => {
+    const dom = unkeyedFeed(30, { wholesale: true })
+    const result = await runWalk(dom, fastParams())
+    expectWholeOrderedRows(result.html ?? '', 30)
+  })
+
+  describe('unkeyed shapes × start positions: every row once, in order', () => {
+    const shapes: Array<[string, UnkeyedOpts]> = [
+      ['plain', {}],
+      ['data-index', { ident: true }],
+      ['generated ids', { generatedIds: true }],
+      ['in-place stubs', { placeholder: true }],
+      ['wholesale innerHTML', { wholesale: true }],
+      ['keyed wrapper', { keyedWrapper: true }],
+    ]
+    const cases: Array<[string, UnkeyedOpts]> = []
+    for (const [name, shape] of shapes) {
+      for (const container of [false, true]) {
+        for (const anchorAt of [0, 900, 2_000]) {
+          cases.push([`${name}, ${container ? 'container' : 'window'}, opened at ${String(anchorAt)}px`, { ...shape, container, anchorAt }])
+        }
+      }
+    }
+    it.each(cases)('%s', async (_name, opts) => {
+      const result = await runWalk(unkeyedFeed(40, opts), fastParams())
+      const html = result.html ?? ''
+      expectWholeOrderedRows(html, 40)
+      expect(html).not.toContain('class="ph"')
+    })
+  })
+
+  it('nothing restorable on a reacting page: the walk rewinds to where the page opened', async () => {
+    const dom = unkeyedFeed(30, { textless: true, anchorAt: 900 })
+    const result = await runWalk(dom, fastParams())
+    expect(result.reactive).toBe(true)
+    expect(result.restored).toBe(0)
+    expect(result.html).toBeUndefined()
+    expect(result.rewound).toBe(true)
+    expect(dom.window.scrollY).toBe(900)
+    // The live page the provider now reads shows the opening window again.
+    expect(dom.window.document.querySelector('img[src="r10.png"]')).not.toBeNull()
+  })
+
+  it('transient status toasts churned by scrolling are never resurrected', async () => {
+    const { dom } = inertDoc(60)
+    const doc = dom.window.document
+    doc.body.insertAdjacentHTML('beforeend', '<div class="toasts"></div>')
+    const toasts = doc.querySelector('.toasts')!
+    let shown = 0
+    const scrollTo = dom.window.scrollTo
+    dom.window.scrollTo = ((arg: ScrollToOptions) => {
+      scrollTo(arg)
+      toasts.innerHTML = `<div role="status">TOAST-${String(++shown)} saved</div>`
+    }) as typeof dom.window.scrollTo
+    const result = await runWalk(dom, fastParams())
+    expect(result.restored ?? 0).toBe(0)
+    expect(result.html).toBeUndefined()
+  })
+
+  it('a load-more feed that only appends restores nothing and leaves the live read alone', async () => {
+    const { dom } = inertDoc(40)
+    const doc = dom.window.document
+    const article = doc.querySelector('article')!
+    let more = 0
+    const scrollTo = dom.window.scrollTo
+    dom.window.scrollTo = ((arg: ScrollToOptions) => {
+      scrollTo(arg)
+      article.insertAdjacentHTML('beforeend', `<p>MORE-${String(++more)} appended.</p>`)
+    }) as typeof dom.window.scrollTo
+    const result = await runWalk(dom, fastParams())
+    expect(result.reactive).toBe(true)
+    expect(result.restored).toBe(0)
+    expect(result.html).toBeUndefined()
   })
 
   it('a page that does not scroll at all is skipped', async () => {
