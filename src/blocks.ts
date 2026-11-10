@@ -24,7 +24,14 @@ const BLOCK_TAGS = new Set([
   'dl', 'figure', 'address', 'center', 'body',
 ])
 
-const WORD = /[\p{L}\p{N}_]+/gu
+/**
+ * Word tokens: runs of letters/digits, except that each Han / kana character
+ * is its own token. Unspaced scripts would otherwise count a whole sentence
+ * as one "word", making a long Chinese paragraph weigh the same as a
+ * one-line headline link and breaking every density and ratio feature.
+ * Pages without CJK text tokenize exactly as with plain `[\p{L}\p{N}_]+`.
+ */
+export const WORD = /[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}]|(?:(?![\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}])[\p{L}\p{N}_])+/gu
 const NEGATIVE_NAMES = /(^|[\s_-])(nav|navbar|menu|footer|header|sidebar|side|widget|related|recommend\w*|share|social|comments?|cookie\w*|consent|banner|promo|ad|ads|advert\w*|breadcrumbs?|pagination|pager|tags?|meta|subscribe|newsletter|login|signup|modal|popup|toolbar|skip)([\s_-]|$)/i
 const POSITIVE_NAMES = /(^|[\s_-])(content|article|post|entry|body|text|story|description|desc|product|details?|main|prose|markdown|rte|copy|summary|answer|question|message|thread)([\s_-]|$)/i
 const PRICE = /[$€£¥₹]\s?\d|\d\s?(€|EUR|USD)/

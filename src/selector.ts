@@ -15,11 +15,8 @@
 
 import { CANDIDATE_KINDS, type CandidateKind, type GenerationFacts, NOISE_SUBTREE_TAGS } from './candidates.ts'
 import { SELECTOR_MODEL } from './selector-model.ts'
-import { blockKey, segmentBlocks } from './blocks.ts'
+import { blockKey, segmentBlocks, WORD } from './blocks.ts'
 import { predictTrees, type TreeEnsemble } from './trees.ts'
-
-/** Token pattern approximating Python's `\w+` (the scorers' tokenizer). */
-const WORD = /[\p{L}\p{N}_]+/gu
 
 /** Text statistics of one sanitized candidate. */
 export interface CandidateStats {

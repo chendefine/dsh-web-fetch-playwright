@@ -10,8 +10,9 @@ import { describe, expect, it } from 'vitest'
 import { JSDOM } from 'jsdom'
 import {
   discoursePreloadedHtml, findRecordRegion, generateCandidates, noscriptTextLength, stripPageChrome, unwrapNoscripts,
+  markRecommendationRails, splitRails,
 } from '../src/candidates.ts'
-import { blockKey, renderBlocks, segmentBlocks } from '../src/blocks.ts'
+import { blockKey, renderBlocks, segmentBlocks, WORD } from '../src/blocks.ts'
 import { predictTrees } from '../src/trees.ts'
 import { htmlToMarkdown, scoreCandidates } from '../src/markdown.ts'
 import { FEATURE_NAMES } from '../src/selector.ts'
@@ -120,6 +121,50 @@ describe('blocks', () => {
     expect(blocks[1]?.links).toBe(1)
     const html = renderBlocks(blocks, [false, true, true, true])
     expect(html).toBe('<p>para <a href="#">link</a></p>\n<ul>\n<li>one</li>\n<li>two</li>\n</ul>')
+  })
+})
+
+describe('CJK tokenization', () => {
+  it('counts each Han/kana character as a word, Latin runs as before', () => {
+    expect('广州最高医疗建筑 hello world2 カナ'.match(WORD)).toEqual(['广', '州', '最', '高', '医', '疗', '建', '筑', 'hello', 'world2', 'カ', 'ナ'])
+  })
+})
+
+/** 163.com shape: a two-paragraph post followed by a much larger recommendation rail. */
+const RAIL_PAGE = `<!doctype html><html><head><title>130米！广州最高医疗建筑来了</title></head><body>
+<div class="post_main"><h1>130米！广州最高医疗建筑来了</h1>
+<div id="content" class="post_content"><div class="post_body">
+<p>广州最高的超高层医疗建筑，中山大学附属第一医院临床研究大楼，近日举行封顶仪式。</p>
+<p>该大楼坐落于越秀区中山二路58号院本部，通过拆除后勤楼、行政楼、旧饭堂等老旧楼栋盘活原址土地。项目总占地面积5600平方米，总建筑面积达5.4万平方米，建筑总高度130米，分为地上29层、地下4层，是目前广州最高的超高层医疗建筑，预计2027年年底全面竣工投用。</p>
+</div><div class="post_statement"><p>特别声明：以上内容(如有图片或视频亦包括在内)为自媒体平台“网易号”用户上传并发布，本平台仅提供信息存储服务。</p>
+<p>Notice: The content above (including the pictures and videos if any) is uploaded and posted by a user of NetEase Hao, which is a social media platform and only provides information storage services.</p></div></div>
+<div class="post_recommends"><ul>${Array.from({ length: 30 }, (_, i) => `<li class="post_recommend"><a href="/dy/article/X${String(i)}.html"><img src="c.jpg"></a><h3><a href="/dy/article/X${String(i)}.html">推荐文章标题第${String(i)}篇，城市建设新闻速览</a></h3><p>某某号 2026-11-09 21:15:43</p></li>`).join('')}</ul></div>
+</div></body></html>`
+
+describe('recommendation rails', () => {
+  it('drops a rail that outweighs a short article (163.com badcase)', () => {
+    const { markdown, strategy } = htmlToMarkdown(RAIL_PAGE, 'https://www.163.com/dy/article/LBA8924U05199NPP.html')
+    expect(markdown).toContain('预计2027年年底全面竣工投用')
+    expect(markdown).not.toContain('推荐文章标题')
+    expect(strategy).toBe('art')
+  })
+
+  it('marks only rails recognised by name AND link density', () => {
+    expect(markRecommendationRails(doc(RAIL_PAGE))?.querySelector('.post_recommends')?.hasAttribute('data-dsh-rail')).toBe(true)
+    const prose = `<body><div class="related-notes"><p>${POST.repeat(4)}</p></div><p>${POST}</p></body>`
+    expect(markRecommendationRails(doc(prose))).toBeNull()
+  })
+
+  const links = Array.from({ length: 8 }, (_, i) => `<li><a href="/r/${String(i)}">Related story number ${String(i)}</a></li>`).join('')
+
+  it('cuts a marked rail only after prose, and restores the unmarked HTML exactly', () => {
+    const document = doc('<body></body>')
+    const trailing = `<div><p>${POST}</p><ul data-dsh-rail="">${links}</ul></div>`
+    const split = splitRails(trailing, document)
+    expect(split.plain).toBe(`<div><p>${POST}</p><ul>${links}</ul></div>`)
+    expect(split.derailed).toBe(`<div><p>${POST}</p></div>`)
+    // A "related-product" grid that opens the content is the content.
+    expect(splitRails(`<div><ul data-dsh-rail="">${links}</ul><p>${POST}</p></div>`, document).derailed).toBeNull()
   })
 })
 

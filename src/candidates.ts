@@ -202,6 +202,97 @@ export function prunedArticleContent(articleHtml: string, document: Document): s
   return container.innerHTML
 }
 
+// ------------------------------------------------- recommendation rails ----
+
+/** Link density at or above which a recommendation-named subtree is a rail. */
+const RAIL_LINK_DENSITY = 0.3
+const RAIL_MIN_LINKS = 4
+/** Prose (low-link text) the page must keep outside the rails. */
+const RAIL_MIN_PROSE_CHARS = 80
+const RAIL_PROSE_LINK_DENSITY = 0.2
+
+/** Class/id sub-tokens naming a recommendation / related-content rail. */
+function isRailName(token: string): boolean {
+  return token.includes('recommend') || token.startsWith('related')
+    || token === 'outbrain' || token === 'taboola' || token === 'tuijian' || token === 'xgtj'
+}
+
+function isRecommendationRail(element: Element): boolean {
+  const names = `${element.getAttribute('class') ?? ''} ${element.id}`.toLowerCase()
+  if (!names.split(/[\s_-]+/).some(isRailName)) return false
+  if (element.querySelectorAll('a').length < RAIL_MIN_LINKS) return false
+  const text = visibleTextLength(element)
+  return text > 0 && linkTextLength(element) / text >= RAIL_LINK_DENSITY
+}
+
+/** Marker attribute carried through Readability (it keeps `data-*`). */
+const RAIL_ATTR = 'data-dsh-rail'
+const RAIL_ATTR_TEXT = ` ${RAIL_ATTR}=""`
+
+function isProse(block: Element): boolean {
+  const text = visibleTextLength(block)
+  return text >= RAIL_MIN_PROSE_CHARS && linkTextLength(block) / text < RAIL_PROSE_LINK_DENSITY
+}
+
+/**
+ * A copy of `document` whose recommendation rails ("post_recommends",
+ * "related-posts", Outbrain/Taboola widgets) carry a marker attribute, or
+ * null when it has none. Readability scores class/id names and text, never
+ * `data-*`, so it picks the same container on the copy as on the original —
+ * removing the rails beforehand instead was measured to shift its pick to a
+ * larger ancestor (WCXB 4206).
+ */
+export function markRecommendationRails(document: Document): Document | null {
+  const body = document.body
+  if (body === null) return null
+  const rails: Element[] = []
+  const walk = (element: Element): void => {
+    for (const child of childElements(element)) {
+      if (isRecommendationRail(child)) rails.push(child)
+      else walk(child)
+    }
+  }
+  walk(body)
+  // Most pages have no rail: skip the clone. Otherwise mark the original
+  // just long enough to clone it, so the caller's document ends unchanged.
+  if (rails.length === 0) return null
+  for (const rail of rails) rail.setAttribute(RAIL_ATTR, '')
+  const copy = document.cloneNode(true) as Document
+  for (const rail of rails) rail.removeAttribute(RAIL_ATTR)
+  return copy
+}
+
+/**
+ * Split a Readability extraction of a rail-marked page into the extraction
+ * exactly as it would be unmarked, and — when a marked rail follows prose —
+ * the extraction without those rails.
+ *
+ * The trailing prune cannot catch a rail that outweighs the article (on a
+ * short 163.com post the rail is 86% of Readability's pick, past the share
+ * guards that keep docs indexes intact), and Readability strips the class
+ * names that would tell the two apart, hence the marker. A rail is removed
+ * only when it is recognised by name AND link density AND sits after some
+ * prose inside the extraction: a category page whose "related-product" grid
+ * opens the content (WCXB 4247) is the content, not a rail.
+ */
+export function splitRails(articleHtml: string, document: Document): { plain: string, derailed: string | null } {
+  if (!articleHtml.includes(RAIL_ATTR)) return { plain: articleHtml, derailed: null }
+  const plain = articleHtml.split(RAIL_ATTR_TEXT).join('')
+  const container = htmlFragment(articleHtml, document)
+  const prose = Array.from(container.querySelectorAll('p, div, td, section, article')).filter(block => !block.hasAttribute(RAIL_ATTR) && block.closest(`[${RAIL_ATTR}]`) === null && isProse(block))
+  let removed = 0
+  for (const rail of Array.from(container.querySelectorAll(`[${RAIL_ATTR}]`))) {
+    // eslint-disable-next-line no-bitwise
+    const preceded = prose.some(block => (block.compareDocumentPosition(rail) & 4 /* FOLLOWING */) !== 0 && !block.contains(rail))
+    if (preceded) {
+      rail.remove()
+      removed++
+    }
+  }
+  if (removed === 0 || visibleTextLength(container) < RAIL_MIN_PROSE_CHARS) return { plain, derailed: null }
+  return { plain, derailed: container.innerHTML.split(RAIL_ATTR_TEXT).join('') }
+}
+
 // ------------------------------------------------------------ helpers ----
 
 /**
@@ -214,6 +305,12 @@ export function childElements(element: Element): Element[] {
   const out: Element[] = []
   for (let child = element.firstElementChild; child !== null; child = child.nextElementSibling) out.push(child)
   return out
+}
+
+function htmlFragment(html: string, document: Document): Element {
+  const container = document.createElement('div')
+  container.innerHTML = html
+  return container
 }
 
 interface ReadabilityPick { content: string, title?: string }
@@ -463,11 +560,17 @@ export function generateCandidates(document: Document): { candidates: RawCandida
   const body = document.body
   const bodyHtml = body?.innerHTML ?? ''
 
-  const art = runReadability(document)
+  // Rails are marked before Readability (it drops the class names that
+  // identify them) and cut from its output; the gate and `artu` see the
+  // extraction exactly as unmarked, so the legacy marker and the "keep
+  // everything" alternative are unchanged.
+  const marked = runReadability(markRecommendationRails(document) ?? document)
+  const rails = marked === null ? null : splitRails(marked.content, document)
+  const art = marked === null || rails === null ? null : { ...marked, content: rails.plain }
   const gatePass = art !== null && articleCoversPage(art.content, document)
   let pruneChanged = false
   if (art !== null) {
-    const pruned = prunedArticleContent(art.content, document)
+    const pruned = prunedArticleContent(rails?.derailed ?? art.content, document)
     pruneChanged = pruned !== art.content
     candidates.push({ kind: 'art', html: pruned, title: art.title, legacy: gatePass })
     if (pruneChanged) candidates.push({ kind: 'artu', html: art.content, title: art.title, legacy: false })
