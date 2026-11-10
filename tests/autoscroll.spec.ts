@@ -27,6 +27,7 @@ function fastParams(over: Partial<DeepCaptureParams> = {}): DeepCaptureParams {
     stepSettleMs: 4,
     bottomPollMs: 5,
     bottomPatienceMs: 40,
+    inertPatienceMs: 10,
     ...over,
   }
 }
@@ -147,6 +148,30 @@ function inertDoc(rows: number): { dom: JSDOM; scrolls: number[] } {
   return { dom, scrolls }
 }
 
+/**
+ * jsdom has no Resource Timing: stand in a PerformanceObserver that reports
+ * completed requests of the given initiator types once the walk reaches the
+ * bottom of an {@link inertDoc}.
+ */
+function requestsAtBottom(dom: JSDOM, initiatorTypes: string[]): void {
+  const pending: { initiatorType: string }[] = []
+  const scrollTo = dom.window.scrollTo
+  dom.window.scrollTo = ((arg: ScrollToOptions) => {
+    scrollTo(arg)
+    if (dom.window.scrollY + VIEW_H >= dom.window.document.documentElement.scrollHeight) {
+      pending.push(...initiatorTypes.map(initiatorType => ({ initiatorType })))
+    }
+  }) as typeof dom.window.scrollTo
+  Object.defineProperty(dom.window, 'PerformanceObserver', {
+    configurable: true,
+    value: class {
+      observe(): void {}
+      disconnect(): void {}
+      takeRecords(): { initiatorType: string }[] { return pending.splice(0) }
+    },
+  })
+}
+
 const order = (html: string, prefix: string, total: number): number[] => {
   const at: number[] = []
   for (let n = 1; n <= total; n++) at.push(html.indexOf(`${prefix}-${String(n)} `))
@@ -190,6 +215,35 @@ describe('deepCaptureInPage (evaluated by source in jsdom)', () => {
     expect(scrolls.at(-1)).toBe(100 * ROW_H - VIEW_H)
     // Nothing degraded, nothing restored: the provider reads the live page.
     expect(result.html).toBeUndefined()
+  })
+
+  it('scroll-inert page: holds at the bottom only for the short inert patience', async () => {
+    const { dom } = inertDoc(100)
+    const result = await runWalk(dom, fastParams({ bottomPatienceMs: 1_500, inertPatienceMs: 10 }))
+    expect(result.reactive).toBe(false)
+    expect(result.elapsedMs).toBeLessThan(1_000)
+  })
+
+  it('scroll-inert page that fetches data at the bottom keeps the full patience', async () => {
+    const { dom } = inertDoc(100)
+    requestsAtBottom(dom, ['img', 'xmlhttprequest'])
+    const result = await runWalk(dom, fastParams({ bottomPatienceMs: 300, inertPatienceMs: 10 }))
+    expect(result.reactive).toBe(false)
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(300)
+  })
+
+  it('images and beacons at the bottom are not data requests: the short hold stands', async () => {
+    const { dom } = inertDoc(100)
+    requestsAtBottom(dom, ['img', 'beacon', 'css'])
+    const result = await runWalk(dom, fastParams({ bottomPatienceMs: 1_500, inertPatienceMs: 10 }))
+    expect(result.elapsedMs).toBeLessThan(1_000)
+  })
+
+  it('a page that reacts keeps the full bottom patience', async () => {
+    const dom = windowFeed(30)
+    const result = await runWalk(dom, fastParams({ bottomPatienceMs: 400, inertPatienceMs: 10 }))
+    expect(result.reactive).toBe(true)
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(400)
   })
 
   it('a page that does not scroll at all is skipped', async () => {

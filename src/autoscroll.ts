@@ -60,7 +60,8 @@
  *    collecting after each, until the walk can hold AT THE BOTTOM through a
  *    {@link SCROLL_BOTTOM_PATIENCE_MS} window with the height unchanged
  *    (growth restarts the clock — that is what pages load-more sentinels),
- *    or the step/budget caps close it.
+ *    or the step/budget caps close it. A page that never reacted and issued
+ *    no fetch/XHR holds only {@link SCROLL_INERT_PATIENCE_MS}.
  *
  *    A MutationObserver watches for the walk's whole reason to exist: the
  *    page REACTING to scroll by adding or removing elements. Most of the web
@@ -142,6 +143,17 @@ export const SCROLL_BOTTOM_POLL_MS = 450
  * two 450ms checks), so this is sized over a slow round trip.
  */
 export const SCROLL_BOTTOM_PATIENCE_MS = 2_500
+
+/**
+ * Bottom hold for a page that has given no sign of loading more: it never
+ * added or removed an element in response to the walk's scrolling, and it
+ * issued no fetch/XHR since the walk began. The full
+ * {@link SCROLL_BOTTOM_PATIENCE_MS} exists for feeds whose next chunk is in
+ * flight; holding it on every static article made the walk cost ~4s on
+ * pages it could never help. Any reaction or data request (even one that
+ * lands during this shorter hold) restores the full patience.
+ */
+export const SCROLL_INERT_PATIENCE_MS = 900
 
 /**
  * Careful steps without any DOM reaction before the walk treats the page as
@@ -244,6 +256,7 @@ export interface DeepCaptureParams {
   stepSettleMs: number
   bottomPollMs: number
   bottomPatienceMs: number
+  inertPatienceMs: number
   inertSteps: number
   maxSteps: number
   stashMaxEntries: number
@@ -362,6 +375,30 @@ export async function deepCaptureInPage(p: DeepCaptureParams, strip: (doc: Docum
   const observer = new MutationObserver(tally)
   observer.observe(body, { childList: true, subtree: true })
   const reacted = (): boolean => { tally(observer.takeRecords()); return reactions > 0 }
+  // Data requests (fetch/XHR): the other sign of a feed loading more.
+  // Images, fonts and beacons are not. Observed rather than read from the
+  // resource buffer, which stops growing once full (250 entries in Chromium)
+  // on exactly the heavy pages that matter. Resource Timing reports a
+  // request only once it COMPLETES: a next chunk still in flight when the
+  // short inert hold expires goes unseen, which is the price of that hold.
+  let requests = 0
+  const tallyRequests = (entries: PerformanceEntryList): void => {
+    for (const entry of entries) {
+      const type = (entry as PerformanceResourceTiming).initiatorType
+      if (type === 'fetch' || type === 'xmlhttprequest') requests++
+    }
+  }
+  let requestObserver: PerformanceObserver | null = null
+  try {
+    requestObserver = new PerformanceObserver(list => { tallyRequests(list.getEntries()) })
+    requestObserver.observe({ type: 'resource' })
+  } catch {
+    requestObserver = null // no Resource Timing: reactions alone decide
+  }
+  const requested = (): boolean => {
+    if (requestObserver !== null) tallyRequests(requestObserver.takeRecords())
+    return requests > 0
+  }
 
   // ── Stash ──────────────────────────────────────────────────────────────
   interface Snapshot {
@@ -429,6 +466,8 @@ export async function deepCaptureInPage(p: DeepCaptureParams, strip: (doc: Docum
   // Only reactions to the walk's own scrolling count from here on.
   tally(observer.takeRecords())
   reactions = 0
+  requested()
+  requests = 0
 
   let steps = 0
   let lastHeight = scrollH()
@@ -460,7 +499,9 @@ export async function deepCaptureInPage(p: DeepCaptureParams, strip: (doc: Docum
         collect()
         const before = lastHeight
         noteHeight()
-        if (lastHeight === before && Date.now() - lastChangeAt >= p.bottomPatienceMs) break
+        // `careful` implies reacted(): reactions are never reset mid-walk.
+        const patience = reacted() || requested() ? p.bottomPatienceMs : p.inertPatienceMs
+        if (lastHeight === before && Date.now() - lastChangeAt >= patience) break
         continue
       }
       if (!careful && jumpedFrom === null) {
@@ -488,6 +529,7 @@ export async function deepCaptureInPage(p: DeepCaptureParams, strip: (doc: Docum
     }
   } finally {
     observer.disconnect()
+    requestObserver?.disconnect()
   }
   const reactive = reacted()
   const finalHeight = scrollH()
@@ -585,6 +627,7 @@ export function deepCaptureParams(budgetMs: number): DeepCaptureParams {
     stepSettleMs: SCROLL_STEP_SETTLE_MS,
     bottomPollMs: SCROLL_BOTTOM_POLL_MS,
     bottomPatienceMs: SCROLL_BOTTOM_PATIENCE_MS,
+    inertPatienceMs: SCROLL_INERT_PATIENCE_MS,
     inertSteps: SCROLL_INERT_STEPS,
     maxSteps: SCROLL_MAX_STEPS,
     stashMaxEntries: SCROLL_STASH_MAX_ENTRIES,

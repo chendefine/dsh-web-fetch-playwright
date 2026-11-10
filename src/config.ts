@@ -17,12 +17,14 @@ import type { Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 
 /**
- * Default bounded budget (ms) for the deep-capture scroll walk
- * (`src/autoscroll.ts`). Sized so long topics stay fully covered at the
- * careful cadence (300ms motion + 300ms rest per ~0.7-viewport step, plus
- * the bottom patience window): 20s walks ~25kpx with pagination, covering
- * the measured linux.do badcase (~18kpx, 51 replies) with headroom.
- * Scroll-inert pages take the walk's fast path and spend a few seconds.
+ * Default CAP (ms) on the deep-capture scroll walk (`src/autoscroll.ts`).
+ * It bounds only pages that keep reacting to scrolling — virtualized feeds
+ * and load-more streams — where 20s covers ~25kpx at the careful cadence
+ * (`SCROLL_STEP_MOTION_MS` + `SCROLL_STEP_SETTLE_MS` per ~0.7-viewport
+ * step). It is not what a typical page pays: a page that never reacts takes
+ * `SCROLL_INERT_STEPS` careful steps, one jump to the bottom and a
+ * `SCROLL_INERT_PATIENCE_MS` hold, and a page that does not scroll is
+ * skipped outright.
  */
 export const DEFAULT_SCROLL_BUDGET_MS = 20_000
 
