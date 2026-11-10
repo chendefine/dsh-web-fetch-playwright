@@ -40,6 +40,8 @@ interface Fixture {
   cdp: CDPSession
   pool: CdpConnectionPool
   records: Map<string, Probe>
+  /** `/hold` responses park until this resolves; `held` fires on arrival. */
+  hold: { held: Promise<void>; release(): void }
 }
 
 const PROBE = `<!doctype html><html><head><title>Context recovery probe</title></head><body><main><pre id="probe"></pre></main><script>
@@ -59,8 +61,16 @@ const PROBE = `<!doctype html><html><head><title>Context recovery probe</title><
 
 async function withFixture(run: (fixture: Fixture) => Promise<void>): Promise<void> {
   const records = new Map<string, Probe>()
+  let arrived!: () => void
+  let release!: () => void
+  const held = new Promise<void>(resolveHeld => { arrived = resolveHeld })
+  const released = new Promise<void>(resolveReleased => { release = resolveReleased })
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    if (url.pathname === '/hold') {
+      arrived()
+      await released
+    }
     if (url.pathname === '/record') {
       let body = ''
       for await (const part of req) body += String(part)
@@ -108,8 +118,9 @@ async function withFixture(run: (fixture: Fixture) => Promise<void>): Promise<vo
     // facade ignores that return value; bridge only this type-level difference.
     pool = new CdpConnectionPool(async (url, timeout) =>
       await chromium.connectOverCDP(url, { timeout }) as unknown as PlaywrightBrowser)
-    await run({ endpoint, origin, owner, observer, cdp, pool, records })
+    await run({ endpoint, origin, owner, observer, cdp, pool, records, hold: { held, release } })
   } finally {
+    release()
     // All resources are owned by this individual test, even after assertions
     // reject; closing the observer is not the fault-injection mechanism.
     await pool?.dispose().catch(() => {})
@@ -231,6 +242,31 @@ describe.skipIf(noInstalledBrowser)('real CDP external context deletion recovery
       expect(reset).toMatchObject({ beforeCookie: null, beforeStorage: null })
       await Promise.all([fresh.release(), b.release()])
       expect((await fixture.cdp.send('Target.getBrowserContexts')).browserContextIds).toHaveLength(0)
+    })
+  }, 60_000)
+
+  // Re-identifying a sibling tab attached a CDP session to it; detaching from
+  // a tab still awaiting its response stalled until the setup deadline.
+  it('opens a same-session tab while a sibling tab is still awaiting its response', async () => {
+    await withFixture(async fixture => {
+      const alpha = { scope: 'session', name: 'alpha' } as const
+      const a = await fixture.pool.acquire(fixture.endpoint, 10_000, alpha)
+      // Read identities up front: these helpers attach to the page as well.
+      const [aId, aWindow] = [await contextId(a), await windowId(fixture, a)]
+      const navigation = (a.page as unknown as Page).goto(`${fixture.origin}/hold`)
+      try {
+        await fixture.hold.held
+        const a2 = await fixture.pool.acquire(fixture.endpoint, 5_000, alpha)
+        expect(await contextId(a2)).toBe(aId)
+        expect(await windowId(fixture, a2)).toBe(aWindow)
+        fixture.hold.release()
+        await navigation
+        await Promise.all([a.release(), a2.release()])
+        expect((await fixture.cdp.send('Target.getBrowserContexts')).browserContextIds).toHaveLength(0)
+      } finally {
+        fixture.hold.release()
+        await navigation.catch(() => {})
+      }
     })
   }, 60_000)
 

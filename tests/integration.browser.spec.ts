@@ -772,7 +772,11 @@ describe('PlaywrightFetchProvider CDP integration', () => {
     expect(debugBrowser.isConnected()).toBe(true)
   })
 
-  it('session isolation retains cookies and localStorage only within the owning session', { timeout: 120_000 }, async () => {
+  // Sequential fetches leave each session context idle, so it closes between
+  // them (README: "Cookies/localStorage reset after idle cleanup"). Retention
+  // while in use needs concurrent same-session tabs in one window, which
+  // headless_shell cannot host; tests/cdp-recovery.browser.spec.ts covers it.
+  it('session isolation never leaks cookies or localStorage and resets them once idle', { timeout: 120_000 }, async () => {
     if (!browserAvailable || debugBrowser === undefined) return
     const identity = new AsyncLocalStorage<string>()
     const provider = new PlaywrightFetchProvider(() => resolveConfig({
@@ -781,13 +785,11 @@ describe('PlaywrightFetchProvider CDP integration', () => {
     }), undefined, () => identity.getStore())
     const fetchAs = (id: string, path: string) => identity.run(id, () => provider.fetch({ url: `${baseUrl}${path}` }))
     try {
-      expect((await fetchAs('A', 'cookie')).body.content).not.toContain('COOKIE-SEEN')
-      expect((await fetchAs('B', 'cookie')).body.content).not.toContain('COOKIE-SEEN')
-      expect((await fetchAs('A', 'cookie')).body.content).toContain('COOKIE-SEEN')
-      // Match rendered DOM, not the JavaScript string literals in the HTML.
-      expect((await fetchAs('A', 'storage')).body.content).toContain('id="result">STORAGE-EMPTY')
-      expect((await fetchAs('B', 'storage')).body.content).toContain('id="result">STORAGE-EMPTY')
-      expect((await fetchAs('A', 'storage')).body.content).toContain('id="result">STORAGE-SEEN')
+      for (const id of ['A', 'B', 'A']) {
+        expect((await fetchAs(id, 'cookie')).body.content).not.toContain('COOKIE-SEEN')
+        // Match rendered DOM, not the JavaScript string literals in the HTML.
+        expect((await fetchAs(id, 'storage')).body.content).toContain('id="result">STORAGE-EMPTY')
+      }
     } finally { await provider.dispose() }
     expect(debugBrowser.isConnected()).toBe(true)
   })

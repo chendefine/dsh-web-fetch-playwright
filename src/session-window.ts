@@ -18,6 +18,10 @@ interface TargetIdentity { targetId: string; browserContextId: string }
 const ownership = new WeakMap<PlaywrightBrowser, Map<string, WeakRef<PlaywrightContext>>>()
 // Never adopt an unconfirmed late tab after timing out, nor close sibling leases.
 const unavailable = new WeakSet<PlaywrightContext>()
+// Identities confirmed when each session tab was created. Re-identifying a busy
+// sibling would attach to it, and detaching from a tab mid-navigation can stall
+// until its response arrives; a target id and its context never change.
+const identities = new WeakMap<PlaywrightPage, TargetIdentity>()
 const CLEANUP_GRACE_MS = 100
 
 function claim(browser: PlaywrightBrowser, context: PlaywrightContext, keys: string[]): void {
@@ -112,6 +116,8 @@ export async function createSessionPage(
     return session
   }
   const identify = async (page: PlaywrightPage): Promise<TargetIdentity> => {
+    const known = identities.get(page)
+    if (known) return known
     const session = await newSession(() => ctx.newCDPSession(page))
     let identificationFailed = false
     try {
@@ -164,6 +170,7 @@ export async function createSessionPage(
         throw new Error('Chromium did not place the session tab in its dedicated window')
       }
       claim(browser, context, [`context:${actual.browserContextId}`, `window:${expectedWindow}`])
+      identities.set(created, actual)
       succeeded = true
       return created
     }
@@ -209,6 +216,7 @@ export async function createSessionPage(
     const explicitWindow = await windowOf(explicitTargetId)
     if (explicitWindow === bootstrapWindow) throw new Error('Chromium ignored the dedicated session window request')
     claim(browser, context, [`context:${identity.browserContextId}`, `window:${explicitWindow}`])
+    identities.set(created, { targetId: explicitTargetId, browserContextId: identity.browserContextId })
     await deadline.run(() => bootstrap!.close())
     bootstrap = undefined
     succeeded = true
