@@ -5,6 +5,42 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The deep-capture scroll walk no longer waits ~4s on pages it cannot help.** If a page never adds or removes elements while being scrolled, and has made no fetch/XHR since the walk began, the walk now holds at the bottom for `SCROLL_INERT_PATIENCE_MS` (900ms) instead of `SCROLL_BOTTOM_PATIENCE_MS` (2.5s). Any reaction or data request, including one that arrives during the shorter hold, restores the full patience. Requests are counted with a `PerformanceObserver`. Polling the resource buffer would stop counting once Chromium's 250-entry buffer filled. A request is seen only when it completes, so a next chunk still loading when the short hold runs out is missed.
+- **Discourse post timestamps (`pre` candidate) are now ISO calendar dates** (`2024-09-05`, UTC). They were previously US-English (`September 5, 2024`), whatever the language of the page or the reader.
+- **Site-specific rules removed from the denoise features** (see `docs/benchmark-protocol.md`, rule 3):
+  - The pinyin rail names `tuijian` / `xgtj` are no longer rail names. Rails are recognised by the generic `recommend*` / `related*` names and the Outbrain/Taboola widgets.
+  - URL-shape features no longer match single-letter or store-specific path codes (`/p/`, `/c/`, `/t/`, `/dp/`, `/itm/`).
+  - The Discourse generator signal no longer counts `.ember-application`, which every Ember app carries. It still counts `#data-preloaded[data-preloaded]` and `meta[name="discourse_theme_id"]`.
+  - `consent_hits` now uses the same consent wording as the chrome stripper. A bare 同意 is no longer counted as consent wording, because it is ordinary prose.
+- Both models were retrained on the changed features as the protocol requires: the block classifier first, then the selector on cross-fitted dumps. Stripped F1 compared with 0.2.20:
+
+  | Dataset | 0.2.20 | Retrained |
+  | --- | --- | --- |
+  | WCXB dev | 0.8398 | 0.8377 |
+  | WCXB test (held out) | 0.8691 | 0.8635 |
+  | trafilatura | 0.8887 | 0.8881 |
+  | ScrapingHub | 0.9397 | 0.9396 |
+
+  First baseline on the sealed `fc` split (Firecrawl snapshot, 798 pages, CJK-aware word F1): 0.3135. Of that, CJK pages (60) score 0.3233 and the rest (738) 0.3127. Absolute scores include page drift since the truth text was written, so `fc` is meant only for comparing versions with each other.
+
+  The largest per-type losses are on WCXB test collection (0.791 → 0.754), listing (0.722 → 0.700) and forum (0.752 → 0.740). The removed features had partly learned which sites were in the training set, so this is accepted as the cost of better generalisation.
+
+  The 0.2.20 column was measured before the benchmark harness applied the provider's 2M-character input cap. Re-measured with the cap, 0.2.20 scores 0.8390 on WCXB dev; the other splits are unchanged. The selector margin stays 0.08: it is the only value tried (0, 0.04, 0.08, 0.12) under which 5-fold CV improves on the pre-selector baseline for all three development splits, and it was chosen on CV alone.
+- **Threshold sensitivity check** (protocol rule 5, `benchmark/sweep-thresholds.sh`). Each hand-set candidate threshold (trailing prune: link density, article share, run share, uniform density band; rails: link density, minimum links; gate: article coverage) was rescored at ×0.75 and ×1.25 on WCXB dev and ScrapingHub. Every change stays within ±0.1pp, so none of them holds only at its chosen value. The two rail thresholds move nothing on these splits, which barely contain such rails. They rest on the CJK badcases alone.
+- The scroll walk's cost on a ~30-viewport static article, measured in a real browser, went from 3.8s to 2.4s. Pages that do not scroll still pay nothing.
+
+### Fixed
+
+- **The denoise input cap now applies on every path into the pipeline.** Previously only the live-render path capped the input. The unrenderable-loader fallback and the download/attachment refetch passed the whole body, and a multi-MB page could exhaust the heap. A cut input marks the result `truncated`.
+
+### Added
+
+- `docs/benchmark-protocol.md`: the rules for changing the denoise pipeline. It covers what each split may be used for (WCXB test and `fc` are held out), no site-specific rules, retraining both models when a feature changes, and sensitivity checks for hand-set thresholds.
+
 ## [0.2.20] - 2026-11-10
 
 ### Changed

@@ -26,10 +26,6 @@
 
 - id: tool-web
   disabled: false
-  config:
-    fetch: true
-    fetchTimeoutMs: 60000
-    searchTimeoutMs: 60000
 
 - insert:
     - id: web-fetch-playwright
