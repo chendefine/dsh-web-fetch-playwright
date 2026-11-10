@@ -508,12 +508,16 @@ export function findRecordRegion(body: Element): RecordRegion | null {
   return best
 }
 
-/** Format an ISO timestamp the way forum UIs print it ("September 5, 2024"). */
+/**
+ * A post's timestamp as a locale-neutral calendar date (`2024-09-05`, UTC).
+ * Deliberately not any UI's localized rendering: the reader may be any
+ * language, and the page itself prints dates in its own locale.
+ */
 function formatForumDate(iso: unknown): string {
   if (typeof iso !== 'string') return ''
   const date = new Date(iso)
   if (Number.isNaN(date.getTime())) return ''
-  return date.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' })
+  return date.toISOString().slice(0, 10)
 }
 
 /**

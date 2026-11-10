@@ -70,7 +70,8 @@ describe('Discourse preloaded stream', () => {
     const attr = JSON.stringify({ topic_42: topic }).replace(/"/g, '&quot;')
     const html = discoursePreloadedHtml(doc(`<body><div id="data-preloaded" data-preloaded="${attr}"></div></body>`))
     expect(html).toContain('alice')
-    expect(html).toContain('September 5, 2024')
+    expect(html).toContain('2024-09-05')
+    expect(html).not.toContain('September')
     expect(html).toContain('<p>Reply</p>')
   })
 
