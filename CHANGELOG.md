@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.20] - 2026-11-10
+
+### Changed
+
+- **Denoise is now "propose, then select" instead of one chain of global thresholds.** Each extraction heuristic proposes a candidate (`src/candidates.ts`): Readability with trailing-rail prune (`art`, the 0.2.18 path), unpruned (`artu`), and lenient (`artx`); the semantic main container (`main`); the whole document (`doc`, the old fallback) and a chrome-stripped one (`docc`: consent/cookie banners by name and wording, hidden subtrees, nav/menu/share/ad-named subtrees); the dominant repeated-record region (`rec`: product cards, list rows); noscript-unwrapped variants (`ns_art`/`ns_doc`, for Discourse-style server fallbacks); the Discourse `data-preloaded` post stream (`pre`); and a block-classifier pick (`blk`, `src/blocks.ts`: per-block content probability from gradient-boosted trees, kept blocks re-emitted in document order). A learned selector (`src/selector.ts`, gradient-boosted regression over page features such as generator meta, JSON-LD `@type`, `og:type`, URL shape, DOM statistics, plus candidate features such as size, link density, and block-level diffs against Readability) picks one candidate per page. The 0.2.18 choice is kept unless another candidate beats its estimate by 0.08, so a new heuristic can only add an option and cannot silently override the others. This retires the global-threshold conflicts of earlier releases: noscript unwrapping helped forums but hurt other pages when applied globally, and the 0.2.18 prune deleted link directories that were the content.
+- `DenoiseResult` gains `strategy` (the chosen candidate kind). `mode` keeps its meaning: `document` for whole-document candidates, `article` otherwise.
+- Models are generated files (`src/selector-model.ts`, `src/block-model.ts`) trained by the benchmark tooling: block classifier on WCXB dev + ScrapingHub, selector on WCXB dev + ScrapingHub + trafilatura, with cross-fitted block models so the selector never trains on in-fold block predictions. WCXB test was held out of both.
+- Benchmark, stripped-markdown F1, v0.2.18 → v0.2.20: WCXB test (held out) 0.851 → 0.869; WCXB dev 0.792 → 0.840 (in-sample; 5-fold CV estimate 0.829); trafilatura 0.881 → 0.888; ScrapingHub 0.939 → 0.939. WCXB dev per type: forum 0.48 → 0.69, collection 0.59 → 0.69, listing 0.57 → 0.65, product 0.54 → 0.62, service 0.73 → 0.79, article 0.93 → 0.94. Pages under F1 0.3 dropped from 156 to 85, and empty outputs from 26 to 9. Known trade-offs: WCXB test article F1 −0.4pp (two pages); service precision −1.5pp and test forum precision −2.7pp, traded for larger recall gains.
+- Denoise CPU cost is roughly 2.8× (WCXB dev p50 0.36s → 1.0s per page under 12-way parallelism), from multiple Readability passes and per-candidate sanitizing. That is small next to a browser fetch.
+
+### Fixed
+
+- Iterating element children no longer goes through jsdom's `HTMLCollection` proxy in the trailing-prune walk and the new candidate walks. On a 4,000-paragraph page, the proxy accounted for most of a 5s denoise.
+
 ## [0.2.19] - 2026-11-10
 
 ### Added
