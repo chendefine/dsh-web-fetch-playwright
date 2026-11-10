@@ -18,6 +18,8 @@
  * and the feature-on provider for the before/after comparison (issue #2).
  */
 import { createServer } from 'node:http'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { resolveConfig } from '../src/config.ts'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -131,6 +133,11 @@ const CHALLENGE_HEADERS = {
   'cf-mitigated': 'challenge',
   'server': 'cloudflare',
 } as const
+
+/** PDF fixtures (scripts/make-pdf-fixtures.mjs) served by the PDF routes. */
+const STRUCTURED_PDF = readFileSync(fileURLToPath(new URL('./fixtures/pdf/structured.pdf', import.meta.url)))
+const SCANNED_PDF = readFileSync(fileURLToPath(new URL('./fixtures/pdf/scanned.pdf', import.meta.url)))
+const ZIP_BYTES = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00])
 
 /** Observable counters of the simulated challenge edge. */
 const challengeState = { challengesServed: 0 }
@@ -276,9 +283,51 @@ beforeAll(async () => {
       res.end('{"url":"https://x.com/tianyi/status/2105790798461882377","author_name":"Tianyi Cui"}')
       return
     }
-    if (url === '/download/pdf') {
-      res.writeHead(200, { 'content-type': 'application/pdf', 'content-disposition': 'attachment; filename=doc.pdf' })
-      res.end('%PDF-1.7 fake')
+    if (url === '/pdf/inline.pdf') {
+      // The common case: a PDF link served inline. Headless Chromium has no
+      // viewer and downloads it; a headed / CDP-attached Chrome may commit
+      // it into the viewer — both must end up extracted.
+      res.writeHead(200, { 'content-type': 'application/pdf', 'content-length': String(STRUCTURED_PDF.length) })
+      res.end(STRUCTURED_PDF)
+      return
+    }
+    if (url === '/pdf/attachment') {
+      res.writeHead(200, { 'content-type': 'application/pdf', 'content-disposition': 'attachment; filename="handbook.pdf"' })
+      res.end(STRUCTURED_PDF)
+      return
+    }
+    if (url.startsWith('/pdf/blob')) {
+      // A PDF behind an opaque type and a path without an extension: only
+      // the %PDF- magic identifies it.
+      res.writeHead(200, { 'content-type': 'application/octet-stream' })
+      res.end(STRUCTURED_PDF)
+      return
+    }
+    if (url === '/pdf/zip') {
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-disposition': 'attachment; filename=archive.zip' })
+      res.end(ZIP_BYTES)
+      return
+    }
+    if (url === '/pdf/scan.pdf') {
+      res.writeHead(200, { 'content-type': 'application/pdf' })
+      res.end(SCANNED_PDF)
+      return
+    }
+    if (url === '/pdf/login') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'set-cookie': 'dsh-pdf-session=ok; Path=/' })
+      res.end(COOKIE_PAGE_BLANK)
+      return
+    }
+    if (url === '/pdf/private.pdf') {
+      // Only a request carrying the session cookie gets the PDF: the bytes
+      // refetch must ride the browser context's cookie jar.
+      if ((req.headers.cookie ?? '').includes('dsh-pdf-session=ok')) {
+        res.writeHead(200, { 'content-type': 'application/pdf' })
+        res.end(STRUCTURED_PDF)
+      } else {
+        res.writeHead(403, { 'content-type': 'text/html; charset=utf-8' })
+        res.end('<html><body><h1>Forbidden</h1></body></html>')
+      }
       return
     }
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
@@ -522,12 +571,8 @@ describe('PlaywrightFetchProvider integration', () => {
     expect(result.truncated).toBe(false)
   })
 
-  it('refuses an attachment PDF as WEB_UNSUPPORTED_CONTENT_TYPE (an undecodable download)', { timeout: 120_000 }, async () => {
-    if (!browserAvailable) {
-      console.warn('skipping browser smoke (no launchable browser)')
-      return
-    }
-    const provider = new PlaywrightFetchProvider(() => ({
+  describe('PDF links (real headless Chromium)', () => {
+    const localProvider = (): PlaywrightFetchProvider => new PlaywrightFetchProvider(() => ({
       backend: 'local',
       playwrightPath: '',
       cdpEndpoint: '',
@@ -538,9 +583,43 @@ describe('PlaywrightFetchProvider integration', () => {
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
-    const error = await provider.fetch({ url: `${baseUrl}download/pdf` }).catch(caught => caught)
-    expect(error).toBeInstanceOf(WebError)
-    expect((error as WebError).code).toBe('WEB_UNSUPPORTED_CONTENT_TYPE')
+    const expectHandbook = (result: Awaited<ReturnType<PlaywrightFetchProvider['fetch']>>): void => {
+      expect(result.statusCode).toBe(200)
+      expect(result.body.kind).toBe('text')
+      const content = result.body.kind === 'text' ? result.body.content : ''
+      expect(content).toMatch(/^# PDF Fixture Handbook$/m)
+      expect(content).toContain('## 1 Introduction')
+      expect(content).toContain('| alpha | 12 | 0.8 |')
+      expect(content).toContain('这是第一段中文内容')
+    }
+
+    it('extracts an inline application/pdf link', { timeout: 120_000 }, async () => {
+      if (!browserAvailable) return
+      expectHandbook(await localProvider().fetch({ url: `${baseUrl}pdf/inline.pdf` }))
+    })
+
+    it('extracts an attachment PDF', { timeout: 120_000 }, async () => {
+      if (!browserAvailable) return
+      expectHandbook(await localProvider().fetch({ url: `${baseUrl}pdf/attachment` }))
+    })
+
+    it('sniffs an application/octet-stream PDF without a .pdf path', { timeout: 120_000 }, async () => {
+      if (!browserAvailable) return
+      expectHandbook(await localProvider().fetch({ url: `${baseUrl}pdf/blob?id=42` }))
+    })
+
+    it('still refuses a non-PDF binary download', { timeout: 120_000 }, async () => {
+      if (!browserAvailable) return
+      const error = await localProvider().fetch({ url: `${baseUrl}pdf/zip` }).catch(caught => caught)
+      expect(error).toBeInstanceOf(WebError)
+      expect((error as WebError).code).toBe('WEB_UNSUPPORTED_CONTENT_TYPE')
+    })
+
+    it('reports a scanned PDF as WEB_PDF_NO_TEXT', { timeout: 120_000 }, async () => {
+      if (!browserAvailable) return
+      const error = await localProvider().fetch({ url: `${baseUrl}pdf/scan.pdf` }).catch(caught => caught)
+      expect((error as WebError).code).toBe('WEB_PDF_NO_TEXT')
+    })
   })
 })
 
@@ -610,6 +689,35 @@ describe('PlaywrightFetchProvider CDP integration', () => {
     expect(content).toMatch(/^# (Smoke page|Smoke heading)\b/m)
     expect(content).not.toContain('nav link')
     await provider.dispose()
+  })
+
+  it('extracts PDF links over CDP, refetching with the remote browser\'s cookies', { timeout: 120_000 }, async () => {
+    if (!browserAvailable || debugBrowser === undefined) {
+      console.warn('skipping CDP smoke (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(() => ({
+      backend: 'cdp',
+      playwrightPath: '',
+      cdpEndpoint: endpoint,
+      contextIsolationScope: 'global' as const,
+      shareBrowserContext: true, // profile mode: the remote browser's own jar
+      denoise: true,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
+    }))
+    try {
+      const inline = await provider.fetch({ url: `${baseUrl}pdf/inline.pdf` })
+      expect(inline.body.kind === 'text' ? inline.body.content : '').toMatch(/^# PDF Fixture Handbook$/m)
+      // The private PDF is only served to the session the login page set up
+      // IN the remote browser: the bytes refetch must carry that cookie.
+      await provider.fetch({ url: `${baseUrl}pdf/login` })
+      const gated = await provider.fetch({ url: `${baseUrl}pdf/private.pdf` })
+      expect(gated.statusCode).toBe(200)
+      expect(gated.body.kind === 'text' ? gated.body.content : '').toContain('## 2 Lists')
+    } finally {
+      await provider.dispose()
+    }
   })
 
   it('serves a concurrent burst as tabs over the one shared connection', { timeout: 120_000 }, async () => {

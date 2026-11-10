@@ -52,6 +52,8 @@ export { deepCaptureWalk } from './autoscroll.ts'
 export type { DeepCapture, DeepCaptureStats } from './autoscroll.ts'
 export { PLAYWRIGHT_FETCH_PROVIDER_ID, PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE } from './provider.ts'
 export { htmlToMarkdown } from './markdown.ts'
+export { extractPdfMarkdown, isPdfBytes, isPdfContentType, layoutPdfMarkdown, mayBePdf, MAX_PDF_BYTES, MAX_PDF_PAGES, readPdfDocument, WEB_PDF_ENCRYPTED_CODE, WEB_PDF_INVALID_CODE, WEB_PDF_NO_TEXT_CODE, WEB_PDF_TOO_LARGE_CODE } from './pdf.ts'
+export type { PdfDocumentText, PdfExtraction, PdfExtractOptions, PdfOutlineEntry, PdfPageText, PdfTextRun } from './pdf.ts'
 export type { DenoiseMode, DenoiseResult } from './markdown.ts'
 
 /** Cordis plugin name used by loader diagnostics. */

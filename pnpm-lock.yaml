@@ -29,6 +29,9 @@ importers:
       turndown:
         specifier: ^7.2.0
         version: 7.2.4
+      unpdf:
+        specifier: ^2.1.0
+        version: 2.1.0
     devDependencies:
       '@deepseek-ai/cordis':
         specifier: 4.0.4
@@ -1039,6 +1042,15 @@ packages:
   undici-types@8.10.0:
     resolution: {integrity: sha512-ibvdovq3nCFs8Msrd95BW+zUOq+aOVbT+wpHUoPWhztbHEoPc6oof51iFDB6Es8lTKvNvVW9jNSAB8dwrKTMGg==}
 
+  unpdf@2.1.0:
+    resolution: {integrity: sha512-G/Hsrm++g0EoubUhV8TDFItq6oQ+FUu9EMvIRtHUwseKXB0iJoCvaLvBGOpYUBqyvggv/XfxhYYtohL2QpE3xQ==}
+    engines: {node: '>=24'}
+    peerDependencies:
+      '@napi-rs/canvas': ^0.1.69 || ^1.0.0
+    peerDependenciesMeta:
+      '@napi-rs/canvas':
+        optional: true
+
   verkit@0.3.2:
     resolution: {integrity: sha512-zj/ob3UsvJGN0whEAKFp53REA5X66hvffVqoCtVQAakJKnKlH+/PcOfMoFwIG/o4rElqLv/ycAFlx8ZlXUorCg==}
     engines: {node: '>=18.12.0'}
@@ -1916,6 +1928,8 @@ snapshots:
   undici-types@7.18.2: {}
 
   undici-types@8.10.0: {}
+
+  unpdf@2.1.0: {}
 
   verkit@0.3.2: {}
 

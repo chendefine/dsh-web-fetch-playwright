@@ -60,7 +60,7 @@ interface FakePageSpec {
     headers?: Record<string, string>
     url?: string
     /** What the page's API request context serves the recovery refetch. */
-    refetched?: { status?: number; contentType?: string; body?: string }
+    refetched?: { status?: number; contentType?: string; body?: string; bytes?: Uint8Array; headers?: Record<string, string> }
     /** Omit `page.request` to exercise the no-request-context error path. */
     noRequestContext?: boolean
     /** Reject with a bare `net::ERR_ABORTED` instead of "Download is starting". */
@@ -97,6 +97,15 @@ interface FakePageSpec {
   serializationCorruption?: { corrupted: string; clean: string }
   /** What the page resolves for the deep-capture walk (default: the challenge probe's answer). */
   deepCapture?: unknown
+  /**
+   * Binary navigation body (`response.body()`) — a PDF Chrome committed
+   * inline into its viewer. `null` makes `body()` reject (the viewer owns it).
+   */
+  binaryBody?: Uint8Array | null
+  /** Extra navigation response headers. */
+  headers?: Record<string, string>
+  /** An API request context for non-download navigations (the PDF refetch). */
+  requestContext?: { status?: number; contentType?: string; bytes?: Uint8Array; headers?: Record<string, string> }
 }
 
 const ARTICLE_HTML = `<!doctype html><html><head><title>Fake page</title></head><body>
@@ -162,12 +171,18 @@ interface FakePageState {
 function fakeResponse(spec: FakePageSpec, entry?: NonNullable<FakePageSpec['gotoScript']>[number]): PlaywrightResponse | null {
   if (spec.gotoError !== undefined) return null
   const challenge = entry?.challenge === true || (entry === undefined && spec.challenge === true)
-  const headers: Record<string, string> = { 'content-type': entry?.contentType ?? spec.contentType ?? 'text/html; charset=utf-8' }
+  const headers: Record<string, string> = { 'content-type': entry?.contentType ?? spec.contentType ?? 'text/html; charset=utf-8', ...(spec.headers ?? {}) }
   if (challenge) headers['cf-mitigated'] = 'challenge'
   return {
     status: () => entry?.status ?? spec.status ?? (challenge ? 403 : 200),
     headers: () => headers,
     text: async () => entry?.textBody ?? spec.textBody ?? '',
+    ...('binaryBody' in spec ? {
+      body: async (): Promise<Uint8Array> => {
+        if (spec.binaryBody === null || spec.binaryBody === undefined) throw new Error('Protocol error (Network.getResponseBody): No data found for resource with given identifier')
+        return spec.binaryBody
+      },
+    } : {}),
     url: () => spec.finalUrl ?? 'https://final.example.com/docs',
     request: () => ({
       isNavigationRequest: () => true,
@@ -334,10 +349,27 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, listeners: FakeP
           get: async (fetchUrl: string): Promise<PlaywrightResponse> => {
             state.refetches++
             const rf = spec.downloadFailure?.refetched
+            const text = rf?.body ?? '{"type":"tweet","html":"<blockquote>…</blockquote>"}'
             return {
               status: () => rf?.status ?? 200,
-              headers: () => ({ 'content-type': rf?.contentType ?? 'application/json; charset=utf-8' }),
-              text: async () => rf?.body ?? '{"type":"tweet","html":"<blockquote>…</blockquote>"}',
+              headers: () => ({ 'content-type': rf?.contentType ?? 'application/json; charset=utf-8', ...(rf?.headers ?? {}) }),
+              text: async () => text,
+              body: async () => rf?.bytes ?? new TextEncoder().encode(text),
+              url: () => fetchUrl,
+            }
+          },
+        },
+      } : {}),
+      ...(spec.downloadFailure === undefined && spec.requestContext !== undefined ? {
+        request: {
+          get: async (fetchUrl: string): Promise<PlaywrightResponse> => {
+            state.refetches++
+            const rc = spec.requestContext!
+            return {
+              status: () => rc.status ?? 200,
+              headers: () => ({ 'content-type': rc.contentType ?? 'application/pdf', ...(rc.headers ?? {}) }),
+              text: async () => new TextDecoder().decode(rc.bytes ?? new Uint8Array()),
+              body: async () => rc.bytes ?? new Uint8Array(),
               url: () => fetchUrl,
             }
           },
@@ -797,11 +829,11 @@ describe('PlaywrightFetchProvider download navigation recovery', () => {
     expect(raw.body).toEqual({ kind: 'html', content: '<html><body>attached raw</body></html>' })
   })
 
-  it('refuses an undecodable download (pdf/zip) as WEB_UNSUPPORTED_CONTENT_TYPE without refetching', async () => {
+  it('refuses an undecodable download (zip) as WEB_UNSUPPORTED_CONTENT_TYPE without refetching', async () => {
     const provider = new FakeProvider({}, {
-      downloadFailure: { contentType: 'application/pdf' },
+      downloadFailure: { contentType: 'application/zip', url: 'https://example.com/archive.zip' },
     })
-    const code = await codeOf(provider.fetch({ url: 'https://example.com/file.pdf' }))
+    const code = await codeOf(provider.fetch({ url: 'https://example.com/archive.zip' }))
     expect(code).toBe('WEB_UNSUPPORTED_CONTENT_TYPE')
     const session = provider.lastSession as unknown as { closed: { refetches: number } }
     expect(session.closed.refetches).toBe(0)
@@ -862,6 +894,96 @@ describe('PlaywrightFetchProvider download navigation recovery', () => {
       downloadFailure: { refetched: { status: 200, contentType: 'application/json', body: '{"ok":true}' } },
     }).fetch({ url: 'https://example.com/oembed' })
     expect(result.statusCode).toBe(200)
+  })
+})
+
+/** The Chromium-printed fixture (see scripts/make-pdf-fixtures.mjs). */
+const STRUCTURED_PDF = new Uint8Array(readFileSync(fileURLToPath(new URL('./fixtures/pdf/structured.pdf', import.meta.url))))
+const SCANNED_PDF = new Uint8Array(readFileSync(fileURLToPath(new URL('./fixtures/pdf/scanned.pdf', import.meta.url))))
+const ZIP_BYTES = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x08, 0x00])
+
+describe('PlaywrightFetchProvider PDF routing', () => {
+  const contentOf = (result: { body: { kind: string; content: string } }): string => result.body.content
+
+  it('extracts a PDF download (attachment / headless Chromium shape) to markdown via the refetch', async () => {
+    const provider = new FakeProvider({}, {
+      downloadFailure: {
+        contentType: 'application/pdf',
+        url: 'https://papers.example.com/handbook.pdf',
+        refetched: { contentType: 'application/pdf', bytes: STRUCTURED_PDF },
+      },
+    })
+    const result = await provider.fetch({ url: 'https://papers.example.com/handbook.pdf' })
+    expect(result.statusCode).toBe(200)
+    expect(result.body.kind).toBe('text')
+    const markdown = contentOf(result)
+    expect(markdown).toMatch(/^<!-- page 1 -->\n\n# PDF Fixture Handbook$/m)
+    expect(markdown).toContain('## 1 Introduction')
+    expect(markdown).toContain('| Engine | Pages | Seconds |')
+    expect(result.url).toBe('https://papers.example.com/handbook.pdf')
+    expect((provider.lastSession as unknown as { closed: { refetches: number } }).closed.refetches).toBe(1)
+  })
+
+  it('extracts a PDF Chrome committed inline (viewer / CDP shape) from the navigation body', async () => {
+    const provider = new FakeProvider({}, { contentType: 'application/pdf', binaryBody: STRUCTURED_PDF })
+    const result = await provider.fetch({ url: 'https://example.com/doc.pdf' })
+    expect(result.body.kind).toBe('text')
+    expect(contentOf(result)).toContain('# PDF Fixture Handbook')
+  })
+
+  it('refetches an inline PDF whose navigation body the viewer withholds', async () => {
+    const provider = new FakeProvider({}, { contentType: 'application/pdf', binaryBody: null, requestContext: { bytes: STRUCTURED_PDF } })
+    const result = await provider.fetch({ url: 'https://example.com/doc.pdf' })
+    expect(contentOf(result)).toContain('## 2 Lists')
+    expect((provider.lastSession as unknown as { closed: { refetches: number } }).closed.refetches).toBe(1)
+  })
+
+  it('sniffs an application/octet-stream download and extracts it when the bytes are a PDF', async () => {
+    const result = await new FakeProvider({}, {
+      downloadFailure: {
+        contentType: 'application/octet-stream',
+        url: 'https://files.example.com/download?id=42',
+        refetched: { contentType: 'application/octet-stream', bytes: STRUCTURED_PDF },
+      },
+    }).fetch({ url: 'https://files.example.com/download?id=42' })
+    expect(contentOf(result)).toContain('# PDF Fixture Handbook')
+  })
+
+  it('refuses an octet-stream download whose bytes are not a PDF', async () => {
+    const provider = new FakeProvider({}, {
+      downloadFailure: {
+        contentType: 'application/octet-stream',
+        url: 'https://files.example.com/download?id=7',
+        refetched: { contentType: 'application/octet-stream', bytes: ZIP_BYTES },
+      },
+    })
+    const error = await provider.fetch({ url: 'https://files.example.com/download?id=7' }).catch(caught => caught)
+    expect((error as WebError).code).toBe('WEB_UNSUPPORTED_CONTENT_TYPE')
+    expect((error as WebError).message).toContain('not a PDF')
+  })
+
+  it('refuses a declared PDF over the size limit before downloading it', async () => {
+    const provider = new FakeProvider({}, {
+      downloadFailure: { contentType: 'application/pdf', headers: { 'content-length': String(200 * 1024 * 1024) }, refetched: { bytes: STRUCTURED_PDF } },
+    })
+    expect(await codeOf(provider.fetch({ url: 'https://example.com/huge.pdf' }))).toBe('WEB_PDF_TOO_LARGE')
+    expect((provider.lastSession as unknown as { closed: { refetches: number } }).closed.refetches).toBe(0)
+  })
+
+  it('reports a scanned PDF as WEB_PDF_NO_TEXT', async () => {
+    const code = await codeOf(new FakeProvider({}, { contentType: 'application/pdf', binaryBody: SCANNED_PDF }).fetch({ url: 'https://example.com/scan.pdf' }))
+    expect(code).toBe('WEB_PDF_NO_TEXT')
+  })
+
+  it('reports bytes that only claim to be a PDF as WEB_PDF_INVALID', async () => {
+    const code = await codeOf(new FakeProvider({}, { contentType: 'application/pdf', binaryBody: new TextEncoder().encode('<html>not found</html>'), requestContext: { bytes: new TextEncoder().encode('<html>not found</html>') } }).fetch({ url: 'https://example.com/missing.pdf' }))
+    expect(code).toBe('WEB_PDF_INVALID')
+  })
+
+  it('still refuses other binary content types outright (no download, no sniff)', async () => {
+    const provider = new FakeProvider({}, { contentType: 'image/png', requestContext: { bytes: STRUCTURED_PDF } })
+    expect(await codeOf(provider.fetch({ url: 'https://example.com/img' }))).toBe('WEB_UNSUPPORTED_CONTENT_TYPE')
+    expect((provider.lastSession as unknown as { closed: { refetches: number } }).closed.refetches).toBe(0)
   })
 })
 

@@ -13,6 +13,11 @@ export interface PlaywrightResponse {
   status(): number
   headers(): Record<string, string>
   text(): Promise<string>
+  /**
+   * The raw body bytes — the PDF path reads binary bodies through it (a
+   * Node `Buffer` is a `Uint8Array`). Absent on minimal fakes.
+   */
+  body?(): Promise<Uint8Array>
   /** This response's URL; absent on minimal fakes. */
   url?(): string
   /**

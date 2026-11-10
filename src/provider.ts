@@ -33,6 +33,15 @@
  * {@link DEFAULT_MAX_CONCURRENCY_CDP} tabs); further fetches wait briefly in
  * a queue and fail fast (rather than hang until abort) when no slot frees.
  *
+ * PDFs: a URL that serves a PDF — committed inline into Chrome's viewer,
+ * handed to the download manager as an attachment, or served as an opaque
+ * `application/octet-stream` whose bytes start with `%PDF-` — is read as
+ * bytes (the navigation body, else a refetch through the page's API request
+ * context) and extracted to markdown by `src/pdf.ts` (pdf.js via `unpdf`
+ * plus layout heuristics: headings, paragraphs, lists, tables, page
+ * markers). Scans without a text layer, encrypted, oversized, and broken
+ * PDFs fail with the `WEB_PDF_*` codes.
+ *
  * Private-network and SSRF protection is not implemented (same stance as the
  * shipped HTTP provider); a page this provider can reach is whatever the
  * browser can reach. Profile mode additionally acts WITH the remote
@@ -87,6 +96,7 @@ import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, effectiveCh
 import type { ResolvedConfig } from './config.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
 import { htmlToMarkdown } from './markdown.ts'
+import { extractPdfMarkdown, isPdfBytes, isPdfContentType, mayBePdf, MAX_PDF_BYTES, WEB_PDF_INVALID_CODE, WEB_PDF_TOO_LARGE_CODE } from './pdf.ts'
 import { STRIP_SCRIPTING_ELEMENTS } from './strip.ts'
 import { resolveCdpBackend, resolvePlaywrightBackend } from './playwright-resolve.ts'
 import type { PlaywrightBrowser, PlaywrightContext, PlaywrightDownload, PlaywrightPage, PlaywrightResponse, PlaywrightRoute } from './types.ts'
@@ -288,12 +298,16 @@ function validateFetchUrl(input: string): URL {
   return url
 }
 
-/** The decodable body kinds, mirroring the HTTP provider's classification. */
-type FetchableKind = 'html' | 'text'
+/**
+ * The decodable body kinds: the HTTP provider's classification plus `pdf`,
+ * which this provider extracts to markdown (see `src/pdf.ts`).
+ */
+type FetchableKind = 'html' | 'text' | 'pdf'
 
 /** Classify a `Content-Type` into a decodable kind; undefined = unsupported. */
 function classifyContentType(contentType: string | undefined): FetchableKind | undefined {
   const mime = (contentType ?? '').replace(/;.*$/s, '').trim().toLowerCase()
+  if (isPdfContentType(mime)) return 'pdf'
   if (mime === '' || mime === 'text/html' || mime === 'application/xhtml+xml') return 'html'
   if (mime.startsWith('text/')) return 'text'
   if (mime === 'application/json' || mime === 'application/xml' || mime.endsWith('+json') || mime.endsWith('+xml')) return 'text'
@@ -543,14 +557,23 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     // ran (the real page reloads in), else the response goto returned.
     const finalResponse = (challengeWaitMs > 0 ? tracker.last() : undefined) ?? response
     const kind = classifyContentType(finalResponse?.headers()['content-type'])
-    if (kind === undefined) {
-      throw new WebError(`unsupported content type "${finalResponse?.headers()['content-type'] ?? 'unknown'}"`, 'WEB_UNSUPPORTED_CONTENT_TYPE')
-    }
     const finalUrl = page.url()
     // An SPA-style clear swaps the document without navigating: no new
     // response exists to report, so the cleared document reads as served.
     const clearedWithoutNavigation = challengeEntryResponse !== null && finalResponse === challengeEntryResponse
     const statusCode = finalResponse !== null && !clearedWithoutNavigation ? finalResponse.status() : 200
+
+    // A PDF the browser committed as a document (its built-in viewer — a
+    // headed or CDP-attached Chrome) or an opaque binary that may be one:
+    // read the bytes and extract them, never the viewer's wrapper DOM.
+    if (kind === 'pdf' || (kind === undefined && finalResponse !== null && mayBePdf(finalResponse.headers(), finalUrl))) {
+      const download = await downloadPdfBytes(page, finalResponse, finalResponse?.url?.() ?? finalUrl, deadline)
+      if (download.pdf) return await pdfResult(download.bytes, download.url, statusCode, deadline)
+      if (kind === 'pdf') throw new WebError('the response claims to be a PDF but its bytes are not one', WEB_PDF_INVALID_CODE)
+    }
+    if (kind === undefined) {
+      throw new WebError(`unsupported content type "${finalResponse?.headers()['content-type'] ?? 'unknown'}"`, 'WEB_UNSUPPORTED_CONTENT_TYPE')
+    }
 
     // Non-HTML decodes straight from the response body; no denoise applies.
     if (kind === 'text') {
@@ -820,7 +843,7 @@ async function recoverUnrenderedStatus(
   // class only fires on empty bodies, so '' is the honest fallback.
   let content = ''
   try { content = await response.text() } catch { content = '' }
-  if (kind === 'text' || content === '') {
+  if (kind !== 'html' || content === '') {
     // Empty HTML needs no pipeline — the empty string IS the body.
     return capResult(finalUrl, status, { kind: 'text', content })
   }
@@ -866,7 +889,9 @@ function isDownloadFailure(error: unknown, response: PlaywrightResponse | null):
  * download decision — which works identically on the local and CDP
  * backends because it never touches the remote artifact.
  *
- * Undecodable downloads (a PDF, a ZIP) still fail with
+ * A PDF download (declared `application/pdf`, or an opaque binary whose
+ * bytes sniff as `%PDF-`) is extracted to markdown (`src/pdf.ts`);
+ * undecodable downloads (a ZIP) still fail with
  * `WEB_UNSUPPORTED_CONTENT_TYPE`, classified from what the navigation
  * actually served; a playwright build without a request context surfaces a
  * clear "the browser will not render this" error instead of the raw
@@ -893,8 +918,14 @@ async function recoverDownloadResponse(
   if (!isDownloadFailure(error, tracked)) return undefined
   if (tracked !== null) {
     // What the site served the navigation is the truth about the resource:
-    // an undecodable download (PDF/ZIP/…) has no business being refetched.
+    // an undecodable download (ZIP/…) has no business being refetched — a
+    // PDF (declared, or an opaque binary that may be one) is the exception.
     const trackedKind = classifyContentType(tracked.headers()['content-type'])
+    if (trackedKind === 'pdf' || (trackedKind === undefined && mayBePdf(tracked.headers(), tracked.url?.() ?? url.toString()))) {
+      const download = await downloadPdfBytes(page, null, tracked.url?.() ?? url.toString(), deadline, tracked.headers())
+      if (download.pdf) return await pdfResult(download.bytes, download.url, download.status, deadline)
+      throw new WebError(`unsupported content type "${tracked.headers()['content-type'] ?? 'unknown'}" (served as a download; not a PDF)`, 'WEB_UNSUPPORTED_CONTENT_TYPE')
+    }
     if (trackedKind === undefined) {
       throw new WebError(`unsupported content type "${tracked.headers()['content-type'] ?? 'unknown'}" (served as a download)`, 'WEB_UNSUPPORTED_CONTENT_TYPE')
     }
@@ -913,6 +944,13 @@ async function recoverDownloadResponse(
   // answer falls back to what the navigation served.
   const servedType = (headers['content-type'] ?? '').trim() !== '' ? headers['content-type'] : tracked?.headers()['content-type']
   const kind = classifyContentType(servedType)
+  if (kind === 'pdf') {
+    // Untracked navigation, but the refetch says PDF: extract it.
+    assertPdfSize(headers)
+    const bytes = refetched.body !== undefined ? await refetched.body() : new Uint8Array()
+    if (!isPdfBytes(bytes)) throw new WebError('the response claims to be a PDF but its bytes are not one', WEB_PDF_INVALID_CODE)
+    return await pdfResult(bytes, refetched.url?.() ?? fetchUrl, refetched.status(), deadline)
+  }
   if (kind === undefined) {
     throw new WebError(`unsupported content type "${servedType ?? 'unknown'}"`, 'WEB_UNSUPPORTED_CONTENT_TYPE')
   }
@@ -925,6 +963,77 @@ async function recoverDownloadResponse(
   if (!denoise) return capResult(finalUrl, statusCode, { kind: 'html', content })
   const { markdown } = htmlToMarkdown(content, finalUrl)
   return capResult(finalUrl, statusCode, { kind: 'text', content: markdown })
+}
+
+/** Time kept back from the PDF page walk for layout and result assembly. */
+const PDF_FINISH_RESERVE_MS = 1_500
+
+/** Refuse a PDF whose declared length is over the limit — before downloading it. */
+function assertPdfSize(headers: Record<string, string> | undefined): void {
+  const declared = Number.parseInt(headers?.['content-length'] ?? '', 10)
+  if (Number.isFinite(declared) && declared > MAX_PDF_BYTES) {
+    throw new WebError(
+      `the PDF is ${String(Math.round(declared / 1024 / 1024))}MB, above the ${String(MAX_PDF_BYTES / 1024 / 1024)}MB limit`,
+      WEB_PDF_TOO_LARGE_CODE,
+    )
+  }
+}
+
+/**
+ * Get a (possibly) PDF resource's bytes. The navigation response's own body
+ * is tried first — a PDF Chrome committed into its viewer still has it —
+ * then the page's API request context refetches the URL (same cookie jar,
+ * plain HTTP, no render-or-download decision; the only way to reach a body
+ * Chromium streamed to its download manager). The `%PDF-` magic decides.
+ *
+ * @param page - the fetch's tab (for its request context).
+ * @param response - the navigation response, when the browser committed one.
+ * @param url - the URL to refetch.
+ * @param deadline - the fetch budget.
+ * @param servedHeaders - the navigation's headers (size pre-check) when no
+ * response object is passed.
+ * @returns the bytes, where they came from, and whether they are a PDF.
+ */
+async function downloadPdfBytes(
+  page: PlaywrightPage,
+  response: PlaywrightResponse | null,
+  url: string,
+  deadline: Deadline,
+  servedHeaders?: Record<string, string>,
+): Promise<{ pdf: boolean; bytes: Uint8Array; url: string; status: number }> {
+  assertPdfSize(response?.headers() ?? servedHeaders)
+  if (response?.body !== undefined) {
+    try {
+      const bytes = await response.body()
+      if (isPdfBytes(bytes)) return { pdf: true, bytes, url: response.url?.() ?? url, status: response.status() }
+    } catch {
+      // the viewer / download manager owns the body — refetch below
+    }
+  }
+  if (page.request === undefined) {
+    throw new WebError(
+      'the response is a PDF the browser will not hand over, and this playwright build exposes no request context to refetch it',
+      'WEB_PROVIDER_ERROR',
+    )
+  }
+  const refetched = await page.request.get(url, { timeout: deadline.remainingMs(), signal: deadline.signal })
+  assertPdfSize(refetched.headers())
+  const bytes = refetched.body !== undefined ? await refetched.body() : new Uint8Array()
+  return { pdf: isPdfBytes(bytes), bytes, url: refetched.url?.() ?? url, status: refetched.status() }
+}
+
+/**
+ * Extract PDF bytes to a markdown text result inside the fetch budget.
+ * A limit that stopped the page walk early flags the result truncated.
+ */
+async function pdfResult(bytes: Uint8Array, finalUrl: string, statusCode: number, deadline: Deadline): Promise<WebFetchResult> {
+  const extraction = await extractPdfMarkdown(bytes, {
+    signal: deadline.signal,
+    timeBudgetMs: Math.max(1_000, deadline.remainingMs() - PDF_FINISH_RESERVE_MS),
+    maxChars: MAX_BODY_CHARS,
+  })
+  const result = capResult(finalUrl, statusCode, { kind: 'text', content: extraction.markdown })
+  return extraction.truncated && !result.truncated ? { ...result, truncated: true } : result
 }
 
 /**

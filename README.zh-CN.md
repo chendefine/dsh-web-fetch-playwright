@@ -10,6 +10,7 @@
 
 - **真实浏览器渲染** —— 以用户视角加载页面，SPA 客户端渲染内容也能抓到，而非只有原始 HTML。
 - **降噪管线** —— Mozilla Readability 提取正文，DOMPurify 移除布局/噪音标签（导航、侧边栏、页脚、广告、表单），Turndown + GFM 插件按与内置 `tool-web` 渲染器一致的风格转成 Markdown。内联 `data:` 图片（Docusaurus 等构建工具会把截图以 base64 内嵌进 HTML）会被替换为带大小的占位符，如 `![alt](data:image/png;base64,...8.9KB)`，避免 base64 字符流刷屏。对列表型页面（门户首页、商品目录——正文本身就是链接），Readability 的链接密度打分会误选出噪声碎片（实测 163.com 首页：96 字符的页脚备案块胜出，320 条新闻标题得分趋零），因此抽取结果需通过**覆盖率置信门**——不足 250 字符、或占页面可见文本不足 10% 即不予采信，转而回退到整页消毒转换，此类页面上可基本完整保留列表内容。通过置信门的抽取结果再做**尾部链接密集块修剪**——正文之后的推荐流、分享栏往往随正文一起被裹进胜出的容器里，且能躲过所有基于类名的规则（163 的 `post_recommend` 卡片单卡链接密度 0.42–0.48，恰好低于 Readability 自己 0.5 的删除线，且抽取后类名尽失、无从匹配）；只有当尾部连续块**既占容器文本少数、又明显比其前的正文更"链接化"**时才整体移除，因此链接列表型抽取（信息流、门户头条）不受影响。
+- **PDF 链接** —— 当 URL 返回的是 PDF（inline 的 `application/pdf`、`Content-Disposition: attachment` 下载，或文件头为 `%PDF-` 的 `application/octet-stream`）时，按字节读取并转换为 Markdown，而不是报错：pdf.js（通过 `unpdf`）提供带坐标的文本和真实字体名，版面启发式规则据此还原标题（书签、`3.1` / `第二章` / `一、` 等章节编号、字号、独立粗体行）、段落（间距、首行缩进、跨栏跨页衔接、基于全文词表的断词合并、中日韩文字无空格拼接）、列表、等宽代码块、列对齐的 GFM 表格、行内粗体和 `<!-- page N -->` 页码标记，同时去除页眉页脚和页码。详见 [PDF 链接](#pdf-链接)。
 - **两种后端** —— 本地启动 Playwright 浏览器，或通过 DevTools 协议（CDP）驱动一个已在运行的浏览器。
 - **浏览器解析** —— 配置路径 → `$PATH` 上的 `playwright` CLI → 插件自带的 `playwright-core`；CDP 模式完全不需要本地浏览器。
 - **共享 profile 或复用隔离上下文（CDP）** —— 每次抓取通过共享 CDP 连接创建自己的标签页，用完即关。默认复用浏览器已有默认 context 与登录态（`connectOverCDP` → `browser.contexts()[0]`，类似关闭隔离后的 CLI CDP attach，而不是 `playwright-cli open`）。会话隔离按需创建独立的内存 context，仅在同一会话的抓取或其他标签页仍在使用时复用；全局隔离则在同一插件实例内跨会话保留并复用一个固定的隔离 context。本地后端仍每次抓取启动并关闭浏览器。
@@ -30,12 +31,13 @@ web_fetch (tool-web)
    └─ ctx.web.fetchProvider = playwright
         ├─ local: 解析（路径 → $PATH → 内置 playwright-core）→ chromium.launch
         ├─ cdp:   connectOverCDP(endpoint)
+        ├─ PDF（inline / attachment / 嗅探出的 octet-stream）→ 字节（导航响应体，否则 request context 重新拉取）→ pdf.js → 版面启发式 → Markdown
         ├─ page.goto → 等待稳定（networkidle，尽力而为）→ 深度抓取滚动遍历（虚拟化信息流；有还原时直接返回其合并且已剥离的结果）→ 否则在活 DOM 中剥离脚本子树 → page.content()
         ├─ 降噪：jsdom → 内联 data: 图片改占位符 → Readability → 覆盖率置信门 → 尾部链接密集块修剪 → DOMPurify → Turndown(GFM)
         └─ Markdown（关闭降噪时返回原始 HTML）
 ```
 
-**非 2xx 状态码是结果而非错误** —— 这是 web seam 的契约（`@deepseek-ai/dsh-web`）：抓取到的 404/418/500 会连同状态码一起正常返回，与 `dsh-web-fetch-http` 的行为一致。但对*仅有状态*的响应 Chromium 会把事情搞砸 —— 空 body 的错误状态（httpbin 的 `/status/404`）会让整个导航以 `net::ERR_HTTP_RESPONSE_CODE_FAILURE` 失败，204/205 则因无可渲染内容被中止（`net::ERR_ABORTED`）。因此 provider 在每次抓取中都跟踪最后一个主框架响应（该响应先于 Chromium 判定导航失败到达），并把这类失败恢复成带状态码的正常结果，`web_fetch` 会报告 `Fetched … (HTTP 404)` 而不是抛出 `WEB_PROVIDER_ERROR`。同样的恢复也覆盖*下载型*响应 —— 带 `Content-Disposition: attachment` 的 body（publish.twitter.com 的 oembed 端点——agent 读取推文常用的替代 URL——返回的 JSON 正是如此）永远不会被提交为文档：`goto` 以 `Download is starting` 拒绝，且 body 已从网络栈中流失，provider 因此通过页面的 API request context 重新拉取并返回可解码内容；不可解码的下载（PDF、ZIP）仍以 `WEB_UNSUPPORTED_CONTENT_TYPE` 失败。若恢复出的响应本身来自 Cloudflare 挑战边缘，仍以 `WEB_FETCH_CHALLENGE` 失败；传输错误与取消也依旧按错误处理。
+**非 2xx 状态码是结果而非错误** —— 这是 web seam 的契约（`@deepseek-ai/dsh-web`）：抓取到的 404/418/500 会连同状态码一起正常返回，与 `dsh-web-fetch-http` 的行为一致。但对*仅有状态*的响应 Chromium 会把事情搞砸 —— 空 body 的错误状态（httpbin 的 `/status/404`）会让整个导航以 `net::ERR_HTTP_RESPONSE_CODE_FAILURE` 失败，204/205 则因无可渲染内容被中止（`net::ERR_ABORTED`）。因此 provider 在每次抓取中都跟踪最后一个主框架响应（该响应先于 Chromium 判定导航失败到达），并把这类失败恢复成带状态码的正常结果，`web_fetch` 会报告 `Fetched … (HTTP 404)` 而不是抛出 `WEB_PROVIDER_ERROR`。同样的恢复也覆盖*下载型*响应 —— 带 `Content-Disposition: attachment` 的 body（publish.twitter.com 的 oembed 端点——agent 读取推文常用的替代 URL——返回的 JSON 正是如此）永远不会被提交为文档：`goto` 以 `Download is starting` 拒绝，且 body 已从网络栈中流失，provider 因此通过页面的 API request context 重新拉取并返回可解码内容；PDF 下载会被提取为 Markdown（见 [PDF 链接](#pdf-链接)），其他不可解码的下载（ZIP）仍以 `WEB_UNSUPPORTED_CONTENT_TYPE` 失败。若恢复出的响应本身来自 Cloudflare 挑战边缘，仍以 `WEB_FETCH_CHALLENGE` 失败；传输错误与取消也依旧按错误处理。
 
 **回读文档前，先在活 DOM 中剥离非内容脚本子树 —— 构造上即输出中性。** 降噪管线（以及关闭降噪时工具层自己的渲染器）会用 jsdom 重新解析 `page.content()`，而脚本的*文本内容*是这条往返链路中唯一无法信任的东西：页面自身的运行时 JS 可能把内嵌 `</script>` 的文本写回某个数据脚本的 textContent —— 实测于 techcommunity.microsoft.com（Khoros/Aurora 平台），其客户端把整个 Apollo 缓存经 `JSON.stringify` 写回 `script#__NEXT_DATA__`，把线上响应里 712 处 `\u003c` 转义还原成了裸 `<` —— 而浏览器序列化脚本文本时原样输出，于是这份扁平化的 HTML 字符串会在*第一个*内嵌结束标签处终止脚本，把余下约 270KB 的 JSON *当作标记语言*解析。解析出的幽灵元素（`<id>` 之类的未知标签、塞满 CSS 与 i18n 字符串的锚点）恰好是 Readability 评分器眼里的"正文质量"（实测 126 分对真实正文的 45 分），于是抓取 RDP 10 AVC/H.264 一文时返回的是 CSS 规则和 `CachedAsset` 字符串而不是文章本体。事后再对字符串做补丁无法消除这种歧义 —— 只有浏览器自己的解析持有文档的真实结构 —— 因此普通的 `script` 与 `template` 子树在 `page.content()` 之前先在活页面里剥掉（`page.evaluate`，尽力而为）。这不会改变管线以往的任何输出：Readability 本就在抽取与评分前删除 script/noscript 节点，DOMPurify 的白名单本就丢弃 script，工具层渲染器也整体移除 SCRIPT/TEMPLATE —— 在真实页面语料（Wikipedia、MDN、Hacker News、坏例页 wire 版，加上 noscript/JSON-LD/template 边界用例）上的差分 A/B **每一页都字节级一致**。两个刻意的保留让间接消费方也不受损：`script[type="application/ld+json"]` 只做*消险*而非删除（`</` 改写为 `<\/` —— 仍是合法 JSON，Readability 的元数据读取解析到同一对象，文章标题保持无站点后缀的干净形态，如 "Remote Desktop Protocol" 而非 "… - Wikipedia"）；`noscript` 完整保留，因为 Readability 的 `_unwrapNoscriptImages` 会从懒加载的 `<noscript><img …>` 包裹中抢救出真实图片。该剥离在关闭降噪时同样生效，让返回给工具层渲染器的原始 HTML 也是序列化安全的，并把管线要解析的体积压缩约 70%（以该坏例页计）。
 
@@ -156,6 +158,20 @@ google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.config/chrome
 遍历在两种降噪模式下都运行；受 `scrollBudgetMs`（默认 20s；`0` 恢复旧版单瞬间行为）与剩余抓取预算减去解码储备的双重约束。任何失败——页面没有 `evaluate`、求值被拒、引擎拒绝遍历——都静默降级为旧版抓取：遍历只会增加内容，不会让抓取失败。CDP profile 模式下遍历滚动的是远端浏览器里抓取自有的那个标签页，与渲染发生在同一处。
 
 真实坏例实测：linux.do 帖子（51 楼、约 18kpx）在 20s 预算内一次遍历走完，每楼都被再水合、零占位符残留；飞书 wiki 页面在 20s 预算中用约 11.5s 走完内层容器（15 步、插回 38 个被移除的块、最终 DOM 191 块——静止抓取只有 7 块），深部尾文（两处 JSON 示例与完整段落）都进入 markdown。一项如实记录的残余限制：飞书表格块的**单元格**藏在第二层块内虚拟化后面，遍历不追——表头与行能还原，超大载荷单元格可能保持为空。
+
+### PDF 链接
+
+当抓取的 URL 实际返回的是 PDF 时，provider 会提取其内容，而不是以 `WEB_UNSUPPORTED_CONTENT_TYPE` 失败：
+
+| PDF 的返回方式 | 浏览器的行为 | 字节的获取方式 |
+| --- | --- | --- |
+| `application/pdf`（inline） | 无头 Chromium 会下载它；有界面或经 CDP 连接的 Chrome 会打开内置查看器 | 导航响应体本身是 PDF 时直接使用，否则通过页面的 API request context 重新拉取 |
+| `Content-Disposition: attachment` | `goto` 以 `Download is starting` 拒绝 | 通过 API request context 重新拉取 |
+| `application/octet-stream` 等通用二进制类型、`.pdf` 路径或文件名 | 下载 | 重新拉取后，以 `%PDF-` 魔数判定 |
+
+重新拉取使用同一个浏览器上下文，因此 Cookie 和登录态（CDP profile 模式）对需要登录的 PDF 同样生效。字节交给 pdf.js（`unpdf` 的 serverless 构建，按需动态加载，插件启动时不会加载）解析，再由版面分析（`src/pdf.ts`）把带坐标的文本还原成 Markdown：第一页最大字号的文字作为 `#` 标题（否则用 PDF 元数据中的标题）；标题层级来自书签、章节编号（`3.1` / `第二章` / `一、`）、更大的字号或独立成行的粗体；去除页眉页脚和页码；重建段落，并跨栏、跨页衔接；项目符号、编号条目、等宽字体块和列对齐的行分别转为列表、代码块和 GFM 表格；每页开头带 `<!-- page N -->` 标记。
+
+限制与错误码：超过 50MB 的 PDF 以 `WEB_PDF_TOO_LARGE` 失败（下载前先按 `Content-Length` 检查）；读取到 500 页、累计 10 万字符或抓取截止时间时停止，结果标记为 `truncated`，并注明最后读取的页码。没有文本层的扫描件以 `WEB_PDF_NO_TEXT` 失败（不支持 OCR；自带 OCR 文本层的 PDF 可以正常提取），加密 PDF 以 `WEB_PDF_ENCRYPTED` 失败，pdf.js 无法解析的数据以 `WEB_PDF_INVALID` 失败。已知局限：没有稳定列间距的表格（以及图中的标注文字）会以普通文本输出；多栏版面依赖 PDF 内容流的顺序；用矢量图形（而非字形）绘制的项目符号不会被识别为列表标记。
 
 ## 开发
 
