@@ -829,6 +829,18 @@ describe('PlaywrightFetchProvider download navigation recovery', () => {
     expect(raw.body).toEqual({ kind: 'html', content: '<html><body>attached raw</body></html>' })
   })
 
+  it('bounds the denoise input on the attachment path too, flagging the cut', async () => {
+    // >2M chars of cheap-to-parse padding: the pipeline must see a cut
+    // input (an uncapped multi-MB page exhausts the heap) and say so.
+    const body = '<!doctype html><html><body><article><h1>Attached</h1><p>The saved page body, with enough prose that the extractor locks onto the article.</p></article><!--' + 'x'.repeat(2_100_000) + '--></body></html>'
+    const result = await new FakeProvider({}, {
+      downloadFailure: { contentType: 'text/html; charset=utf-8', refetched: { contentType: 'text/html; charset=utf-8', body } },
+    }).fetch({ url: 'https://example.com/saved-page' })
+    expect(result.body.kind).toBe('text')
+    if (result.body.kind === 'text') expect(result.body.content).toMatch(/# Attached/)
+    expect(result.truncated).toBe(true)
+  })
+
   it('refuses an undecodable download (zip) as WEB_UNSUPPORTED_CONTENT_TYPE without refetching', async () => {
     const provider = new FakeProvider({}, {
       downloadFailure: { contentType: 'application/zip', url: 'https://example.com/archive.zip' },

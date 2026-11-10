@@ -615,12 +615,7 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       // governs the Readability/DOMPurify stage this provider owns.
       return capResult(finalUrl, statusCode, { kind: 'html', content: html })
     }
-    const bounded = html.length > MAX_PIPELINE_INPUT_CHARS ? html.slice(0, MAX_PIPELINE_INPUT_CHARS) : html
-    const { markdown } = htmlToMarkdown(bounded, finalUrl)
-    const result = capResult(finalUrl, statusCode, { kind: 'text', content: markdown })
-    return bounded !== html
-      ? { ...result, truncated: true }
-      : result
+    return denoiseResult(finalUrl, statusCode, html)
   }
 
   /**
@@ -848,8 +843,7 @@ async function recoverUnrenderedStatus(
     return capResult(finalUrl, status, { kind: 'text', content })
   }
   if (!denoise) return capResult(finalUrl, status, { kind: 'html', content })
-  const { markdown } = htmlToMarkdown(content, finalUrl)
-  return capResult(finalUrl, status, { kind: 'text', content: markdown })
+  return denoiseResult(finalUrl, status, content)
 }
 
 /**
@@ -961,8 +955,7 @@ async function recoverDownloadResponse(
     return capResult(finalUrl, statusCode, { kind: 'text', content })
   }
   if (!denoise) return capResult(finalUrl, statusCode, { kind: 'html', content })
-  const { markdown } = htmlToMarkdown(content, finalUrl)
-  return capResult(finalUrl, statusCode, { kind: 'text', content: markdown })
+  return denoiseResult(finalUrl, statusCode, content)
 }
 
 /** Time kept back from the PDF page walk for layout and result assembly. */
@@ -1075,6 +1068,20 @@ async function stripScriptingElements(page: PlaywrightPage): Promise<void> {
   } catch {
     // keep going without the strip
   }
+}
+
+/**
+ * Denoise an HTML body into a capped text result. The synchronous pipeline
+ * builds several DOMs per page, so its input is bounded on EVERY path that
+ * reaches it (live render, unrenderable-loader fallback, refetch): an
+ * uncapped 5MB API-reference page needs >4GB of heap. A cut input flags
+ * the result truncated.
+ */
+function denoiseResult(url: string, statusCode: number, html: string): WebFetchResult {
+  const bounded = html.length > MAX_PIPELINE_INPUT_CHARS ? html.slice(0, MAX_PIPELINE_INPUT_CHARS) : html
+  const { markdown } = htmlToMarkdown(bounded, url)
+  const result = capResult(url, statusCode, { kind: 'text', content: markdown })
+  return { ...result, truncated: result.truncated || bounded !== html }
 }
 
 /** Apply the decoded-body cap and flag the cut. */
