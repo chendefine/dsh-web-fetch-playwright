@@ -155,6 +155,17 @@ describe('recommendation rails', () => {
     expect(markRecommendationRails(doc(prose))).toBeNull()
   })
 
+  it('recognises rails by generic names and widget vendors, never by per-site abbreviations', () => {
+    const rail = (cls: string): string => `<body><p>${POST}</p><div class="${cls}">${Array.from({ length: 6 }, (_, i) => `<a href="/x/${String(i)}">Another story ${String(i)}</a>`).join(' ')}</div></body>`
+    for (const cls of ['related-posts', 'post_recommends', 'OUTBRAIN', 'taboola-below-article']) {
+      expect(markRecommendationRails(doc(rail(cls))), cls).not.toBeNull()
+    }
+    // Site-specific pinyin abbreviations (相关推荐 → xgtj) are not rail names.
+    for (const cls of ['xgtj', 'tuijian', 'link-list']) {
+      expect(markRecommendationRails(doc(rail(cls))), cls).toBeNull()
+    }
+  })
+
   const links = Array.from({ length: 8 }, (_, i) => `<li><a href="/r/${String(i)}">Related story number ${String(i)}</a></li>`).join('')
 
   it('cuts a marked rail only after prose, and restores the unmarked HTML exactly', () => {

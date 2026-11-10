@@ -211,10 +211,16 @@ const RAIL_MIN_LINKS = 4
 const RAIL_MIN_PROSE_CHARS = 80
 const RAIL_PROSE_LINK_DENSITY = 0.2
 
-/** Class/id sub-tokens naming a recommendation / related-content rail. */
+/**
+ * Class/id sub-tokens naming a recommendation / related-content rail: the
+ * English words every CMS and theme uses, plus the two syndicated
+ * recommendation widgets embedded across thousands of publishers (their
+ * containers are named after the vendor, not after what they show). No
+ * per-site names: a rail must also pass the link-density and position checks.
+ */
 function isRailName(token: string): boolean {
   return token.includes('recommend') || token.startsWith('related')
-    || token === 'outbrain' || token === 'taboola' || token === 'tuijian' || token === 'xgtj'
+    || token === 'outbrain' || token === 'taboola'
 }
 
 function isRecommendationRail(element: Element): boolean {
@@ -392,8 +398,14 @@ const CHROME_TOKENS = new Set([
 
 const CHROME_ROLES = new Set(['navigation', 'dialog', 'alertdialog', 'complementary', 'contentinfo', 'search', 'banner'])
 
-/** Cookie/consent banner wording (EN/DE/FR/ES/IT/NL/ZH). */
-const CONSENT_TEXT = /\b(cookies?|consent|datenschutz\w*|einwilligung|zustimm\w*|akzeptier\w*|privacy|gdpr|rgpd)\b|隐私|同意/i
+/**
+ * Cookie/consent banner wording (EN/DE/FR/ES/IT/NL/ZH), as a regex source
+ * shared with the selector's `consent_hits` feature so both read the same
+ * languages. Chinese banners say "Cookie" or 隐私; 同意 ("agree") alone is
+ * everyday prose and only counts as the banner's ACTION below.
+ */
+export const CONSENT_TERMS = String.raw`\b(cookies?|consent|datenschutz\w*|einwilligung|zustimm\w*|akzeptier\w*|privacy|gdpr|rgpd)\b|隐私`
+const CONSENT_TEXT = new RegExp(CONSENT_TERMS, 'i')
 const CONSENT_ACTION = /\b(accept|agree|allow|reject|decline|manage|preferences|settings|akzeptieren|zustimmen|einverstanden|ablehnen|accepter|aceptar|accetta|accepteren)\b|接受|同意/i
 
 function isChromeElement(element: Element): boolean {

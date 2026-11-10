@@ -13,7 +13,7 @@
  * @module dsh-web-fetch-playwright/selector
  */
 
-import { CANDIDATE_KINDS, type CandidateKind, type GenerationFacts, NOISE_SUBTREE_TAGS } from './candidates.ts'
+import { CANDIDATE_KINDS, type CandidateKind, CONSENT_TERMS, type GenerationFacts, NOISE_SUBTREE_TAGS } from './candidates.ts'
 import { SELECTOR_MODEL } from './selector-model.ts'
 import { blockKey, segmentBlocks, WORD } from './blocks.ts'
 import { predictTrees, type TreeEnsemble } from './trees.ts'
@@ -37,7 +37,7 @@ export interface CandidateStats {
   blockList: { key: string, words: number, linkWords: number }[]
 }
 
-const CONSENT_WORDS = /\b(cookies?|consent|datenschutz|privacy|einwilligung|akzeptieren|accept)\b/gi
+const CONSENT_WORDS = new RegExp(CONSENT_TERMS, 'gi')
 
 /** Measure one sanitized candidate body. */
 export function measureCandidate(kind: CandidateKind, legacy: boolean, root: Element): CandidateStats {
@@ -85,12 +85,19 @@ export function measureCandidate(kind: CandidateKind, legacy: boolean, root: Ele
   }
 }
 
-/** Page-shape regexes over the URL. */
+/**
+ * Page-shape regexes over the URL: whole words a site of ANY platform would
+ * choose for that page type. Single-letter and store-specific path codes
+ * (`/p/`, `/c/`, `/t/`, `/dp/`, `/itm/`) are deliberately absent — each is
+ * one platform's convention that collides with others (`/p/` is a product
+ * on one shop and every post on Substack or Jianshu), so as features they
+ * only taught the model which sites were in the training set.
+ */
 const URL_SHAPES: [string, RegExp][] = [
-  ['product', /\/(products?|p|dp|item|itm|artikel|produkt)\/|[?&](pid|sku|product)=/i],
-  ['collection', /\/(collections?|categor(y|ies)|shop|c|catalog|kategorie|brands?|department)\b/i],
+  ['product', /\/(products?|item|artikel|produkt)\/|[?&](pid|sku|product)=/i],
+  ['collection', /\/(collections?|categor(y|ies)|shop|catalog|kategorie|brands?|department)\b/i],
   ['docs', /\/(docs?|documentation|api|reference|guides?|manual|tutorials?|learn|wiki)\b|^https?:\/\/(docs|developer|developers|wiki)\./i],
-  ['forum', /\/(t|threads?|forums?|topics?|discussions?|questions|community|comments)\b|^https?:\/\/(community|forum|forums|discuss|answers)\./i],
+  ['forum', /\/(threads?|forums?|topics?|discussions?|questions|community|comments)\b|^https?:\/\/(community|forum|forums|discuss|answers)\./i],
   ['article', /\/(20\d\d|19\d\d)\/|\/(blog|news|articles?|story|stories|posts?|press)\b/i],
   ['search', /\/search\b|[?&](q|query|s|keyword)=/i],
 ]
@@ -145,8 +152,12 @@ const log1p = Math.log1p
 export function pageFeatures(document: Document, url: string, facts: GenerationFacts, doc: CandidateStats | undefined, bodyText: number): number[] {
   const bodyWords = doc?.words ?? 0
   const count = (selector: string): number => document.querySelectorAll(selector).length
+  // The generator meta, plus what Discourse itself declares for installs
+  // that drop it (its data island, its theme meta). Framework markers
+  // (`.ember-application`) are not generator evidence: every Ember app
+  // carries them.
   const generator = Array.from(document.querySelectorAll('meta[name="generator" i]'), meta => meta.getAttribute('content') ?? '').join(' ')
-    + (document.querySelector('#data-preloaded, meta[name="discourse_theme_id"], .ember-application') !== null ? ' discourse' : '')
+    + (document.querySelector('#data-preloaded[data-preloaded], meta[name="discourse_theme_id"]') !== null ? ' discourse' : '')
   const jsonld = Array.from(document.querySelectorAll('script[type="application/ld+json"]'), script => script.textContent ?? '').join('\n')
   const ogType = (document.querySelector('meta[property="og:type"]')?.getAttribute('content') ?? '').toLowerCase()
   let path = ''
