@@ -63,6 +63,17 @@ export const DEFAULT_CHALLENGE_RETRIES = 1
 /** Ceiling the schema accepts for `challengeRetries`. */
 export const MAX_CHALLENGE_RETRIES = 3
 
+/**
+ * Default for `challengeHttpFallback`: when the browser cannot clear a
+ * challenge inside its window (the interactive checkbox was never offered,
+ * or verification refused), refetch the URL once through the page's
+ * plain-HTTP request context — the same cookie jar, no render decision —
+ * because many Cloudflare edges serve the real document to non-browser
+ * clients while withholding the interactive challenge from the browser
+ * session (measured live: v2ex.com from a datacenter IP).
+ */
+export const DEFAULT_CHALLENGE_HTTP_FALLBACK = true
+
 /** Which browser backend serves a fetch. */
 export type PlaywrightBackend = 'local' | 'cdp'
 
@@ -121,6 +132,14 @@ export interface Config {
    */
   challengeRetries?: number
   /**
+   * When the browser cannot clear a challenge inside its window (no
+   * checkbox offered, or verification refused), refetch the URL once
+   * through the page's plain-HTTP request context (same cookie jar) and
+   * return that document when it is not itself a challenge. `false`
+   * restores the browser-only posture.
+   */
+  challengeHttpFallback?: boolean
+  /**
    * Bounded budget (ms) for the deep-capture scroll walk — the in-page pass
    * that defeats viewport virtualization on feed-shaped pages (Discourse
    * topic streams: replies outside the render window are empty height-only
@@ -156,6 +175,7 @@ export const Config = z.object({
   // The challenge wait budget and the deep-capture scroll budget are
   // deliberately absent: they are code-level constants, not user settings.
   challengeRetries: z.number().step(1).min(0).max(MAX_CHALLENGE_RETRIES).default(DEFAULT_CHALLENGE_RETRIES).volatile(),
+  challengeHttpFallback: z.boolean().default(DEFAULT_CHALLENGE_HTTP_FALLBACK).volatile(),
 })
 
 /**
@@ -183,6 +203,8 @@ export interface PlaywrightPluginConfig {
   maxConcurrency: Volatile<number | undefined>
   /** Challenge retry count as a live reference. */
   challengeRetries: Volatile<number>
+  /** Challenge dead-end plain-HTTP refetch toggle as a live reference. */
+  challengeHttpFallback: Volatile<boolean>
 }
 
 /**
@@ -203,6 +225,7 @@ export function snapshotsOf(config: PlaywrightPluginConfig): Config {
     denoise: config.denoise.get(),
     maxConcurrency: config.maxConcurrency.get(),
     challengeRetries: config.challengeRetries.get(),
+    challengeHttpFallback: config.challengeHttpFallback.get(),
   }
 }
 
@@ -230,6 +253,7 @@ export function resolveConfig(config: Partial<Config>): ResolvedConfig {
     denoise: resolved.denoise.get(),
     maxConcurrency: resolved.maxConcurrency.get(),
     challengeRetries: resolved.challengeRetries.get(),
+    challengeHttpFallback: resolved.challengeHttpFallback.get(),
     ...(challengeWaitMs === undefined ? {} : { challengeWaitMs }),
     ...(scrollBudgetMs === undefined ? {} : { scrollBudgetMs }),
   }
@@ -280,6 +304,17 @@ export function effectiveChallengeWaitMs(config: Pick<Config, 'challengeWaitMs'>
 export function effectiveChallengeRetries(config: Pick<Config, 'challengeRetries'>): number {
   if (typeof config.challengeRetries === 'number') return config.challengeRetries
   return DEFAULT_CHALLENGE_RETRIES
+}
+
+/**
+ * Whether a challenge dead-end may refetch through plain HTTP: an explicit
+ * setting wins (absent = on, the default).
+ *
+ * @param config - the resolved settings section (or any partial of it).
+ * @returns true when the plain-HTTP fallback may run.
+ */
+export function effectiveChallengeHttpFallback(config: Pick<Config, 'challengeHttpFallback'>): boolean {
+  return config.challengeHttpFallback !== false
 }
 
 /**

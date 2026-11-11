@@ -11,6 +11,7 @@ import { describe, expect, it } from 'vitest'
 import {
   Config,
   DEFAULT_CDP_ENDPOINT,
+  DEFAULT_CHALLENGE_HTTP_FALLBACK,
   DEFAULT_CHALLENGE_RETRIES,
   DEFAULT_CHALLENGE_WAIT_MS,
   DEFAULT_MAX_CONCURRENCY_CDP,
@@ -18,6 +19,7 @@ import {
   DEFAULT_SCROLL_BUDGET_MS,
   MAX_CHALLENGE_RETRIES,
   MAX_CONCURRENCY_CEILING,
+  effectiveChallengeHttpFallback,
   effectiveChallengeRetries,
   effectiveChallengeWaitMs,
   effectiveContextMode,
@@ -40,6 +42,7 @@ describe('Config', () => {
       contextIsolationScope: 'global',
       denoise: true,
       challengeRetries: DEFAULT_CHALLENGE_RETRIES,
+      challengeHttpFallback: DEFAULT_CHALLENGE_HTTP_FALLBACK,
     })
   })
 
@@ -62,6 +65,7 @@ describe('Config', () => {
       maxConcurrency: 50,
       challengeWaitMs: 30_000,
       challengeRetries: 2,
+      challengeHttpFallback: false,
       scrollBudgetMs: 12_000,
     })
     expect(resolved).toEqual({
@@ -74,6 +78,7 @@ describe('Config', () => {
       maxConcurrency: 50,
       challengeWaitMs: 30_000,
       challengeRetries: 2,
+      challengeHttpFallback: false,
       scrollBudgetMs: 12_000,
     })
   })
@@ -124,6 +129,7 @@ describe('the volatile configuration face', () => {
       denoise: true,
       maxConcurrency: 8,
       challengeRetries: DEFAULT_CHALLENGE_RETRIES,
+      challengeHttpFallback: DEFAULT_CHALLENGE_HTTP_FALLBACK,
     })
   })
 
@@ -156,6 +162,14 @@ describe('effective challenge knobs', () => {
     expect(effectiveChallengeRetries({ challengeRetries: 0 })).toBe(0)
     expect(effectiveChallengeRetries({ challengeRetries: 3 })).toBe(3)
     expect(effectiveChallengeRetries({})).toBe(DEFAULT_CHALLENGE_RETRIES)
+  })
+
+  it('defaults the challenge dead-end HTTP fallback on; only an explicit false disables it', () => {
+    expect(resolveConfig({}).challengeHttpFallback).toBe(true)
+    expect(resolveConfig({ challengeHttpFallback: false }).challengeHttpFallback).toBe(false)
+    expect(effectiveChallengeHttpFallback({})).toBe(true)
+    expect(effectiveChallengeHttpFallback({ challengeHttpFallback: true })).toBe(true)
+    expect(effectiveChallengeHttpFallback({ challengeHttpFallback: false })).toBe(false)
   })
 })
 

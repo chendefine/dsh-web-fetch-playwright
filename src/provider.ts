@@ -55,9 +55,14 @@
  * behavior). The wait tracks the LAST main-frame navigation response (the
  * real page reloads in after the challenge clears) and watches the live DOM
  * so SPA-style clears are caught too. It never clicks, never injects
- * answers, never touches cookies itself; when the budget runs out the fetch
- * fails with {@link WEB_FETCH_CHALLENGE_CODE} instead of returning the
- * interstitial as content.
+ * answers, never touches cookies itself; when the budget runs out, ONE
+ * plain-HTTP refetch of the same URL through the page's request context
+ * (same cookie jar, the browser's UA, none of Chromium's render decisions
+ * — `challengeHttpFallback`, default on) tries to retrieve the real
+ * document, gated by the same response-level and content-level challenge
+ * classifiers so an interstitial can never pass as content. When that too
+ * fails, the fetch fails with {@link WEB_FETCH_CHALLENGE_CODE} instead of
+ * returning the interstitial as content.
  *
  * Deep capture (viewport-virtualized feeds and app-shell documents): feed-
  * shaped pages — Discourse topic streams, comment threads, timelines —
@@ -103,7 +108,7 @@ import type { WebFetchProvider, WebFetchRequest, WebFetchResult } from '@deepsee
 import { CHALLENGE_DOM_PROBE, CHALLENGE_FINISH_RESERVE_MS, CHALLENGE_POLL_INTERVAL_MS, classifyChallengeHtml, classifyChallengeResponse, isChallengeCompatibleResponse } from './challenge.ts'
 import type { ChallengeVerdict } from './challenge.ts'
 import { deepCaptureWalk } from './autoscroll.ts'
-import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveMaxConcurrency, effectiveScrollBudgetMs, normalizeCdpEndpoint } from './config.ts'
+import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, effectiveChallengeHttpFallback, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveMaxConcurrency, effectiveScrollBudgetMs, normalizeCdpEndpoint } from './config.ts'
 import type { ResolvedConfig } from './config.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
 import { htmlToMarkdown } from './markdown.ts'
@@ -585,6 +590,15 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
         // No budget left for another window: a re-navigation could only
         // land on the interstitial again.
         if (--attemptsLeft <= 0 || deadline.expired) {
+          // The dead-end refetch: many Cloudflare edges serve the real
+          // document to plain-HTTP clients (same cookies, no render
+          // decision) while withholding the interactive challenge from
+          // THIS browser session — measured live on v2ex.com, where the
+          // browser drew an empty widget frame and curl drew the article.
+          if (effectiveChallengeHttpFallback(config)) {
+            const fallback = await this.challengeHttpFallback(page, url, deadline, config.denoise)
+            if (fallback !== undefined) return fallback
+          }
           const lastStatus = (tracker.last() ?? response)?.status()
           throw new WebError(
             `the site kept serving a Cloudflare challenge (last status ${lastStatus === undefined ? 'unknown' : String(lastStatus)}) for up to ${String(challengeWaitMs)}ms across ${String(effectiveChallengeRetries(config) + 1)} attempt(s); the browser did not clear it naturally — retry later, raise challengeWaitMs, or use a profile whose browser already holds clearance`,
@@ -668,6 +682,53 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       return flagPartial(capResult(finalUrl, statusCode, { kind: 'html', content: html }), partial)
     }
     return flagPartial(denoiseResult(finalUrl, statusCode, html), partial)
+  }
+
+  /**
+   * The challenge dead-end's plain-HTTP refetch: one request through the
+   * page's own request context (the SAME cookie jar — any clearance the
+   * profile holds rides along — but none of Chromium's render decisions),
+   * wearing the browser's own User-Agent. Returns the finished result when
+   * the answer is a NON-challenge HTML document, undefined otherwise (the
+   * caller throws the honest WEB_FETCH_CHALLENGE). A challenge served to
+   * this request too, a non-HTML body, or any transport failure keeps the
+   * browser-only verdict.
+   */
+  private async challengeHttpFallback(page: PlaywrightPage, url: URL, deadline: Deadline, denoise: boolean): Promise<WebFetchResult | undefined> {
+    if (page.request === undefined || deadline.expired || deadline.signal.aborted) return undefined
+    try {
+      // A CDP-attached browser's request context does not inherit the
+      // browser's UA — send it explicitly so the edge sees one client.
+      let userAgent: string | undefined
+      if (typeof page.evaluate === 'function') {
+        try {
+          const ua = await page.evaluate('navigator.userAgent')
+          if (typeof ua === 'string' && ua !== '') userAgent = ua
+        } catch {
+          userAgent = undefined
+        }
+      }
+      const response = await page.request.get(url.toString(), {
+        headers: {
+          ...(userAgent === undefined ? {} : { 'user-agent': userAgent }),
+          accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        },
+        timeout: Math.min(deadline.remainingMs(), 15_000),
+        signal: deadline.signal,
+      })
+      const headers = response.headers()
+      const status = response.status()
+      if (status < 200 || status >= 300) return undefined
+      if (classifyChallengeResponse(status, headers) === 'challenge') return undefined
+      if (classifyContentType(headers['content-type']) !== 'html') return undefined
+      const html = await response.text()
+      if (classifyChallengeHtml(html) !== 'none') return undefined
+      if (!denoise) return capResult(url.toString(), status, { kind: 'html', content: html })
+      return denoiseResult(url.toString(), status, html)
+    } catch {
+      return undefined
+    }
   }
 
   /**

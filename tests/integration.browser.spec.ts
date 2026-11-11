@@ -392,6 +392,7 @@ describe('PlaywrightFetchProvider integration', () => {
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -420,6 +421,7 @@ describe('PlaywrightFetchProvider integration', () => {
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -447,6 +449,7 @@ describe('PlaywrightFetchProvider integration', () => {
       shareBrowserContext: true,
       denoise: false,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -468,6 +471,7 @@ describe('PlaywrightFetchProvider integration', () => {
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -504,6 +508,7 @@ describe('PlaywrightFetchProvider integration', () => {
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -534,6 +539,7 @@ describe('PlaywrightFetchProvider integration', () => {
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -556,6 +562,7 @@ describe('PlaywrightFetchProvider integration', () => {
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -581,6 +588,7 @@ describe('PlaywrightFetchProvider integration', () => {
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -609,6 +617,7 @@ describe('PlaywrightFetchProvider integration', () => {
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -629,6 +638,7 @@ describe('PlaywrightFetchProvider integration', () => {
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -728,6 +738,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       contextIsolationScope: 'global' as const,
       shareBrowserContext: false, // isolated: preserves this suite's original stance
       denoise: true,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -752,6 +763,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       contextIsolationScope: 'global' as const,
       shareBrowserContext: true, // profile mode: the remote browser's own jar
       denoise: true,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -781,6 +793,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       contextIsolationScope: 'global' as const,
       shareBrowserContext: false, // isolated: preserves this suite's original stance
       denoise: true,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -806,6 +819,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       contextIsolationScope: 'global' as const,
       shareBrowserContext: true,
       denoise: true,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -855,6 +869,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       contextIsolationScope: 'global' as const,
       shareBrowserContext: false,
       denoise: true,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -882,6 +897,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       contextIsolationScope: 'global' as const,
       shareBrowserContext: true,
       denoise: true,
+      challengeHttpFallback: true,
       challengeWaitMs: 12_000,
       challengeRetries: 1,
     }))
@@ -912,6 +928,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       contextIsolationScope: 'global' as const,
       shareBrowserContext: false,
       denoise: true,
+      challengeHttpFallback: true,
       challengeWaitMs: 12_000,
       challengeRetries: 1,
     }))
@@ -942,6 +959,7 @@ describe('PlaywrightFetchProvider challenge A/B (simulated Cloudflare edge)', ()
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       ...over,
     })
   }
@@ -1377,6 +1395,7 @@ describe('PlaywrightFetchProvider deep capture (viewport-virtualized topic)', ()
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
       ...over,
@@ -1430,6 +1449,7 @@ describe('PlaywrightFetchProvider deep capture (viewport-virtualized topic)', ()
       shareBrowserContext: true,
       denoise: false,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
       scrollBudgetMs: 10_000,
@@ -1519,6 +1539,7 @@ describe('PlaywrightFetchProvider deep capture (app-shell inner scroll container
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
       ...over,
@@ -1593,6 +1614,7 @@ describe('PlaywrightFetchProvider deep capture (app-shell inner scroll container
       shareBrowserContext: true,
       denoise: false,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
       scrollBudgetMs: 10_000,
@@ -1615,6 +1637,7 @@ describe('PlaywrightFetchProvider deep capture (unkeyed virtualized rows)', () =
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
       ...over,

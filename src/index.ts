@@ -24,9 +24,11 @@ import { PlaywrightFetchProvider } from './provider.ts'
 export {
   Config,
   DEFAULT_CDP_ENDPOINT,
+  DEFAULT_CHALLENGE_HTTP_FALLBACK,
   DEFAULT_CHALLENGE_RETRIES,
   DEFAULT_CHALLENGE_WAIT_MS,
   DEFAULT_SCROLL_BUDGET_MS,
+  effectiveChallengeHttpFallback,
   effectiveChallengeRetries,
   effectiveChallengeWaitMs,
   effectiveContextMode,

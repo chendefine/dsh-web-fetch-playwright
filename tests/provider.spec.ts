@@ -114,6 +114,12 @@ interface FakePageSpec {
   headers?: Record<string, string>
   /** An API request context for non-download navigations (the PDF refetch). */
   requestContext?: { status?: number; contentType?: string; bytes?: Uint8Array; headers?: Record<string, string> }
+  /**
+   * Every call the fake page's request context served, in order (url +
+   * request headers) — what the challenge dead-end fallback sent. Absent
+   * unless a test wants to assert on the refetch's shape.
+   */
+  requestHeaderLog?: Array<{ url: string; headers?: Record<string, string> }>
 }
 
 const ARTICLE_HTML = `<!doctype html><html><head><title>Fake page</title></head><body>
@@ -353,6 +359,9 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, listeners: FakeP
     },
     ...(spec.noEvaluate === true ? {} : {
       evaluate: async (script: string): Promise<unknown> => {
+        // The dead-end fallback's UA read: a plain question, not a
+        // challenge-probe read of the document.
+        if (script === 'navigator.userAgent') return 'Mozilla/5.0 (X11; Linux x86_64) FakeChrome/128.0.0.1'
         noteRead()
         spec.recordEvaluates?.push(script)
         // The provider's live-DOM strip: recognize it by its JSON-LD carve-out
@@ -391,8 +400,9 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, listeners: FakeP
       } : {}),
       ...(spec.downloadFailure === undefined && spec.requestContext !== undefined ? {
         request: {
-          get: async (fetchUrl: string): Promise<PlaywrightResponse> => {
+          get: async (fetchUrl: string, options?: { headers?: Record<string, string> }): Promise<PlaywrightResponse> => {
             state.refetches++
+            spec.requestHeaderLog?.push({ url: fetchUrl, headers: options?.headers })
             const rc = spec.requestContext!
             return {
               status: () => rc.status ?? 200,
@@ -455,6 +465,7 @@ class FakeProvider extends PlaywrightFetchProvider {
       // Legacy default: the challenge path stays off unless a test opts in.
       challengeWaitMs: 0,
       challengeRetries: 0,
+      challengeHttpFallback: true,
       ...config,
     }))
   }
@@ -492,6 +503,7 @@ class GatedProvider extends PlaywrightFetchProvider {
       maxConcurrency: 4,
       challengeWaitMs: 0,
       challengeRetries: 0,
+      challengeHttpFallback: true,
       ...config,
     }))
   }
@@ -926,6 +938,7 @@ describe('PlaywrightFetchProvider download navigation recovery', () => {
       shareBrowserContext: true,
       denoise: true,
       maxConcurrency: 4,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -1205,6 +1218,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       contextIsolationScope: 'global',
       shareBrowserContext: false,
       denoise: true,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -1236,6 +1250,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       contextIsolationScope: 'global',
       shareBrowserContext: false,
       denoise: true,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -1261,6 +1276,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       contextIsolationScope: 'global',
       shareBrowserContext: true,
       denoise: true,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -1294,6 +1310,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       contextIsolationScope: 'global',
       shareBrowserContext: true,
       denoise: true,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -1316,6 +1333,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       contextIsolationScope: 'global',
       shareBrowserContext: true,
       denoise: true,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -1344,6 +1362,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       contextIsolationScope: 'global',
       shareBrowserContext: true,
       denoise: true,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -1387,6 +1406,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       contextIsolationScope: 'global',
       shareBrowserContext: true,
       denoise: true,
+      challengeHttpFallback: true,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -1534,6 +1554,117 @@ describe('PlaywrightFetchProvider cloudflare challenge wait', () => {
     expect(result.statusCode).toBe(200)
     expect(bodyOf(result)).toContain('World')
     expect(counters(provider).gotos).toBe(2)
+  })
+})
+
+/**
+ * The challenge dead-end's plain-HTTP fallback: when the browser cannot
+ * clear the challenge inside its whole window, ONE request through the
+ * page's own request context (the same cookie jar, the browser's UA, none
+ * of Chromium's render decisions) tries to retrieve the real document —
+ * and only the real document: an answer that is itself a challenge, a
+ * non-2xx, or a non-HTML body keeps the honest WEB_FETCH_CHALLENGE
+ * verdict, so an interstitial can never pass through as content.
+ */
+describe('PlaywrightFetchProvider challenge dead-end plain-HTTP fallback', () => {
+  /** The request-context calls the last session's page served. */
+  function refetches(provider: FakeProvider): number {
+    return (provider.lastSession as unknown as { closed: { refetches: number } }).closed.refetches
+  }
+
+  const ARTICLE_BYTES = new TextEncoder().encode(ARTICLE_HTML)
+
+  const challengeError = async (provider: FakeProvider, url: string): Promise<WebError> => {
+    const error = await provider.fetch({ url }).then(() => { throw new Error('expected rejection') }, (e: unknown) => e)
+    expect(error).toBeInstanceOf(WebError)
+    return error as WebError
+  }
+
+  it('B1 the dead-end refetch returns the plain-HTTP article the edge serves the browser session', async () => {
+    const requestLog: Array<{ url: string; headers?: Record<string, string> }> = []
+    const provider = new FakeProvider({ challengeWaitMs: 60, challengeRetries: 0 }, {
+      challenge: true,
+      neverClears: true,
+      requestContext: { status: 200, contentType: 'text/html; charset=utf-8', bytes: ARTICLE_BYTES },
+      requestHeaderLog: requestLog,
+    })
+    const result = await provider.fetch({ url: 'https://example.com/guarded' })
+    expect(result.statusCode).toBe(200)
+    expect(result.body.kind).toBe('text')
+    if (result.body.kind === 'text') expect(result.body.content).toContain('World')
+    expect(refetches(provider)).toBe(1)
+    // One client, two channels: the refetch wears the browser's own UA and
+    // asks for HTML through the page's request context.
+    expect(requestLog).toHaveLength(1)
+    expect(requestLog[0]?.url).toBe('https://example.com/guarded')
+    expect(requestLog[0]?.headers?.['user-agent']).toBe('Mozilla/5.0 (X11; Linux x86_64) FakeChrome/128.0.0.1')
+    expect(requestLog[0]?.headers?.accept).toContain('text/html')
+  })
+
+  it('B2 an interstitial served to the refetch too is rejected at the content gate', async () => {
+    const provider = new FakeProvider({ challengeWaitMs: 60, challengeRetries: 0 }, {
+      challenge: true,
+      neverClears: true,
+      // Response-level clean (200, no cf-mitigated) — only the content-level
+      // classifier can refuse it: the double check that keeps the browser
+      // path honest.
+      requestContext: { status: 200, contentType: 'text/html; charset=utf-8', bytes: new TextEncoder().encode(CHALLENGE_HTML) },
+    })
+    const error = await challengeError(provider, 'https://example.com/hard')
+    expect(error.code).toBe(WEB_FETCH_CHALLENGE_CODE)
+    expect(refetches(provider)).toBe(1)
+  })
+
+  it('B3 challengeHttpFallback: false restores the browser-only posture — no refetch at all', async () => {
+    const provider = new FakeProvider({ challengeWaitMs: 60, challengeRetries: 0, challengeHttpFallback: false }, {
+      challenge: true,
+      neverClears: true,
+      requestContext: { status: 200, contentType: 'text/html; charset=utf-8', bytes: ARTICLE_BYTES },
+    })
+    const error = await challengeError(provider, 'https://example.com/guarded')
+    expect(error.code).toBe(WEB_FETCH_CHALLENGE_CODE)
+    expect(refetches(provider)).toBe(0)
+  })
+
+  it('B4 a non-2xx refetch answer keeps the browser verdict', async () => {
+    const provider = new FakeProvider({ challengeWaitMs: 60, challengeRetries: 0 }, {
+      challenge: true,
+      neverClears: true,
+      requestContext: { status: 403, contentType: 'text/html; charset=utf-8', bytes: ARTICLE_BYTES },
+    })
+    const error = await challengeError(provider, 'https://example.com/guarded')
+    expect(error.code).toBe(WEB_FETCH_CHALLENGE_CODE)
+    expect(refetches(provider)).toBe(1)
+  })
+
+  it('B5 a non-HTML refetch answer keeps the browser verdict', async () => {
+    const provider = new FakeProvider({ challengeWaitMs: 60, challengeRetries: 0 }, {
+      challenge: true,
+      neverClears: true,
+      requestContext: { status: 200, contentType: 'application/json; charset=utf-8', bytes: new TextEncoder().encode('{"type":"tweet"}') },
+    })
+    const error = await challengeError(provider, 'https://example.com/guarded')
+    expect(error.code).toBe(WEB_FETCH_CHALLENGE_CODE)
+    expect(refetches(provider)).toBe(1)
+  })
+
+  it('B6 a page without a request context degrades to the honest challenge failure', async () => {
+    const provider = new FakeProvider({ challengeWaitMs: 60, challengeRetries: 0 }, { challenge: true, neverClears: true })
+    const error = await challengeError(provider, 'https://example.com/guarded')
+    expect(error.code).toBe(WEB_FETCH_CHALLENGE_CODE)
+    expect(refetches(provider)).toBe(0)
+  })
+
+  it('B7 a raw (un-denoised) fallback document passes through as html', async () => {
+    const provider = new FakeProvider({ challengeWaitMs: 60, challengeRetries: 0, denoise: false }, {
+      challenge: true,
+      neverClears: true,
+      requestContext: { status: 200, contentType: 'text/html; charset=utf-8', bytes: ARTICLE_BYTES },
+    })
+    const result = await provider.fetch({ url: 'https://example.com/guarded' })
+    expect(result.statusCode).toBe(200)
+    expect(result.body).toMatchObject({ kind: 'html' })
+    expect(refetches(provider)).toBe(1)
   })
 })
 

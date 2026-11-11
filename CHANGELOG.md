@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Challenge dead-end plain-HTTP fallback (`challengeHttpFallback`, default on).** When the browser cannot clear a Cloudflare challenge inside its whole window — the interactive checkbox was never offered, or verification refused it — the fetch now makes ONE plain-HTTP request for the same URL through the page's own request context: the same cookie jar (any clearance the profile holds rides along), the browser's own User-Agent, none of Chromium's render decisions. Many Cloudflare edges serve the real document to such a request while withholding the interactive challenge from the browser session itself — measured live on v2ex.com from a datacenter IP, where the browser drew an empty widget frame for 15s×2 and the plain request drew the full article. The fallback answer must itself be a non-challenge HTML document (checked at response level AND content level, through the same classifiers that gate the browser path); anything else — a challenge, a non-2xx, a non-HTML body, a transport failure — keeps the honest `WEB_FETCH_CHALLENGE` verdict, so the fallback can never smuggle an interstitial through as content.
+
 ## [0.2.21] - 2026-11-10
 
 ### Changed

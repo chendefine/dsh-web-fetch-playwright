@@ -36,15 +36,15 @@ export interface PlaywrightDownload {
 }
 
 /**
- * The page's `APIRequestContext` surface the download recovery refetches
- * through — plain HTTP from the Playwright client, the context's cookie jar,
- * and none of Chromium's render-or-download semantics. Reuses
- * {@link PlaywrightResponse} because that is structurally what an
- * `APIResponse` is for the members this plugin reads. Absent on fakes that
- * do not exercise the recovery.
+ * The page's `APIRequestContext` surface the download recovery and the
+ * challenge dead-end fallback refetch through — plain HTTP from the
+ * Playwright client, the context's cookie jar, and none of Chromium's
+ * render-or-download semantics. Reuses {@link PlaywrightResponse} because
+ * that is structurally what an `APIResponse` is for the members this
+ * plugin reads. Absent on fakes that do not exercise the recovery.
  */
 export interface PlaywrightRequestContext {
-  get(url: string, options?: { timeout?: number; signal?: AbortSignal }): Promise<PlaywrightResponse>
+  get(url: string, options?: { timeout?: number; signal?: AbortSignal; headers?: Record<string, string> }): Promise<PlaywrightResponse>
 }
 
 /** The request side of a response, for main-frame filtering. */
