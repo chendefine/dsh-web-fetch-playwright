@@ -5,11 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.22] - 2026-11-11
 
 ### Added
 
+- **A fetch whose waiting budget runs out now extracts what the page already holds, instead of failing.** The per-fetch deadline is now two-stage: a 25s waiting budget that bounds every wait (navigation, settle, challenge wait, scroll walk), then a 10s extraction grace as the hard backstop. When the waiting budget runs out the page is no longer torn down: a still-loading navigation whose main-frame response has arrived is stopped with a best-effort `window.stop()` (bounded at 1s), and whatever the DOM holds by then goes through the normal extraction — denoise or raw HTML — flagged `truncated` when the document never finished loading (a stopped non-HTML document yields its rendered `innerText`). `WEB_FETCH_TIMEOUT` now fires only when nothing arrived at all, or when extraction itself hangs past the grace. The scroll walk may now spend the whole waiting budget: its former 4s decode reserve moved into the grace window, so a walk cut short by the budget still merges and returns what it stashed, and the content read plus decode happen after it.
 - **Challenge dead-end plain-HTTP fallback (`challengeHttpFallback`, default on).** When the browser cannot clear a Cloudflare challenge inside its whole window — the interactive checkbox was never offered, or verification refused it — the fetch now makes ONE plain-HTTP request for the same URL through the page's own request context: the same cookie jar (any clearance the profile holds rides along), the browser's own User-Agent, none of Chromium's render decisions. Many Cloudflare edges serve the real document to such a request while withholding the interactive challenge from the browser session itself — measured live on v2ex.com from a datacenter IP, where the browser drew an empty widget frame for 15s×2 and the plain request drew the full article. The fallback answer must itself be a non-challenge HTML document (checked at response level AND content level, through the same classifiers that gate the browser path); anything else — a challenge, a non-2xx, a non-HTML body, a transport failure — keeps the honest `WEB_FETCH_CHALLENGE` verdict, so the fallback can never smuggle an interstitial through as content.
+
+### Changed
+
+- **The per-fetch deadline drops from 45s to 25s** and now bounds waiting only (see above); budget plus grace stays inside the tool layer's 60s. A challenge window never re-navigates once the budget is spent — another window could only land on the interstitial again. The concurrency queue wait drops from 20s to 10s, so a fetch dequeued behind others still has time to render inside the tool budget.
+- **`challengeWaitMs` and `scrollBudgetMs` are no longer user settings.** The Cloudflare challenge wait and the deep-capture scroll budget are removed from the settings schema, the settings card, and both READMEs; they run on the built-in defaults (15s / 20s). They remain code-level overrides: tests and demo scripts may still pass them explicitly, and `0` still disables the respective path for such callers.
 
 ## [0.2.21] - 2026-11-10
 
