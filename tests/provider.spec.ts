@@ -32,6 +32,14 @@ interface FakePageSpec {
   /** Never settle `goto` on its own — it rejects when the page closes. */
   hangGoto?: boolean
   /**
+   * A load that outruns the fetch budget: `goto` rejects with Playwright's
+   * TimeoutError once its `timeout` option elapses. With `responded`, the
+   * main-frame response arrived first (the page holds a partial document).
+   */
+  slowGoto?: { responded: boolean }
+  /** The deep-capture walk's evaluation never settles (a wedged page). */
+  hangDeepCapture?: boolean
+  /**
    * Chromium status-render failure (httpbin `/status/N` shape): `goto` emits
    * a main-frame response event (headers arrive before the loader is torn
    * down), then rejects with the net error Chromium reports for a response
@@ -242,10 +250,25 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, listeners: FakeP
   }
 
   const page: PlaywrightPage = {
-    goto: (): Promise<PlaywrightResponse | null> => {
+    goto: (_url: string, options?: { timeout?: number }): Promise<PlaywrightResponse | null> => {
       // A closed page rejects navigation, like a real Playwright page.
       if (state.pageClosed) return Promise.reject(new Error('Target closed'))
       if (spec.gotoError !== undefined) return Promise.reject(spec.gotoError)
+      if (spec.slowGoto !== undefined) {
+        state.gotos++
+        if (spec.slowGoto.responded) {
+          const response = fakeResponse(spec)
+          if (response !== null) for (const listener of [...responseListeners]) listener(response)
+        }
+        const timeout = options?.timeout ?? 30_000
+        return new Promise((_resolve, reject) => {
+          setTimeout(() => {
+            const error = new Error(`page.goto: Timeout ${String(timeout)}ms exceeded.`)
+            error.name = 'TimeoutError'
+            reject(error)
+          }, timeout)
+        })
+      }
       if (spec.statusFailure !== undefined) {
         // Chromium's order: responseReceived (the response event) fires
         // before loadingFailed (the goto rejection) — the provider's
@@ -309,6 +332,8 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, listeners: FakeP
     },
     url: () => spec.finalUrl ?? 'https://final.example.com/docs',
     content: async () => {
+      // A closed page cannot be read, like a real Playwright page.
+      if (state.pageClosed) throw new Error('Target page, context or browser has been closed')
       noteRead()
       if (onChallenge()) return CHALLENGE_HTML
       if (spec.serializationCorruption !== undefined) {
@@ -335,7 +360,11 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, listeners: FakeP
         // the stripped scripting subtrees are gone, so the page serializes
         // differently.
         // The walk embeds the same strip by source, so it is told apart first.
-        if (script.includes('dsh-deep-capture')) return 'deepCapture' in spec ? spec.deepCapture : onChallenge()
+        if (script.includes('dsh-deep-capture')) {
+          // Like a real page: closing it rejects the pending evaluation.
+          if (spec.hangDeepCapture === true) return await new Promise<never>((_resolve, reject) => { gotoRejecters.push(reject) })
+          return 'deepCapture' in spec ? spec.deepCapture : onChallenge()
+        }
         if (spec.serializationCorruption !== undefined && script.includes('ld+json')) scriptingStripped = true
         return onChallenge()
       },
@@ -434,6 +463,13 @@ class FakeProvider extends PlaywrightFetchProvider {
     this.lastSession = fakeSession(this.spec)
     return this.lastSession
   }
+}
+
+/** {@link FakeProvider} with a tiny waiting budget and extraction grace. */
+class BudgetProvider extends FakeProvider {
+  // Above the walk's 500ms floor, so a fresh fetch still walks.
+  protected override readonly fetchTimeoutMs = 800
+  protected override readonly extractGraceMs = 400
 }
 
 /**
@@ -1550,5 +1586,53 @@ describe('PlaywrightFetchProvider deep-capture walk', () => {
     const result = await provider.fetch({ url: 'https://example.com/data.json' })
     expect(result.body.kind).toBe('text')
     expect(recordEvaluates.some(script => script.includes('dsh-deep-capture'))).toBe(false)
+  })
+})
+
+describe('PlaywrightFetchProvider waiting budget (soft deadline)', () => {
+  it('extracts what a still-loading page already holds when the budget runs out, stopping the load', async () => {
+    const recordEvaluates: string[] = []
+    const provider = new BudgetProvider({}, { slowGoto: { responded: true }, recordEvaluates })
+    const result = await provider.fetch({ url: 'https://example.com/slow' })
+    expect(result.statusCode).toBe(200)
+    expect(result.body.kind).toBe('text')
+    expect(result.body.content).toContain('Hello')
+    expect(result.truncated).toBe(true)
+    expect(recordEvaluates).toContain('window.stop()')
+    // No walk on a spent budget: the extraction runs straight away.
+    expect(recordEvaluates.some(script => script.includes('dsh-deep-capture'))).toBe(false)
+  })
+
+  it('keeps the partial page raw when denoise is off', async () => {
+    const provider = new BudgetProvider({ denoise: false }, { slowGoto: { responded: true } })
+    const result = await provider.fetch({ url: 'https://example.com/slow' })
+    expect(result.body.kind).toBe('html')
+    expect(result.body.content).toContain('<h1>Hello</h1>')
+    expect(result.truncated).toBe(true)
+  })
+
+  it('still fails WEB_FETCH_TIMEOUT when no response arrived inside the budget', async () => {
+    const provider = new BudgetProvider({}, { slowGoto: { responded: false } })
+    await expect(codeOf(provider.fetch({ url: 'https://example.com/dead' }))).resolves.toBe('WEB_FETCH_TIMEOUT')
+  })
+
+  it('caps the scroll walk at the waiting budget, not the larger scroll budget', async () => {
+    const recordEvaluates: string[] = []
+    const provider = new BudgetProvider({ scrollBudgetMs: 60_000 }, { recordEvaluates })
+    const result = await provider.fetch({ url: 'https://example.com/feed' })
+    expect(result.truncated).toBe(false)
+    const walk = recordEvaluates.find(script => script.includes('dsh-deep-capture'))
+    expect(walk).toBeDefined()
+    const budget = Number(/"budgetMs":(\d+)/.exec(walk!)?.[1])
+    expect(budget).toBeGreaterThan(0)
+    expect(budget).toBeLessThanOrEqual(800)
+  })
+
+  it('fails WEB_FETCH_TIMEOUT and closes the tab only when extraction hangs past the grace', async () => {
+    const provider = new BudgetProvider({ scrollBudgetMs: 60_000 }, { hangDeepCapture: true })
+    const started = Date.now()
+    await expect(codeOf(provider.fetch({ url: 'https://example.com/wedged' }))).resolves.toBe('WEB_FETCH_TIMEOUT')
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1_100)
+    expect((provider.lastSession as unknown as { closed: { pageClosed: boolean } }).closed.pageClosed).toBe(true)
   })
 })

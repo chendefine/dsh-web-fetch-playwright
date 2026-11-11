@@ -289,6 +289,17 @@ beforeAll(async () => {
       res.end('{"url":"https://x.com/tianyi/status/2105790798461882377","author_name":"Tianyi Cui"}')
       return
     }
+    if (url === '/slow/never-ends') {
+      // A document that streams its article and then never finishes: the
+      // response arrived, DOMContentLoaded never fires.
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      res.write(`<!doctype html><html><head><title>Slow page</title></head><body>
+<nav>nav link</nav>
+<main><article><h1>Slow heading</h1><p>The part that already streamed in.</p>
+<p>A second paragraph gives the article scorer enough text mass to find the main region.</p></article></main>
+`)
+      return // the connection stays open; afterAll tears it down
+    }
     if (url === '/pdf/inline.pdf') {
       // The common case: a PDF link served inline. Headless Chromium has no
       // viewer and downloads it; a headed / CDP-attached Chrome may commit
@@ -358,10 +369,42 @@ beforeAll(async () => {
 })
 
 afterAll(async () => {
+  server.closeAllConnections()
   await new Promise<void>(resolve => { server.close(() => { resolve() }) })
 })
 
+/** The real provider with a short waiting budget, so the soft deadline fires fast. */
+class ShortBudgetProvider extends PlaywrightFetchProvider {
+  protected override readonly fetchTimeoutMs = 4_000
+}
+
 describe('PlaywrightFetchProvider integration', () => {
+  it('returns what a never-finishing page already streamed when the waiting budget runs out', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping browser smoke (no launchable browser)')
+      return
+    }
+    const provider = new ShortBudgetProvider(() => ({
+      backend: 'local',
+      playwrightPath: '',
+      cdpEndpoint: '',
+      contextIsolationScope: 'global' as const,
+      shareBrowserContext: true,
+      denoise: true,
+      maxConcurrency: 4,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
+    }))
+    const started = Date.now()
+    const result = await provider.fetch({ url: `${baseUrl}slow/never-ends` })
+    expect(Date.now() - started).toBeLessThan(4_000 + 10_000)
+    expect(result.statusCode).toBe(200)
+    expect(result.truncated).toBe(true)
+    const content = result.body.kind === 'text' ? result.body.content : ''
+    expect(content).toContain('Slow heading')
+    expect(content).toContain('The part that already streamed in.')
+  })
+
   it('fetches a local page through a real browser and denoises it', { timeout: 120_000 }, async () => {
     if (!browserAvailable) {
       console.warn('skipping browser smoke (no launchable browser)')
@@ -955,7 +998,7 @@ describe('PlaywrightFetchProvider challenge A/B (simulated Cloudflare edge)', ()
     expect(error).toBeInstanceOf(WebError)
     expect((error as WebError).code).toBe(WEB_FETCH_CHALLENGE_CODE)
     expect((error as WebError).message).toContain('Cloudflare')
-    // Bounded: gave up after the wait window, nowhere near the 45s deadline.
+    // Bounded: gave up after the wait window, nowhere near the 25s fetch budget.
     expect(Date.now() - started).toBeLessThan(20_000)
     await provider.dispose()
   })

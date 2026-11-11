@@ -124,8 +124,9 @@
  * The walk runs in BOTH denoise modes (the raw-HTML path serializes the same
  * cloaked placeholders) but never for non-HTML documents. It is bounded by
  * the `scrollBudgetMs` setting (`0` restores the pre-walk legacy behavior)
- * and always by the remaining fetch deadline minus a decode reserve — the
- * provider's abort closes the tab, which rejects the pending evaluation.
+ * and always by the fetch's remaining waiting budget: a walk cut short there
+ * still merges and returns what it stashed, and the content read plus decode
+ * run in the provider's extraction grace window after it.
  *
  * @module dsh-web-fetch-playwright/autoscroll
  */
@@ -206,12 +207,6 @@ export const SCROLL_STASH_MAX_CHARS = 2_000_000
  * rehydrate. Such keys are remembered and never serialized again.
  */
 export const SCROLL_STASH_MAX_ENTRY_CHARS = 64_000
-
-/**
- * Tail of the fetch budget the walk never spends, keeping room for the
- * content read and the synchronous denoise decode.
- */
-export const SCROLL_FINISH_RESERVE_MS = 4_000
 
 /**
  * A walk budget below this cannot complete even the first window plus one

@@ -84,6 +84,17 @@
  * degrades to the legacy capture (see `src/autoscroll.ts` for the measured
  * linux.do and Feishu badcases).
  *
+ * Deadline (soft, then hard): each fetch has a {@link DEFAULT_TIMEOUT_MS}
+ * budget for WAITING — navigation, settle, challenge wait, scroll walk. When
+ * it runs out the page is NOT torn down: every wait is bounded by the same
+ * budget and simply ends, a navigation still loading is stopped
+ * (`window.stop()`) once its main-frame response has arrived, and whatever
+ * the page holds by then goes through the normal extraction — a slow or
+ * endless page still hands the agent the content it already rendered
+ * (flagged `truncated` when the document never finished loading). Only when
+ * nothing arrived at all, or extraction itself hangs past
+ * {@link EXTRACT_GRACE_MS}, does the fetch fail with `WEB_FETCH_TIMEOUT`.
+ *
  * @module dsh-web-fetch-playwright/provider
  */
 
@@ -91,7 +102,7 @@ import { WebError } from '@deepseek-ai/dsh-web'
 import type { WebFetchProvider, WebFetchRequest, WebFetchResult } from '@deepseek-ai/dsh-web'
 import { CHALLENGE_DOM_PROBE, CHALLENGE_FINISH_RESERVE_MS, CHALLENGE_POLL_INTERVAL_MS, classifyChallengeHtml, classifyChallengeResponse, isChallengeCompatibleResponse } from './challenge.ts'
 import type { ChallengeVerdict } from './challenge.ts'
-import { deepCaptureWalk, SCROLL_FINISH_RESERVE_MS } from './autoscroll.ts'
+import { deepCaptureWalk } from './autoscroll.ts'
 import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveMaxConcurrency, effectiveScrollBudgetMs, normalizeCdpEndpoint } from './config.ts'
 import type { ResolvedConfig } from './config.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
@@ -128,10 +139,23 @@ const MAX_PIPELINE_INPUT_CHARS = 2_000_000
  * budget to render after dequeue — and failing fast tells the caller to
  * retry or raise `maxConcurrency` instead of hanging until an abort.
  */
-const QUEUE_TIMEOUT_MS = 20_000
+const QUEUE_TIMEOUT_MS = 10_000
 
-/** Default per-fetch budget (ms), inside the tool layer's 60s. */
-const DEFAULT_TIMEOUT_MS = 45_000
+/**
+ * Per-fetch waiting budget (ms): when it runs out the fetch stops waiting
+ * for the page and extracts what it already holds (see the module docs).
+ */
+const DEFAULT_TIMEOUT_MS = 25_000
+
+/**
+ * Hard backstop (ms) after {@link DEFAULT_TIMEOUT_MS} for reading and
+ * decoding what the page holds; only past it is the tab closed and the fetch
+ * failed. Budget plus grace stays inside the tool layer's 60s.
+ */
+const EXTRACT_GRACE_MS = 10_000
+
+/** Bound (ms) on the best-effort `window.stop()` of a still-loading page. */
+const STOP_LOADING_GRACE_MS = 1_000
 
 /** Best-effort post-DOM settle wait (ms) so SPA content can finish rendering. */
 const SETTLE_MS = 5_000
@@ -163,9 +187,13 @@ export interface BrowserSession {
 }
 
 /**
- * A single abort deadline composing the caller's signal with this provider's
- * time budget. The timeout reason is kept apart from an outer abort so the
- * error translation can pick `WEB_FETCH_TIMEOUT` over `WEB_ABORTED`.
+ * The fetch's two-stage deadline composed with the caller's signal. The SOFT
+ * stage (`timeoutMs`) only bounds waiting: {@link remainingMs} counts down to
+ * it and {@link expired} reports it, so every wait ends there and the fetch
+ * extracts what the page holds. The HARD stage (`timeoutMs + graceMs`) aborts
+ * {@link signal}, which closes the page. The timeout reason is kept apart
+ * from an outer abort so the error translation can pick `WEB_FETCH_TIMEOUT`
+ * over `WEB_ABORTED`.
  */
 class Deadline {
   readonly signal: AbortSignal
@@ -173,13 +201,13 @@ class Deadline {
   private readonly expiresAt: number
   private timedOut = false
 
-  constructor(outer: AbortSignal | undefined, timeoutMs: number) {
+  constructor(outer: AbortSignal | undefined, timeoutMs: number, graceMs = 0) {
     this.signal = this.controller.signal
     this.expiresAt = Date.now() + timeoutMs
     const timer = setTimeout(() => {
       this.timedOut = true
       this.controller.abort(new Error('playwright fetch deadline'))
-    }, timeoutMs)
+    }, timeoutMs + graceMs)
     if (outer !== undefined) {
       if (outer.aborted) this.controller.abort(outer.reason)
       else outer.addEventListener('abort', () => { this.controller.abort(outer.reason) }, { once: true })
@@ -187,12 +215,17 @@ class Deadline {
     this.signal.addEventListener('abort', () => { clearTimeout(timer) }, { once: true })
   }
 
-  /** Whether OUR timer fired (vs an outer cancellation). */
+  /** Whether OUR hard timer fired (vs an outer cancellation). */
   get isTimeout(): boolean {
     return this.timedOut
   }
 
-  /** Milliseconds left on the budget, floored at 1 for Playwright options. */
+  /** Whether the soft (waiting) budget has run out. */
+  get expired(): boolean {
+    return Date.now() >= this.expiresAt
+  }
+
+  /** Milliseconds left on the waiting budget, floored at 1 for Playwright options. */
   remainingMs(): number {
     return Math.max(1, this.expiresAt - Date.now())
   }
@@ -324,6 +357,9 @@ function translateError(error: unknown, deadline: Deadline): WebError {
     return new WebError('web fetch aborted', 'WEB_ABORTED', { cause: error })
   }
   if (error instanceof WebError) return error
+  // Past the waiting budget with nothing salvageable (no response arrived,
+  // or a bounded wait's own timeout surfaced): the budget is the cause.
+  if (deadline.expired) return new WebError('playwright web fetch timed out before the page delivered any content', 'WEB_FETCH_TIMEOUT', { cause: error })
   return new WebError(`playwright web fetch failed: ${String(error instanceof Error ? error.message : error)}`, 'WEB_PROVIDER_ERROR', { cause: error })
 }
 
@@ -336,6 +372,12 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
   readonly id = PLAYWRIGHT_FETCH_PROVIDER_ID
 
   private readonly semaphore = new Semaphore(DEFAULT_MAX_CONCURRENCY_LOCAL)
+
+  /** Waiting budget per fetch (ms); code-level, overridable by subclasses (tests). */
+  protected readonly fetchTimeoutMs: number = DEFAULT_TIMEOUT_MS
+
+  /** Extraction grace after the waiting budget (ms); code-level, overridable by subclasses. */
+  protected readonly extractGraceMs: number = EXTRACT_GRACE_MS
 
   /** Shared CDP connection; injectable so the suite can substitute a fake. */
   protected readonly cdpPool: CdpConnectionPool
@@ -382,7 +424,7 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       }
     }
     const url = validateFetchUrl(request.url)
-    const deadline = new Deadline(signal, DEFAULT_TIMEOUT_MS)
+    const deadline = new Deadline(signal, this.fetchTimeoutMs, this.extractGraceMs)
 
     let session: BrowserSession | undefined
     let acquired = false
@@ -394,6 +436,7 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       acquired = true
       session = await this.openSession(config, deadline, sessionId)
       if (deadline.signal.aborted) throw new Error('web fetch aborted during session setup')
+      if (deadline.expired) throw new Error('the fetch budget ran out during session setup')
       // An aborted deadline must also interrupt Playwright's own waits:
       // closing the page rejects every pending operation on it (and, for
       // fetch-owned contexts, the context close that follows takes the rest).
@@ -510,6 +553,9 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     const first = await this.navigate(page, url, tracker, deadline, config.denoise)
     if (first.recovered !== undefined) return first.recovered
     let response = first.response
+    // The document never finished loading inside the budget: extract what
+    // arrived and flag the result as incomplete.
+    let partial = first.partial === true
     tracker.seed(response)
 
     let challengeEntryResponse: PlaywrightResponse | null = null
@@ -536,7 +582,9 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
           try { chained = classifyChallengeHtml(await page.content()) === 'challenge' } catch { chained = false }
           if (!chained) break
         }
-        if (--attemptsLeft <= 0) {
+        // No budget left for another window: a re-navigation could only
+        // land on the interstitial again.
+        if (--attemptsLeft <= 0 || deadline.expired) {
           const lastStatus = (tracker.last() ?? response)?.status()
           throw new WebError(
             `the site kept serving a Cloudflare challenge (last status ${lastStatus === undefined ? 'unknown' : String(lastStatus)}) for up to ${String(challengeWaitMs)}ms across ${String(effectiveChallengeRetries(config) + 1)} attempt(s); the browser did not clear it naturally — retry later, raise challengeWaitMs, or use a profile whose browser already holds clearance`,
@@ -549,6 +597,7 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
         const retry = await this.navigate(page, url, tracker, deadline, config.denoise)
         if (retry.recovered !== undefined) return retry.recovered
         response = retry.response
+        partial = retry.partial === true
         tracker.seed(response)
       }
     }
@@ -577,8 +626,12 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
 
     // Non-HTML decodes straight from the response body; no denoise applies.
     if (kind === 'text') {
-      const text = finalResponse !== null ? await finalResponse.text() : await page.content()
-      return capResult(finalUrl, statusCode, { kind: 'text', content: text })
+      // A stopped load has no complete response body to read; the page's
+      // rendered text is what arrived.
+      const text = partial
+        ? await renderedText(page)
+        : finalResponse !== null ? await finalResponse.text() : await page.content()
+      return flagPartial(capResult(finalUrl, statusCode, { kind: 'text', content: text }), partial)
     }
 
     // Best-effort settle for client-rendered content; a timeout just keeps
@@ -589,12 +642,11 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     // their off-window content at rest — see `src/autoscroll.ts`): a bounded
     // walk stashes what each rendered window shows and, when it restored
     // anything, hands back its own merged, already-stripped serialization.
-    // HTML documents only, inside the deadline with a decode reserve,
-    // silently degrading to the legacy capture; `scrollBudgetMs: 0` skips it.
-    const scrollBudgetMs = Math.min(
-      effectiveScrollBudgetMs(config),
-      deadline.remainingMs() - SCROLL_FINISH_RESERVE_MS,
-    )
+    // HTML documents only, ending at the waiting budget at the latest — the
+    // walk then hands back what it stashed so far and extraction runs in
+    // the grace window — silently degrading to the legacy capture;
+    // `scrollBudgetMs: 0` skips it, as does a budget already spent.
+    const scrollBudgetMs = deadline.expired ? 0 : Math.min(effectiveScrollBudgetMs(config), deadline.remainingMs())
     const captured = scrollBudgetMs > 0 ? await deepCaptureWalk(page, scrollBudgetMs) : undefined
 
     // Serialization safety for the live read: the document is about to be
@@ -613,9 +665,9 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     if (!config.denoise) {
       // The tool layer's own turndown renders raw HTML; the checkbox only
       // governs the Readability/DOMPurify stage this provider owns.
-      return capResult(finalUrl, statusCode, { kind: 'html', content: html })
+      return flagPartial(capResult(finalUrl, statusCode, { kind: 'html', content: html }), partial)
     }
-    return denoiseResult(finalUrl, statusCode, html)
+    return flagPartial(denoiseResult(finalUrl, statusCode, html), partial)
   }
 
   /**
@@ -637,7 +689,7 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     tracker: MainFrameTracker,
     deadline: Deadline,
     denoise: boolean,
-  ): Promise<{ response: PlaywrightResponse | null; recovered?: WebFetchResult }> {
+  ): Promise<{ response: PlaywrightResponse | null; recovered?: WebFetchResult; partial?: boolean }> {
     try {
       const response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: deadline.remainingMs() })
       return { response }
@@ -649,6 +701,14 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
         if (recovered !== undefined) return { response: null, recovered }
         const download = await recoverDownloadResponse(error, page, tracker, url, deadline, denoise)
         if (download !== undefined) return { response: null, recovered: download }
+        // The waiting budget ran out mid-load: once the document's response
+        // arrived the page already holds content, so stop the load and let
+        // the caller extract it instead of failing the whole fetch.
+        const arrived = tracker.last()
+        if (deadline.expired && arrived !== null) {
+          await stopLoading(page)
+          return { response: arrived, partial: true }
+        }
       }
       throw error
     }
@@ -715,6 +775,39 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
 /** Resolve after `ms` — the bounded wait's inter-poll nap. */
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => { setTimeout(resolve, ms) })
+}
+
+/**
+ * Best-effort `window.stop()` on a page whose load outran the fetch budget:
+ * the parser and pending subresources halt, so the DOM read next is what
+ * arrived rather than a moving target. Bounded; failures are ignored.
+ */
+async function stopLoading(page: PlaywrightPage): Promise<void> {
+  if (page.evaluate === undefined) return
+  let timer: ReturnType<typeof setTimeout> | undefined
+  await Promise.race([
+    page.evaluate('window.stop()').catch(() => {}),
+    new Promise<void>(resolve => { timer = setTimeout(resolve, STOP_LOADING_GRACE_MS) }),
+  ])
+  if (timer !== undefined) clearTimeout(timer)
+}
+
+/** The rendered text of a stopped non-HTML document (its body's innerText). */
+async function renderedText(page: PlaywrightPage): Promise<string> {
+  if (page.evaluate !== undefined) {
+    try {
+      const text = await page.evaluate('document.body ? document.body.innerText : ""')
+      if (typeof text === 'string') return text
+    } catch {
+      // fall through to the serialized document
+    }
+  }
+  return await page.content()
+}
+
+/** Mark a result built from a document that never finished loading. */
+function flagPartial(result: WebFetchResult, partial: boolean): WebFetchResult {
+  return partial ? { ...result, truncated: true } : result
 }
 
 /**

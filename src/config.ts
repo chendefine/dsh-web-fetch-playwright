@@ -52,8 +52,8 @@ export const MAX_CONCURRENCY_CEILING = 200
 /**
  * Default bounded wait (ms) for a Cloudflare challenge to clear naturally —
  * the user's real browser passes the verification on its own while the fetch
- * holds the same page and context. Sized to fit the 45s per-fetch deadline
- * with the settle/decode tail (and one retry) still inside it.
+ * holds the same page and context. Bounded further by the 25s per-fetch
+ * waiting budget, which keeps a settle/decode tail after the wait.
  */
 export const DEFAULT_CHALLENGE_WAIT_MS = 15_000
 
