@@ -27,7 +27,6 @@ export {
   DEFAULT_CHALLENGE_RETRIES,
   DEFAULT_CHALLENGE_WAIT_MS,
   DEFAULT_SCROLL_BUDGET_MS,
-  MAX_SCROLL_BUDGET_MS,
   effectiveChallengeRetries,
   effectiveChallengeWaitMs,
   effectiveContextMode,

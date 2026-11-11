@@ -17,8 +17,6 @@ export type PlaywrightCardLocaleKey =
   | 'contextScopeGlobal' | 'contextScopeGlobalHint'
   | 'denoise' | 'denoiseHint'
   | 'maxConcurrency' | 'maxConcurrencyHint' | 'maxConcurrencyPlaceholder'
-  | 'challengeWaitMs' | 'challengeWaitMsHint' | 'challengeWaitMsPlaceholder'
-  | 'scrollBudgetMs' | 'scrollBudgetMsHint' | 'scrollBudgetMsPlaceholder'
   | 'overridden' | 'reset' | 'readOnly'
   | 'save' | 'saving' | 'discard' | 'saveFailed' | 'invalidText'
 
@@ -57,12 +55,6 @@ export const en: Record<PlaywrightCardLocaleKey, string> = {
   maxConcurrency: 'Max concurrent fetches',
   maxConcurrencyHint: 'How many pages may render at once (1–200). Blank = auto: 4 local browsers, 50 CDP tabs in the remote browser.',
   maxConcurrencyPlaceholder: '(auto: local 4 / CDP 50)',
-  challengeWaitMs: 'Cloudflare challenge wait (ms)',
-  challengeWaitMsHint: 'Bounded wait for a Cloudflare challenge to clear naturally in the same tab (0–60000; 0 = off). 0 disables: the first response is returned as-is.',
-  challengeWaitMsPlaceholder: '(default: 15000)',
-  scrollBudgetMs: 'Deep-capture scroll budget (ms)',
-  scrollBudgetMsHint: 'Bounded in-page scroll walk that captures viewport-virtualized feeds (forum topics, comment threads) whole: posts outside the render window are empty placeholders at rest. 0–30000; 0 = off (capture the page as it rests).',
-  scrollBudgetMsPlaceholder: '(default: 20000)',
   overridden: 'Overridden',
   reset: 'Reset to default',
   readOnly: 'This deployment stores settings read-only.',
@@ -101,12 +93,6 @@ export const zh: Record<PlaywrightCardLocaleKey, string> = {
   maxConcurrency: '最大并发抓取数',
   maxConcurrencyHint: '同时渲染的页面上限（1–200）；留空自动：本地 4 个浏览器，CDP 在远端浏览器里 50 个标签页。',
   maxConcurrencyPlaceholder: '（自动：本地 4 / CDP 50）',
-  challengeWaitMs: 'Cloudflare 挑战等待上限（毫秒）',
-  challengeWaitMsHint: '在同一标签页内有界等待 Cloudflare 验证自然通过（0–60000；0 = 关闭）。关闭时直接返回首次响应——旧版行为。',
-  challengeWaitMsPlaceholder: '（默认：15000）',
-  scrollBudgetMs: '深度抓取滚动预算（毫秒）',
-  scrollBudgetMsHint: '有界的页内滚动遍历，完整捕获视口虚拟化的信息流（论坛帖子、评论区）：静止时渲染窗口外的帖子只是空占位符。0–30000；0 = 关闭（按页面静止状态抓取）。',
-  scrollBudgetMsPlaceholder: '（默认：20000）',
   overridden: '已覆盖',
   reset: '恢复默认',
   readOnly: '本部署的设置为只读。',

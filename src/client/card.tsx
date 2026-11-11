@@ -177,32 +177,6 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
         onEdit={(text) => { props.edit('maxConcurrency', text) }}
         onReset={() => { props.resetField('maxConcurrency') }}
       />
-      <ValueField
-        id="plugin-config-playwright-challenge-wait"
-        label={t('challengeWaitMs')}
-        hint={t('challengeWaitMsHint')}
-        placeholder={t('challengeWaitMsPlaceholder')}
-        overriddenLabel={t('overridden')}
-        resetLabel={t('reset')}
-        invalidLabel={t('invalidText')}
-        disabled={disabled}
-        {...state.challengeWaitMs}
-        onEdit={(text) => { props.edit('challengeWaitMs', text) }}
-        onReset={() => { props.resetField('challengeWaitMs') }}
-      />
-      <ValueField
-        id="plugin-config-playwright-scroll-budget"
-        label={t('scrollBudgetMs')}
-        hint={t('scrollBudgetMsHint')}
-        placeholder={t('scrollBudgetMsPlaceholder')}
-        overriddenLabel={t('overridden')}
-        resetLabel={t('reset')}
-        invalidLabel={t('invalidText')}
-        disabled={disabled}
-        {...state.scrollBudgetMs}
-        onEdit={(text) => { props.edit('scrollBudgetMs', text) }}
-        onReset={() => { props.resetField('scrollBudgetMs') }}
-      />
     </CardForm>
   )
 }

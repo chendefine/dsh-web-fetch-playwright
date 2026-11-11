@@ -17,9 +17,7 @@ import {
   DEFAULT_MAX_CONCURRENCY_LOCAL,
   DEFAULT_SCROLL_BUDGET_MS,
   MAX_CHALLENGE_RETRIES,
-  MAX_CHALLENGE_WAIT_MS,
   MAX_CONCURRENCY_CEILING,
-  MAX_SCROLL_BUDGET_MS,
   effectiveChallengeRetries,
   effectiveChallengeWaitMs,
   effectiveContextMode,
@@ -41,9 +39,7 @@ describe('Config', () => {
       shareBrowserContext: true,
       contextIsolationScope: 'global',
       denoise: true,
-      challengeWaitMs: DEFAULT_CHALLENGE_WAIT_MS,
       challengeRetries: DEFAULT_CHALLENGE_RETRIES,
-      scrollBudgetMs: DEFAULT_SCROLL_BUDGET_MS,
     })
   })
 
@@ -90,23 +86,24 @@ describe('Config', () => {
     expect(() => resolveConfig({ maxConcurrency: 2.5 })).toThrow()
   })
 
-  it('accepts the challenge knobs across their ranges, rejects outside them', () => {
-    expect(resolveConfig({ challengeWaitMs: 0 }).challengeWaitMs).toBe(0)
-    expect(resolveConfig({ challengeWaitMs: MAX_CHALLENGE_WAIT_MS }).challengeWaitMs).toBe(MAX_CHALLENGE_WAIT_MS)
-    expect(() => resolveConfig({ challengeWaitMs: -1 })).toThrow()
-    expect(() => resolveConfig({ challengeWaitMs: MAX_CHALLENGE_WAIT_MS + 1 })).toThrow()
+  it('accepts the challenge retry knob across its range, rejects outside it', () => {
     expect(resolveConfig({ challengeRetries: 0 }).challengeRetries).toBe(0)
     expect(resolveConfig({ challengeRetries: MAX_CHALLENGE_RETRIES }).challengeRetries).toBe(MAX_CHALLENGE_RETRIES)
     expect(() => resolveConfig({ challengeRetries: -1 })).toThrow()
     expect(() => resolveConfig({ challengeRetries: MAX_CHALLENGE_RETRIES + 1 })).toThrow()
   })
 
-  it('accepts the scroll-walk budget across its range, rejects outside it', () => {
+  it('keeps the code-level budgets out of the settings schema', () => {
+    // Not user settings: the schema never surfaces them, so an unset
+    // resolution leaves them absent and the effective* helpers default them.
+    const resolved = Config({}) as unknown as Record<string, unknown>
+    expect(resolved).not.toHaveProperty('challengeWaitMs')
+    expect(resolved).not.toHaveProperty('scrollBudgetMs')
+    expect(effectiveChallengeWaitMs(resolveConfig({}))).toBe(DEFAULT_CHALLENGE_WAIT_MS)
+    expect(effectiveScrollBudgetMs(resolveConfig({}))).toBe(DEFAULT_SCROLL_BUDGET_MS)
+    // Code (tests, demo scripts) may still override them explicitly.
+    expect(resolveConfig({ challengeWaitMs: 0 }).challengeWaitMs).toBe(0)
     expect(resolveConfig({ scrollBudgetMs: 0 }).scrollBudgetMs).toBe(0)
-    expect(resolveConfig({ scrollBudgetMs: MAX_SCROLL_BUDGET_MS }).scrollBudgetMs).toBe(MAX_SCROLL_BUDGET_MS)
-    expect(() => resolveConfig({ scrollBudgetMs: -1 })).toThrow()
-    expect(() => resolveConfig({ scrollBudgetMs: MAX_SCROLL_BUDGET_MS + 1 })).toThrow()
-    expect(() => resolveConfig({ scrollBudgetMs: 2.5 })).toThrow()
   })
 })
 
@@ -126,9 +123,7 @@ describe('the volatile configuration face', () => {
       contextIsolationScope: 'global',
       denoise: true,
       maxConcurrency: 8,
-      challengeWaitMs: DEFAULT_CHALLENGE_WAIT_MS,
       challengeRetries: DEFAULT_CHALLENGE_RETRIES,
-      scrollBudgetMs: DEFAULT_SCROLL_BUDGET_MS,
     })
   })
 
@@ -151,7 +146,7 @@ describe('the volatile configuration face', () => {
 })
 
 describe('effective challenge knobs', () => {
-  it('an explicit wait wins; a missing one falls back to the schema default', () => {
+  it('an explicit wait wins; a missing one falls back to the built-in default', () => {
     expect(effectiveChallengeWaitMs({ challengeWaitMs: 0 })).toBe(0)
     expect(effectiveChallengeWaitMs({ challengeWaitMs: 7_500 })).toBe(7_500)
     expect(effectiveChallengeWaitMs({})).toBe(DEFAULT_CHALLENGE_WAIT_MS)
@@ -165,7 +160,7 @@ describe('effective challenge knobs', () => {
 })
 
 describe('effectiveScrollBudgetMs', () => {
-  it('an explicit budget wins (0 = the walk is off); a missing one falls back to the schema default', () => {
+  it('an explicit budget wins (0 = the walk is off); a missing one falls back to the built-in default', () => {
     expect(effectiveScrollBudgetMs({ scrollBudgetMs: 0 })).toBe(0)
     expect(effectiveScrollBudgetMs({ scrollBudgetMs: 7_500 })).toBe(7_500)
     expect(effectiveScrollBudgetMs({})).toBe(DEFAULT_SCROLL_BUDGET_MS)

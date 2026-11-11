@@ -28,9 +28,6 @@ import z from '@deepseek-ai/schemastery'
  */
 export const DEFAULT_SCROLL_BUDGET_MS = 20_000
 
-/** Ceiling the schema accepts for `scrollBudgetMs`. */
-export const MAX_SCROLL_BUDGET_MS = 30_000
-
 /** Default CDP endpoint when the settings section leaves it blank. */
 export const DEFAULT_CDP_ENDPOINT = '127.0.0.1:9222'
 
@@ -59,9 +56,6 @@ export const MAX_CONCURRENCY_CEILING = 200
  * with the settle/decode tail (and one retry) still inside it.
  */
 export const DEFAULT_CHALLENGE_WAIT_MS = 15_000
-
-/** Ceiling the schema accepts for `challengeWaitMs`. */
-export const MAX_CHALLENGE_WAIT_MS = 60_000
 
 /** Default same-page re-navigation attempts after a challenge wait runs out. */
 export const DEFAULT_CHALLENGE_RETRIES = 1
@@ -115,7 +109,9 @@ export interface Config {
    * Bounded wait (ms) for a Cloudflare challenge to clear naturally inside
    * the same page/context. `0` (or any config leaving this at 0) restores the
    * legacy behavior: the first response is final, no waiting — the A/B
-   * baseline. Schema default: {@link DEFAULT_CHALLENGE_WAIT_MS}.
+   * baseline. Code-level only (tests, demo scripts): not part of the
+   * settings schema, so users cannot configure it. Default:
+   * {@link DEFAULT_CHALLENGE_WAIT_MS}.
    */
   challengeWaitMs?: number
   /**
@@ -129,8 +125,9 @@ export interface Config {
    * that defeats viewport virtualization on feed-shaped pages (Discourse
    * topic streams: replies outside the render window are empty height-only
    * placeholders carrying the post's id; see `src/autoscroll.ts`). `0`
-   * restores the legacy single-instant capture.
-   * Schema default: {@link DEFAULT_SCROLL_BUDGET_MS}.
+   * restores the legacy single-instant capture. Code-level only (tests,
+   * demo scripts): not part of the settings schema, so users cannot
+   * configure it. Default: {@link DEFAULT_SCROLL_BUDGET_MS}.
    */
   scrollBudgetMs?: number
   /**
@@ -156,11 +153,9 @@ export const Config = z.object({
   // Optional on purpose: the effective default depends on `backend`, which a
   // static schema default cannot express.
   maxConcurrency: z.number().step(1).min(1).max(MAX_CONCURRENCY_CEILING).volatile(),
-  // The bounded natural-wait knobs; 0 disables the whole challenge path.
-  challengeWaitMs: z.number().step(100).min(0).max(MAX_CHALLENGE_WAIT_MS).default(DEFAULT_CHALLENGE_WAIT_MS).volatile(),
+  // The challenge wait budget and the deep-capture scroll budget are
+  // deliberately absent: they are code-level constants, not user settings.
   challengeRetries: z.number().step(1).min(0).max(MAX_CHALLENGE_RETRIES).default(DEFAULT_CHALLENGE_RETRIES).volatile(),
-  // The deep-capture scroll walk's bounded budget; 0 disables the walk.
-  scrollBudgetMs: z.number().step(100).min(0).max(MAX_SCROLL_BUDGET_MS).default(DEFAULT_SCROLL_BUDGET_MS).volatile(),
 })
 
 /**
@@ -186,12 +181,8 @@ export interface PlaywrightPluginConfig {
    * field owns no default — the backend resolves one).
    */
   maxConcurrency: Volatile<number | undefined>
-  /** Challenge wait budget (ms) as a live reference. */
-  challengeWaitMs: Volatile<number>
   /** Challenge retry count as a live reference. */
   challengeRetries: Volatile<number>
-  /** Deep-capture scroll-walk budget (ms) as a live reference. */
-  scrollBudgetMs: Volatile<number>
 }
 
 /**
@@ -211,9 +202,7 @@ export function snapshotsOf(config: PlaywrightPluginConfig): Config {
     contextIsolationScope: config.contextIsolationScope.get(),
     denoise: config.denoise.get(),
     maxConcurrency: config.maxConcurrency.get(),
-    challengeWaitMs: config.challengeWaitMs.get(),
     challengeRetries: config.challengeRetries.get(),
-    scrollBudgetMs: config.scrollBudgetMs.get(),
   }
 }
 
@@ -228,7 +217,10 @@ export function snapshotsOf(config: PlaywrightPluginConfig): Config {
  * @returns the resolved config.
  */
 export function resolveConfig(config: Partial<Config>): ResolvedConfig {
-  const resolved = Config(config as never) as PlaywrightPluginConfig
+  // The code-level budgets bypass the schema: they pass through untouched
+  // (only when explicitly given) and the effective* helpers default them.
+  const { challengeWaitMs, scrollBudgetMs, ...settings } = config
+  const resolved = Config(settings as never) as PlaywrightPluginConfig
   return {
     backend: resolved.backend.get(),
     playwrightPath: resolved.playwrightPath.get(),
@@ -237,21 +229,21 @@ export function resolveConfig(config: Partial<Config>): ResolvedConfig {
     contextIsolationScope: resolved.contextIsolationScope.get(),
     denoise: resolved.denoise.get(),
     maxConcurrency: resolved.maxConcurrency.get(),
-    challengeWaitMs: resolved.challengeWaitMs.get(),
     challengeRetries: resolved.challengeRetries.get(),
-    scrollBudgetMs: resolved.scrollBudgetMs.get(),
+    ...(challengeWaitMs === undefined ? {} : { challengeWaitMs }),
+    ...(scrollBudgetMs === undefined ? {} : { scrollBudgetMs }),
   }
 }
 
 /**
  * Complete config after schemastery applies the field defaults it owns.
- * `maxConcurrency` and `scrollBudgetMs` stay optional — the former because
- * its effective default depends on `backend`, the latter so hand-built
- * resolved configs (tests) may omit it and let
- * {@link effectiveScrollBudgetMs} supply the default the schema would have.
+ * `maxConcurrency` stays optional because its effective default depends on
+ * `backend`; `challengeWaitMs` and `scrollBudgetMs` stay optional because
+ * they are code-level overrides outside the schema — absent, the
+ * effective* helpers supply the built-in defaults.
  */
-export type ResolvedConfig = Omit<Required<Config>, 'maxConcurrency' | 'scrollBudgetMs'>
-  & { maxConcurrency?: number; scrollBudgetMs?: number }
+export type ResolvedConfig = Omit<Required<Config>, 'maxConcurrency' | 'challengeWaitMs' | 'scrollBudgetMs'>
+  & { maxConcurrency?: number; challengeWaitMs?: number; scrollBudgetMs?: number }
 
 /**
  * The concurrency limit a fetch actually runs with: an explicit setting
@@ -268,7 +260,7 @@ export function effectiveMaxConcurrency(config: Pick<Config, 'backend' | 'maxCon
 
 /**
  * The challenge wait budget a fetch actually runs with: an explicit setting
- * wins, else the schema default. `0` means the challenge path is off.
+ * wins, else the built-in default. `0` means the challenge path is off.
  *
  * @param config - the resolved settings section (or any partial of it).
  * @returns the bounded wait in milliseconds.
@@ -292,7 +284,7 @@ export function effectiveChallengeRetries(config: Pick<Config, 'challengeRetries
 
 /**
  * The scroll-walk budget a fetch actually runs with: an explicit setting
- * wins, else the schema default. `0` means the deep-capture walk is off.
+ * wins, else the built-in default. `0` means the deep-capture walk is off.
  *
  * @param config - the resolved settings section (or any partial of it).
  * @returns the bounded walk budget in milliseconds.
