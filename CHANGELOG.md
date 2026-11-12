@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Web-component app shells no longer pay for the Readability family they cannot win.** When ≥90% of the body's visible text sits inside custom-element subtrees (hyphenated tags such as Angular's `<ms-app>`/`<ms-docs-*>` — no DOMPurify allowlist entry covers them, and `KEEP_CONTENT: false` removes them with their content), every Readability-family candidate sanitizes to a corpse. Measured on the badcase (`aistudio.google.com/docs/computer-use` over CDP into a real browser): 99% of body text custom-wrapped; Readability's pick sanitized to a root with zero words and the whole-document candidate to 39 of ~4.5k words, while the three Readability passes over the 1.1MB document cost ~6.5s — dead air between the browser holding the full page (~7s) and the fetch returning (~21–23s). On that shape generation now skips the family (`customWrappedTextShare`, `CUSTOM_WRAP_SKIP_SHARE`, facts `readabilitySkipped`) and seeds the selector with the empty-`art` reference stats a dead pick would have measured, so the surviving candidates' features are unchanged; the DOM-backed fallbacks, noscript paths and block classifier — the candidates the selector picks there anyway — carry the extraction (their titles fall back to `og:title`/`<title>`). Validation: the gate fires on 0 of 84 sampled benchmark pages; over a 63-page output-parity sample the results are byte-identical except the badcase itself (same winning strategy and content, one additional label line). End to end on the badcase: 21–23s → 13–15s.
+- **DOM-backed candidates are sanitized as nodes** — `doc`, `docc`, `main` and `ns_doc` hand their source element to DOMPurify, which imports a copy, instead of the caller re-parsing their serialization (measured on the badcase's whole-body candidate: 555ms → 304ms, byte-identical output, source document unmutated).
+- **The acceptance gate and the trailing prune share one parse of the Readability article** (the gate reads the container first, then the prune mutates it — the same order as before; ~400ms saved per heavy-page parse). Rail-name recognition short-circuits on a literal substring hint before the per-token split, cutting ~360ms from `markRecommendationRails`' walk over every element on the badcase.
+
 ## [0.2.22] - 2026-11-11
 
 ### Added

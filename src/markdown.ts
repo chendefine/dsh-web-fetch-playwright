@@ -227,11 +227,22 @@ function analyze(html: string, url: string): Analysis {
   const sanitize = (candidate: RawCandidate): Analysis['sanitized'][number] => {
     // KEEP_CONTENT: false is the load-bearing half of the denoise: DOMPurify
     // un-wraps forbidden tags but keeps their text by default; with it, the
-    // whole subtree of a forbidden element goes.
-    const root = purify.sanitize(candidate.html, { FORBID_TAGS, FORBID_ATTR, KEEP_CONTENT: false, RETURN_DOM: true }) as HTMLElement
+    // whole subtree of a forbidden element goes. A generator-held NODE is
+    // sanitized by import (identical output, measured on the whole-body
+    // candidate of the Angular docs badcase); a string is re-parsed.
+    const root = purify.sanitize(candidate.node ?? candidate.html, { FORBID_TAGS, FORBID_ATTR, KEEP_CONTENT: false, RETURN_DOM: true }) as HTMLElement
     return { kind: candidate.kind, title: candidate.title, legacy: candidate.legacy, root, stats: measureCandidate(candidate.kind, candidate.legacy, root) }
   }
   const sanitized = generated.candidates.map(sanitize)
+  // The custom-wrap skip left no `art` candidate — but the selector's
+  // features read the art reference (`words_vs_art_log`, the block diffs),
+  // and a skipped Readability run would have measured a DEAD-empty one. Seed
+  // exactly that, so the surviving candidates' vectors stay what a dead pick
+  // yields (verified on the badcase: the sanitized art root holds no text).
+  if (generated.facts.readabilitySkipped === true && !sanitized.some(c => c.kind === 'art')) {
+    const empty = document.createElement('div')
+    sanitized.push({ kind: 'art', title: undefined, legacy: false, root: empty, stats: measureCandidate('art', false, empty) })
+  }
   const page = pageFeatures(document, url, generated.facts, sanitized.find(c => c.kind === 'doc')?.stats, visibleTextLength(document.body))
 
   let blocks: Block[] = []

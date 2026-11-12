@@ -42,6 +42,15 @@ export interface RawCandidate {
   kind: CandidateKind
   /** HTML of the extraction; sanitized by the caller. */
   html: string
+  /**
+   * The extraction as a live DOM node, when the generator already holds one
+   * (`doc`/`docc`/`ns_doc` serialize `body`, `main` the container itself).
+   * DOMPurify sanitizes a node by importing a copy — the caller's re-parse
+   * of `html` (hundreds of ms on large pages, measured on the Angular docs
+   * badcase: 555ms for the whole-body candidate alone) is skipped; `html`
+   * stays the identity for the dedup below.
+   */
+  node?: Element
   /** Title to prepend when the body does not open with a heading. */
   title?: string
   /** Whether the 0.2.18 pipeline would have returned exactly this candidate. */
@@ -113,8 +122,20 @@ const GATE_MIN_ARTICLE_COVERAGE = 0.1
 export function articleCoversPage(articleHtml: string, document: Document): boolean {
   const bodyText = visibleTextLength(document.body)
   if (bodyText < GATE_MIN_BODY_TEXT_CHARS) return true
-  const container = document.createElement('div')
-  container.innerHTML = articleHtml
+  return articleCoversParsed(htmlFragment(articleHtml, document), bodyText)
+}
+
+/**
+ * {@link articleCoversPage} on an already-parsed article container, so the
+ * generator's gate and trailing prune share ONE parse of the article — the
+ * extraction is hundreds of KB on heavy pages (measured on the Angular docs
+ * badcase: ~400ms per parse of Readability's 485KB pick).
+ *
+ * @param container - the parsed article (read, never mutated).
+ * @param bodyText - the page body's visible text length, computed once.
+ */
+function articleCoversParsed(container: Element, bodyText: number): boolean {
+  if (bodyText < GATE_MIN_BODY_TEXT_CHARS) return true
   const articleText = visibleTextLength(container)
   return articleText >= GATE_MIN_ARTICLE_TEXT_CHARS
     && articleText / bodyText >= GATE_MIN_ARTICLE_COVERAGE
@@ -190,8 +211,19 @@ function removeTrailingLinkDenseRun(parent: Element, articleText: number): void 
 
 /** Prune with the 0.2.18 misfire guard; returns the original on a misfire. */
 export function prunedArticleContent(articleHtml: string, document: Document): string {
-  const container = document.createElement('div')
-  container.innerHTML = articleHtml
+  return pruneParsedArticle(htmlFragment(articleHtml, document), articleHtml)
+}
+
+/**
+ * {@link prunedArticleContent} on an already-parsed article container (the
+ * generator passes the gate's parse: the gate reads it first, then this
+ * mutates it — the same order the two-string-parses version produced).
+ *
+ * @param container - the parsed article; pruned in place.
+ * @param articleHtml - the string the container was parsed from (the
+ *   misfire-guard's verbatim return).
+ */
+function pruneParsedArticle(container: Element, articleHtml: string): string {
   const before = visibleTextLength(container)
   if (before === 0) return articleHtml
   pruneTrailingLinkDenseSections(container)
@@ -204,12 +236,24 @@ export function prunedArticleContent(articleHtml: string, document: Document): s
 
 // ------------------------------------------------- recommendation rails ----
 
-/** Link density at or above which a recommendation-named subtree is a rail. */
+/**
+ * Link density at or above which a recommendation-named subtree is a rail.
+ */
 const RAIL_LINK_DENSITY = 0.3
 const RAIL_MIN_LINKS = 4
 /** Prose (low-link text) the page must keep outside the rails. */
 const RAIL_MIN_PROSE_CHARS = 80
 const RAIL_PROSE_LINK_DENSITY = 0.2
+
+/**
+ * Necessary condition for {@link isRailName} on the raw class+id string: a
+ * matching token (`recommended-posts`, `Related`, …) always leaves one of
+ * these literals as a substring. Testing it first short-circuits the
+ * per-token split on the pages where it matters — {@link markRecommendationRails}
+ * walks every element, and on the measured 1.1MB Angular docs badcase the
+ * split alone cost ~360ms of the candidate generation.
+ */
+const RAIL_NAME_HINT = /recommend|related|outbrain|taboola/
 
 /**
  * Class/id sub-tokens naming a recommendation / related-content rail: the
@@ -225,6 +269,7 @@ function isRailName(token: string): boolean {
 
 function isRecommendationRail(element: Element): boolean {
   const names = `${element.getAttribute('class') ?? ''} ${element.id}`.toLowerCase()
+  if (!RAIL_NAME_HINT.test(names)) return false
   if (!names.split(/[\s_-]+/).some(isRailName)) return false
   if (element.querySelectorAll('a').length < RAIL_MIN_LINKS) return false
   const text = visibleTextLength(element)
@@ -562,10 +607,81 @@ export interface GenerationFacts {
   hasPreloaded: boolean
   /** The semantic main container, when found. */
   main: Element | null
+  /**
+   * True when the Readability family was SKIPPED because nearly all body
+   * text is custom-wrapped ({@link customWrappedTextShare}) — every
+   * extraction that would carry it sanitizes to nothing. The orchestrator
+   * then seeds the selector with the empty-`art` reference stats such a run
+   * would have measured, keeping the surviving candidates' features
+   * (`words_vs_art_log`, the block diffs) exactly what a dead Readability
+   * pick yields.
+   */
+  readabilitySkipped?: boolean
 }
 
 /** Below this much noscript text the noscript-unwrapped paths are skipped. */
 const NOSCRIPT_MIN_TEXT_CHARS = 200
+
+/**
+ * At or above this share of custom-wrapped body text the Readability family
+ * is skipped (see {@link customWrappedTextShare}).
+ */
+export const CUSTOM_WRAP_SKIP_SHARE = 0.9
+
+/**
+ * Share of the body's visible text that sits inside custom-element subtrees
+ * (tag names containing `-`: `<ms-app>`, `<my-doc>` — the HTML spec reserves
+ * them for custom elements; no standard HTML or MathML tag and no tag the
+ * denoise pipeline's DOMPurify step keeps contains a dash). DOMPurify's
+ * allowlist removes such tags wholesale — `KEEP_CONTENT: false` takes their
+ * subtrees with them — so once nearly ALL the page's text is custom-wrapped,
+ * every extraction that would carry it sanitizes to a corpse. Measured on
+ * the badcase (aistudio.google.com/docs/computer-use, an Angular app whose
+ * entire DOM lives under `<ms-app>`): 99% of body text custom-wrapped;
+ * Readability's pick sanitized to a root with ZERO words, the whole-document
+ * candidate to 39 of ~4.5k words — while the three Readability passes over
+ * the 1.1MB document cost ~6.5s of pure latency on candidates that could
+ * never win. The DOM-backed fallbacks, the noscript paths and the block
+ * classifier — the candidates that survive DOMPurify on this shape, and the
+ * ones the selector picks on such pages anyway — carry the extraction.
+ *
+ * Noise subtrees (script/style/nav/…) count as neither wrapped nor unwrapped;
+ * the share is over CONTENT-bearing text only. A partial share (a web
+ * component widget inside a normal article) stays below the threshold and
+ * keeps the full pipeline: only the shape where the family is provably dead
+ * pays for it.
+ */
+export function customWrappedTextShare(body: Element): number {
+  let total = 0
+  let wrapped = 0
+  const visit = (node: Node, insideCustom: boolean): void => {
+    if (node.nodeType === 3) {
+      const length = (node.nodeValue ?? '').replace(/\s+/g, '').length
+      if (length === 0) return
+      total += length
+      if (insideCustom) wrapped += length
+      return
+    }
+    if (node.nodeType !== 1 || NOISE_SUBTREE_TAGS.has(node.nodeName.toLowerCase())) return
+    const custom = insideCustom || node.nodeName.includes('-')
+    for (let child = node.firstChild; child !== null; child = child.nextSibling) visit(child, custom)
+  }
+  visit(body, false)
+  return total === 0 ? 0 : wrapped / total
+}
+
+/**
+ * The title the gated path hands its candidates: Readability's own first
+ * source is `og:title`, its second the `<title>` element — both remain
+ * readable on custom-element pages, where the DOM wrapping is the framework's
+ * but the metadata is the page's.
+ */
+function fallbackTitle(document: Document): string | undefined {
+  const og = document.querySelector('meta[property="og:title"]')?.getAttribute('content')?.trim()
+  if (og !== undefined && og !== '') return og
+  const title = document.querySelector('title')?.textContent?.trim()
+  return title === undefined || title === '' ? undefined : title
+}
 
 /**
  * Propose every candidate extraction for one parsed page.
@@ -576,38 +692,54 @@ export function generateCandidates(document: Document): { candidates: RawCandida
   const body = document.body
   const bodyHtml = body?.innerHTML ?? ''
 
-  // Rails are marked before Readability (it drops the class names that
-  // identify them) and cut from its output; the gate and `artu` see the
-  // extraction exactly as unmarked, so the legacy marker and the "keep
-  // everything" alternative are unchanged.
-  const marked = runReadability(markRecommendationRails(document) ?? document)
-  const rails = marked === null ? null : splitRails(marked.content, document)
-  const art = marked === null || rails === null ? null : { ...marked, content: rails.plain }
-  const gatePass = art !== null && articleCoversPage(art.content, document)
+  // The custom-element shape: skip the Readability family outright (see
+  // {@link customWrappedTextShare}) — its candidates sanitize to corpses.
+  const skipReadability = body !== null && customWrappedTextShare(body) >= CUSTOM_WRAP_SKIP_SHARE
+
+  let art: ReadabilityPick | null = null
+  let lenient: ReadabilityPick | null = null
+  let gatePass = false
   let pruneChanged = false
-  if (art !== null) {
-    const pruned = prunedArticleContent(rails?.derailed ?? art.content, document)
-    pruneChanged = pruned !== art.content
-    candidates.push({ kind: 'art', html: pruned, title: art.title, legacy: gatePass })
-    if (pruneChanged) candidates.push({ kind: 'artu', html: art.content, title: art.title, legacy: false })
+  if (!skipReadability) {
+    // Rails are marked before Readability (it drops the class names that
+    // identify them) and cut from its output; the gate and `artu` see the
+    // extraction exactly as unmarked, so the legacy marker and the "keep
+    // everything" alternative are unchanged.
+    const marked = runReadability(markRecommendationRails(document) ?? document)
+    const rails = marked === null ? null : splitRails(marked.content, document)
+    art = marked === null || rails === null ? null : { ...marked, content: rails.plain }
+    if (art !== null) {
+      // One parse of the article serves the gate AND the prune (the common
+      // case: no rail was cut, so both read the same string).
+      const bodyText = visibleTextLength(body)
+      const parsed = htmlFragment(art.content, document)
+      gatePass = articleCoversParsed(parsed, bodyText)
+      const pruning = rails?.derailed ?? art.content
+      const pruned = pruning === art.content
+        ? pruneParsedArticle(parsed, art.content)
+        : prunedArticleContent(pruning, document)
+      pruneChanged = pruned !== art.content
+      candidates.push({ kind: 'art', html: pruned, title: art.title, legacy: gatePass })
+      if (pruneChanged) candidates.push({ kind: 'artu', html: art.content, title: art.title, legacy: false })
+    }
+    // `linkDensityModifier` is a public Readability option missing from the
+    // bundled type declarations; it relaxes the link-density cleaning cutoffs.
+    lenient = runReadability(document, { linkDensityModifier: 0.4 } as ConstructorParameters<typeof Readability>[1])
+    if (lenient !== null && lenient.content !== art?.content) {
+      candidates.push({ kind: 'artx', html: lenient.content, title: lenient.title, legacy: false })
+    }
   }
-  // `linkDensityModifier` is a public Readability option missing from the
-  // bundled type declarations; it relaxes the link-density cleaning cutoffs.
-  const lenient = runReadability(document, { linkDensityModifier: 0.4 } as ConstructorParameters<typeof Readability>[1])
-  if (lenient !== null && lenient.content !== art?.content) {
-    candidates.push({ kind: 'artx', html: lenient.content, title: lenient.title, legacy: false })
-  }
-  const title = art?.title ?? lenient?.title
+  const title = art?.title ?? lenient?.title ?? (skipReadability ? fallbackTitle(document) : undefined)
 
   const main = body === null ? null : findMainContainer(document)
-  if (main !== null) candidates.push({ kind: 'main', html: main.innerHTML, title, legacy: false })
+  if (main !== null) candidates.push({ kind: 'main', html: main.innerHTML, node: main, title, legacy: false })
 
-  candidates.push({ kind: 'doc', html: bodyHtml, legacy: !gatePass })
+  candidates.push({ kind: 'doc', html: bodyHtml, node: body ?? undefined, legacy: !gatePass })
 
   if (body !== null) {
     const cleaned = body.cloneNode(true) as Element
     stripPageChrome(cleaned)
-    candidates.push({ kind: 'docc', html: cleaned.innerHTML, legacy: false })
+    candidates.push({ kind: 'docc', html: cleaned.innerHTML, node: cleaned, legacy: false })
   }
 
   const record = body === null ? null : findRecordRegion(body)
@@ -623,7 +755,7 @@ export function generateCandidates(document: Document): { candidates: RawCandida
     unwrapNoscripts(unwrapped)
     const nsArt = runReadability(unwrapped)
     if (nsArt !== null) candidates.push({ kind: 'ns_art', html: prunedArticleContent(nsArt.content, unwrapped), title: nsArt.title, legacy: false })
-    candidates.push({ kind: 'ns_doc', html: unwrapped.body?.innerHTML ?? '', legacy: false })
+    candidates.push({ kind: 'ns_doc', html: unwrapped.body?.innerHTML ?? '', node: unwrapped.body ?? undefined, legacy: false })
   }
 
   const preloaded = discoursePreloadedHtml(document)
@@ -650,6 +782,7 @@ export function generateCandidates(document: Document): { candidates: RawCandida
       hasMain: main !== null,
       hasPreloaded: preloaded !== null,
       main,
+      ...(skipReadability ? { readabilitySkipped: true } : {}),
     },
   }
 }
