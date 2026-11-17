@@ -43,8 +43,8 @@ export const CHALLENGE_POLL_INTERVAL_MS = 500
 
 /**
  * Tail of the fetch budget held back from the challenge wait so a cleared
- * challenge still has time for its settle (5s networkidle cap) plus the
- * content read and the denoise pipeline.
+ * challenge still has time for its settle (the `DEFAULT_SETTLE_MS` cap)
+ * plus the content read and the denoise pipeline.
  */
 export const CHALLENGE_FINISH_RESERVE_MS = 8_000
 

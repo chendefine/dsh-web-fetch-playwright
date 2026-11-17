@@ -32,7 +32,7 @@ web_fetch (tool-web)
         ├─ local: resolve (path → $PATH → bundled playwright-core) → chromium.launch
         ├─ cdp:   connectOverCDP(endpoint)
         ├─ PDF (inline / attachment / sniffed octet-stream) → bytes (navigation body, else request-context refetch) → pdf.js → layout heuristics → Markdown
-        ├─ page.goto → settle (networkidle, best-effort) → deep-capture scroll walk (virtualized feeds; returns its merged, stripped capture when it restored anything) → otherwise strip scripting subtrees in the live DOM → page.content()
+        ├─ page.goto → settle (load baseline + bounded network-quiet window with a stale-request discount, best-effort — never Playwright's networkidle: worker-script and cross-origin-auth requests never complete on the page session, so strict idle is unreachable on modern SPA pages) → deep-capture scroll walk (virtualized feeds; returns its merged, stripped capture when it restored anything) → otherwise strip scripting subtrees in the live DOM → page.content()
         ├─ denoise: jsdom → elide data-URI images → Readability → coverage gate → trailing link-dense prune → DOMPurify → Turndown(GFM)
         └─ Markdown (or raw HTML when denoise is off)
 ```

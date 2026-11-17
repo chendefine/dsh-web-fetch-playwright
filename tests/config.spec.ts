@@ -17,6 +17,7 @@ import {
   DEFAULT_MAX_CONCURRENCY_CDP,
   DEFAULT_MAX_CONCURRENCY_LOCAL,
   DEFAULT_SCROLL_BUDGET_MS,
+  DEFAULT_SETTLE_MS,
   MAX_CHALLENGE_RETRIES,
   MAX_CONCURRENCY_CEILING,
   effectiveChallengeHttpFallback,
@@ -25,6 +26,7 @@ import {
   effectiveContextMode,
   effectiveMaxConcurrency,
   effectiveScrollBudgetMs,
+  effectiveSettleMs,
   normalizeCdpEndpoint,
   resolveConfig,
   snapshotsOf,
@@ -104,11 +106,14 @@ describe('Config', () => {
     const resolved = Config({}) as unknown as Record<string, unknown>
     expect(resolved).not.toHaveProperty('challengeWaitMs')
     expect(resolved).not.toHaveProperty('scrollBudgetMs')
+    expect(resolved).not.toHaveProperty('settleMs')
     expect(effectiveChallengeWaitMs(resolveConfig({}))).toBe(DEFAULT_CHALLENGE_WAIT_MS)
     expect(effectiveScrollBudgetMs(resolveConfig({}))).toBe(DEFAULT_SCROLL_BUDGET_MS)
+    expect(effectiveSettleMs(resolveConfig({}))).toBe(DEFAULT_SETTLE_MS)
     // Code (tests, demo scripts) may still override them explicitly.
     expect(resolveConfig({ challengeWaitMs: 0 }).challengeWaitMs).toBe(0)
     expect(resolveConfig({ scrollBudgetMs: 0 }).scrollBudgetMs).toBe(0)
+    expect(resolveConfig({ settleMs: 0 }).settleMs).toBe(0)
   })
 })
 

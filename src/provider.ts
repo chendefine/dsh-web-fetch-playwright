@@ -108,14 +108,14 @@ import type { WebFetchProvider, WebFetchRequest, WebFetchResult } from '@deepsee
 import { CHALLENGE_DOM_PROBE, CHALLENGE_FINISH_RESERVE_MS, CHALLENGE_POLL_INTERVAL_MS, classifyChallengeHtml, classifyChallengeResponse, isChallengeCompatibleResponse } from './challenge.ts'
 import type { ChallengeVerdict } from './challenge.ts'
 import { deepCaptureWalk } from './autoscroll.ts'
-import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, effectiveChallengeHttpFallback, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveMaxConcurrency, effectiveScrollBudgetMs, normalizeCdpEndpoint } from './config.ts'
+import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, effectiveChallengeHttpFallback, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveMaxConcurrency, effectiveScrollBudgetMs, effectiveSettleMs, normalizeCdpEndpoint } from './config.ts'
 import type { ResolvedConfig } from './config.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
 import { htmlToMarkdown } from './markdown.ts'
 import { extractPdfMarkdown, isPdfBytes, isPdfContentType, mayBePdf, MAX_PDF_BYTES, WEB_PDF_INVALID_CODE, WEB_PDF_TOO_LARGE_CODE } from './pdf.ts'
 import { STRIP_SCRIPTING_ELEMENTS } from './strip.ts'
 import { resolveCdpBackend, resolvePlaywrightBackend } from './playwright-resolve.ts'
-import type { PlaywrightBrowser, PlaywrightContext, PlaywrightDownload, PlaywrightPage, PlaywrightResponse, PlaywrightRoute } from './types.ts'
+import type { PlaywrightBrowser, PlaywrightContext, PlaywrightDownload, PlaywrightPage, PlaywrightResponse, PlaywrightRoute, PlaywrightWebRequest } from './types.ts'
 
 /** Stable id this provider registers under (the bundle patch pins it). */
 export const PLAYWRIGHT_FETCH_PROVIDER_ID = 'playwright'
@@ -162,8 +162,32 @@ const EXTRACT_GRACE_MS = 10_000
 /** Bound (ms) on the best-effort `window.stop()` of a still-loading page. */
 const STOP_LOADING_GRACE_MS = 1_000
 
-/** Best-effort post-DOM settle wait (ms) so SPA content can finish rendering. */
-const SETTLE_MS = 5_000
+/**
+ * Settle quiet window (ms): the post-load settle ends once no request has
+ * STARTED for this long AND every still-open request is stale (see
+ * {@link SETTLE_STALE_MS}) — the Lighthouse-style network-quiet threshold,
+ * sized to match Playwright's own networkidle quiet window.
+ */
+const SETTLE_QUIET_MS = 500
+
+/**
+ * A request open longer than this (ms) stops gating the settle. On the
+ * pages that motivated the custom detector, the long-lived request is a
+ * worker-script fetch or a cross-origin auth frame whose completion events
+ * are attributed to another CDP target and NEVER arrive on the page session
+ * (measured live over CDP: platform.claude.com's `turbopack-worker-*.js`
+ * and aistudio.google.com's `accounts.google.com/ServiceLogin` probe stayed
+ * "open" for the page's whole life while the page itself completed at
+ * `load`), so strict `networkidle` — Playwright's is officially discouraged
+ * — is unreachable there and the legacy wait burned its whole cap on every
+ * fetch. A genuine content request this old is the documented trade: the
+ * settle stops waiting for it, and the scroll walk plus the live read still
+ * capture whatever it renders when it lands.
+ */
+const SETTLE_STALE_MS = 3_000
+
+/** How often the settle re-checks its quiet/stale conditions (ms). */
+const SETTLE_POLL_MS = 100
 
 /**
  * Grace period (ms) for context/browser closes in the cleanup path. A wedged
@@ -384,6 +408,15 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
   /** Extraction grace after the waiting budget (ms); code-level, overridable by subclasses. */
   protected readonly extractGraceMs: number = EXTRACT_GRACE_MS
 
+  /** Settle quiet window (ms); code-level, overridable by subclasses (tests). */
+  protected readonly settleQuietMs: number = SETTLE_QUIET_MS
+
+  /** Request age (ms) past which it stops gating the settle; overridable by subclasses (tests). */
+  protected readonly settleStaleMs: number = SETTLE_STALE_MS
+
+  /** Settle re-check cadence (ms); overridable by subclasses (tests). */
+  protected readonly settlePollMs: number = SETTLE_POLL_MS
+
   /** Shared CDP connection; injectable so the suite can substitute a fake. */
   protected readonly cdpPool: CdpConnectionPool
 
@@ -549,9 +582,13 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     const page = session.page
     const challengeWaitMs = effectiveChallengeWaitMs(config)
     // The tracker is always on: the challenge wait needs the LAST main-frame
-    // response (feature switch below only gates the waiting), and status
-    // recovery needs whatever response arrived before a failed goto.
+    // response (feature switch below only gates the waiting), status
+    // recovery needs whatever response arrived before a failed goto, and
+    // the settle needs the page's open-request bookkeeping from BEFORE
+    // navigation — a request that started before the settle begins still
+    // counts toward quiet and staleness.
     const tracker = trackMainFrameResponses(page)
+    const activity = trackRequestActivity(page)
     // Feature switch: 0 keeps the exact legacy (pre-0.2.5) behavior — the
     // first response decides, no waiting — an escape hatch and the A/B
     // baseline every test proves the bug against.
@@ -649,8 +686,10 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     }
 
     // Best-effort settle for client-rendered content; a timeout just keeps
-    // what domcontentloaded already produced.
-    await page.waitForLoadState('networkidle', { timeout: Math.min(SETTLE_MS, deadline.remainingMs()) }).catch(() => {})
+    // what domcontentloaded already produced. See {@link settleForContent}
+    // for why this is a custom quiet window rather than Playwright's
+    // networkidle.
+    await this.settleForContent(page, deadline, config, activity)
 
     // Deep capture (viewport-virtualized feeds and app-shell documents lose
     // their off-window content at rest — see `src/autoscroll.ts`): a bounded
@@ -831,6 +870,74 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       return true
     }
   }
+
+  /**
+   * Best-effort settle for client-rendered content — a Lighthouse-style
+   * bounded network-quiet window replacing Playwright's `networkidle`
+   * (officially discouraged): worker-script fetches and cross-origin auth
+   * frames hold one request open on the page session FOREVER (their
+   * completion events are attributed to other CDP targets), so strict
+   * networkidle never arrives on exactly the modern pages the settle exists
+   * for, and the legacy wait burned its whole cap on them every fetch.
+   *
+   * Sequence: a `load` baseline (usually already past — domcontentloaded
+   * resolved earlier), then poll until no request has STARTED within
+   * {@link settleQuietMs} and every still-open request is older than
+   * {@link settleStaleMs} — a request that old is an attribution artifact
+   * or a long-poll whose completion no longer gates content. All waits
+   * share the {@link effectiveSettleMs} cap and the fetch deadline; a page
+   * that exposes no request events degrades to the legacy bounded
+   * networkidle wait. Never throws: any exit path keeps what the document
+   * already holds.
+   */
+  private async settleForContent(
+    page: PlaywrightPage,
+    deadline: Deadline,
+    config: ResolvedConfig,
+    activity: RequestActivity | undefined,
+  ): Promise<void> {
+    const beganAt = Date.now()
+    const cap = effectiveSettleMs(config)
+    if (cap <= 0) {
+      this.noteSettleOutcome('off', 0)
+      return
+    }
+    const endsAt = beganAt + Math.min(cap, deadline.remainingMs())
+    // The load event is the baseline quiet is measured against; usually it
+    // has already fired by the time the challenge loop released the page.
+    await page.waitForLoadState('load', { timeout: Math.max(1, endsAt - Date.now()) }).catch(() => {})
+    if (activity === undefined) {
+      // No request events on this surface: the legacy bounded wait.
+      await page.waitForLoadState('networkidle', { timeout: Math.max(1, endsAt - Date.now()) }).catch(() => {})
+      this.noteSettleOutcome('fallback', Date.now() - beganAt)
+      return
+    }
+    for (;;) {
+      if (deadline.signal.aborted) {
+        this.noteSettleOutcome('aborted', Date.now() - beganAt)
+        return
+      }
+      if (Date.now() >= endsAt) {
+        this.noteSettleOutcome('cap', Date.now() - beganAt)
+        return
+      }
+      if (activity.idle(this.settleQuietMs, this.settleStaleMs)) {
+        this.noteSettleOutcome(activity.openCount() > 0 ? 'stale-discounted' : 'quiet', Date.now() - beganAt)
+        return
+      }
+      await sleep(Math.min(this.settlePollMs, Math.max(1, endsAt - Date.now())))
+    }
+  }
+
+  /**
+   * Settle outcome observation hook — silent in production by design (the
+   * settle is best-effort), but subclasses (tests, diagnostics) override it
+   * to see which exit path every fetch took: `off` (config), `quiet`
+   * (network went quiet), `stale-discounted` (only stale requests remained
+   * open), `cap` (window exhausted), `fallback` (no request events — the
+   * legacy networkidle wait ran), `aborted` (fetch deadline fired).
+   */
+  protected noteSettleOutcome(outcome: 'off' | 'quiet' | 'stale-discounted' | 'cap' | 'fallback' | 'aborted', elapsedMs: number): void {}
 }
 
 /** Resolve after `ms` — the bounded wait's inter-poll nap. */
@@ -916,6 +1023,62 @@ function trackMainFrameResponses(page: PlaywrightPage): MainFrameTracker {
   return {
     last: () => last,
     seed: (response) => { if (response !== null) last = response },
+  }
+}
+
+/**
+ * The running record of the page's open requests, for the settle's
+ * network-quiet detection. Attached BEFORE navigation so every request —
+ * including ones that started before the settle begins — counts toward the
+ * quiet window and staleness.
+ */
+interface RequestActivity {
+  /**
+   * Whether the page is settle-idle: no request started within `quietMs`,
+   * and every still-open request has been open at least `staleMs`.
+   */
+  idle(quietMs: number, staleMs: number): boolean
+  /** How many requests are still open (labels the idle exit). */
+  openCount(): number
+}
+
+/**
+ * Watch the page for request lifecycle events so the settle can decide
+ * network quietness itself. `undefined` when the page exposes no request
+ * events (minimal fakes): the settle then falls back to the legacy bounded
+ * networkidle wait.
+ *
+ * @param page - the fetch's tab.
+ * @returns the open-request tracker, or undefined on an unsupported surface.
+ */
+function trackRequestActivity(page: PlaywrightPage): RequestActivity | undefined {
+  if (typeof page.on !== 'function') return undefined
+  const opened = new Map<PlaywrightWebRequest, number>()
+  let lastStart = Date.now()
+  const onStarted = (request: PlaywrightWebRequest): void => {
+    opened.set(request, Date.now())
+    lastStart = Date.now()
+  }
+  const onSettled = (request: PlaywrightWebRequest): void => {
+    opened.delete(request)
+  }
+  try {
+    page.on('request', onStarted)
+    page.on('requestfinished', onSettled)
+    page.on('requestfailed', onSettled)
+  } catch {
+    return undefined
+  }
+  return {
+    idle: (quietMs, staleMs) => {
+      const now = Date.now()
+      if (now - lastStart < quietMs) return false
+      for (const startedAt of opened.values()) {
+        if (now - startedAt < staleMs) return false
+      }
+      return true
+    },
+    openCount: () => opened.size,
   }
 }
 

@@ -32,7 +32,7 @@ web_fetch (tool-web)
         ├─ local: 解析（路径 → $PATH → 内置 playwright-core）→ chromium.launch
         ├─ cdp:   connectOverCDP(endpoint)
         ├─ PDF（inline / attachment / 嗅探出的 octet-stream）→ 字节（导航响应体，否则 request context 重新拉取）→ pdf.js → 版面启发式 → Markdown
-        ├─ page.goto → 等待稳定（networkidle，尽力而为）→ 深度抓取滚动遍历（虚拟化信息流；有还原时直接返回其合并且已剥离的结果）→ 否则在活 DOM 中剥离脚本子树 → page.content()
+        ├─ page.goto → 等待稳定（load 基线 + 有界网络静默窗，陈旧在途请求不再阻塞——尽力而为；不再用 Playwright 的 networkidle：worker 脚本与跨域认证请求在页面会话上永不完成，严格空闲在现代 SPA 页面上不可达）→ 深度抓取滚动遍历（虚拟化信息流；有还原时直接返回其合并且已剥离的结果）→ 否则在活 DOM 中剥离脚本子树 → page.content()
         ├─ 降噪：jsdom → 内联 data: 图片改占位符 → Readability → 覆盖率置信门 → 尾部链接密集块修剪 → DOMPurify → Turndown(GFM)
         └─ Markdown（关闭降噪时返回原始 HTML）
 ```

@@ -18,7 +18,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { CdpConnectionPool } from '../src/cdp-pool.ts'
 import { PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE } from '../src/provider.ts'
 import type { BrowserSession } from '../src/provider.ts'
-import type { PlaywrightBrowser, PlaywrightContext, PlaywrightDownload, PlaywrightPage, PlaywrightResponse } from '../src/types.ts'
+import type { PlaywrightBrowser, PlaywrightContext, PlaywrightDownload, PlaywrightPage, PlaywrightResponse, PlaywrightWebRequest } from '../src/types.ts'
 
 /** Everything a fake navigation can be told to produce. */
 interface FakePageSpec {
@@ -216,6 +216,8 @@ interface FakePageListeners {
 function makeFakePage(spec: FakePageSpec, state: FakePageState, listeners: FakePageListeners = { popup: [], download: [] }): PlaywrightPage {
   const gotoRejecters: Array<(error: Error) => void> = []
   const responseListeners: Array<(response: PlaywrightResponse) => void> = []
+  const requestListeners: Array<(request: PlaywrightWebRequest) => void> = []
+  const requestSettledListeners: Array<(request: PlaywrightWebRequest) => void> = []
   const downloadListeners = listeners.download
   const popupListeners = listeners.popup
   const scripted = spec.gotoScript ?? []
@@ -352,9 +354,11 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, listeners: FakeP
       for (const reject of gotoRejecters.splice(0)) reject(new Error('Target closed'))
     },
     route: async () => {},
-    on: (event: 'popup' | 'response' | 'download', listener: ((page: PlaywrightPage) => void) | ((response: PlaywrightResponse) => void) | ((download: PlaywrightDownload) => void)) => {
+    on: (event: 'popup' | 'response' | 'download' | 'request' | 'requestfinished' | 'requestfailed', listener: ((page: PlaywrightPage) => void) | ((response: PlaywrightResponse) => void) | ((download: PlaywrightDownload) => void) | ((request: PlaywrightWebRequest) => void)) => {
       if (event === 'popup') popupListeners.push(listener as (page: PlaywrightPage) => void)
       else if (event === 'response') responseListeners.push(listener as (response: PlaywrightResponse) => void)
+      else if (event === 'request') requestListeners.push(listener as (request: PlaywrightWebRequest) => void)
+      else if (event === 'requestfinished' || event === 'requestfailed') requestSettledListeners.push(listener as (request: PlaywrightWebRequest) => void)
       else downloadListeners.push(listener as (download: PlaywrightDownload) => void)
     },
     ...(spec.noEvaluate === true ? {} : {
@@ -466,6 +470,10 @@ class FakeProvider extends PlaywrightFetchProvider {
       challengeWaitMs: 0,
       challengeRetries: 0,
       challengeHttpFallback: true,
+      // Legacy default: the settle stays off unless a test opts in (the
+      // fake emits no request events, so a live settle would park for its
+      // quiet window on every fetch).
+      settleMs: 0,
       ...config,
     }))
   }
@@ -726,9 +734,161 @@ describe('PlaywrightFetchProvider', () => {
     expect(code).toBe('WEB_ABORTED')
   })
 
-  it('survives a networkidle settle timeout (keeps domcontentloaded content)', async () => {
-    const result = await new FakeProvider({}, { networkIdleError: true }).fetch({ url: 'https://example.com/spa' })
+  it('survives a settle timeout (keeps domcontentloaded content)', async () => {
+    // The fake's waitForLoadState throws for every state when armed, so the
+    // settle's load baseline rejects — the swallow keeps the fetch alive.
+    const result = await new FakeProvider({ settleMs: 100 }, { networkIdleError: true }).fetch({ url: 'https://example.com/spa' })
     expect(result.body.kind).toBe('text')
+  })
+})
+
+describe('PlaywrightFetchProvider settle (network-quiet window)', () => {
+  /**
+   * The settle replaced Playwright's networkidle (unreachable on pages with
+   * worker-script or cross-origin-auth requests that never complete on the
+   * page session) with a Lighthouse-style bounded quiet window plus a
+   * stale-request discount. These tests drive a page whose request
+   * lifecycle is scripted relative to goto and assert WHICH exit the
+   * settle took, through the outcome hook real surfaces stay silent on.
+   */
+  interface ScriptedRequest {
+    /** When the request starts, relative to goto (ms). */
+    startAtMs: number
+    /** When it settles, relative to goto (ms); absent = never (immortal). */
+    finishAtMs?: number
+  }
+
+  const SETTLE_HTML = '<html><body><p>ok</p></body></html>'
+  const frameToken = { frame: true }
+
+  /** A page with a scripted request lifecycle, plus scriptable close. */
+  function makeSettlePage(script: ScriptedRequest[], opts: { noRequestEvents?: boolean } = {}): PlaywrightPage {
+    const requestListeners: Array<(request: PlaywrightWebRequest) => void> = []
+    const settledListeners: Array<(request: PlaywrightWebRequest) => void> = []
+    const timers: ReturnType<typeof setTimeout>[] = []
+    const page: PlaywrightPage = {
+      goto: async () => {
+        for (const [index, entry] of script.entries()) {
+          const request: PlaywrightWebRequest = { url: () => `https://cdn.example.com/r${String(index)}` }
+          timers.push(setTimeout(() => { for (const listener of [...requestListeners]) listener(request) }, entry.startAtMs))
+          if (entry.finishAtMs !== undefined) {
+            timers.push(setTimeout(() => { for (const listener of [...settledListeners]) listener(request) }, entry.finishAtMs))
+          }
+        }
+        return {
+          status: () => 200,
+          headers: () => ({ 'content-type': 'text/html; charset=utf-8' }),
+          text: async () => SETTLE_HTML,
+          url: () => 'https://final.example.com/docs',
+          request: () => ({ isNavigationRequest: () => true, resourceType: () => 'document', frame: () => frameToken }),
+        }
+      },
+      waitForLoadState: async () => {},
+      url: () => 'https://final.example.com/docs',
+      content: async () => SETTLE_HTML,
+      close: async () => { for (const timer of timers.splice(0)) clearTimeout(timer) },
+      route: async () => {},
+      ...(opts.noRequestEvents === true ? {} : {
+        on: (event: 'popup' | 'response' | 'download' | 'request' | 'requestfinished' | 'requestfailed', listener: ((page: PlaywrightPage) => void) | ((response: PlaywrightResponse) => void) | ((download: PlaywrightDownload) => void) | ((request: PlaywrightWebRequest) => void)) => {
+          if (event === 'request') requestListeners.push(listener as (request: PlaywrightWebRequest) => void)
+          else if (event === 'requestfinished' || event === 'requestfailed') settledListeners.push(listener as (request: PlaywrightWebRequest) => void)
+        },
+      }),
+      mainFrame: () => frameToken,
+    }
+    return page
+  }
+
+  /** The provider under test: tiny settle cadence, recorded outcomes. */
+  class SettleProvider extends PlaywrightFetchProvider {
+    readonly outcomes: Array<[string, number]> = []
+    private session: BrowserSession | undefined
+
+    constructor(script: ScriptedRequest[], config: Partial<ResolvedConfig> = {}, opts: { noRequestEvents?: boolean } = {}) {
+      super(() => ({
+        backend: 'local',
+        playwrightPath: '',
+        cdpEndpoint: '',
+        contextIsolationScope: 'global',
+        shareBrowserContext: true,
+        denoise: false,
+        maxConcurrency: 4,
+        challengeWaitMs: 0,
+        challengeRetries: 0,
+        challengeHttpFallback: true,
+        scrollBudgetMs: 0,
+        settleMs: 600,
+        ...config,
+      }))
+      const page = makeSettlePage(script, opts)
+      const context: PlaywrightContext = { newPage: async () => page, route: async () => {}, close: async () => {} }
+      this.session = { browser: { newContext: async () => context, close: async () => {} }, context, page } as unknown as BrowserSession
+    }
+
+    protected override readonly settleQuietMs = 40
+    protected override readonly settleStaleMs = 120
+    protected override readonly settlePollMs = 10
+
+    protected override noteSettleOutcome(outcome: string, elapsedMs: number): void {
+      this.outcomes.push([outcome, elapsedMs])
+    }
+
+    protected override async openSession(): Promise<BrowserSession> {
+      return this.session!
+    }
+  }
+
+  it('discounts an immortal request instead of burning the whole cap', async () => {
+    // The measured claude-docs shape: a worker-script request that starts
+    // early and never settles on the page session.
+    const provider = new SettleProvider([{ startAtMs: 5 }])
+    const result = await provider.fetch({ url: 'https://example.com/docs' })
+    expect(result.body.kind).toBe('html')
+    expect(provider.outcomes.length).toBe(1)
+    expect(provider.outcomes[0]![0]).toBe('stale-discounted')
+    expect(provider.outcomes[0]![1]).toBeGreaterThanOrEqual(110) // waited out the stale threshold
+    expect(provider.outcomes[0]![1]).toBeLessThan(500) // …but not the 600ms cap
+  })
+
+  it('ends at the quiet window on a page with no requests', async () => {
+    const provider = new SettleProvider([])
+    await provider.fetch({ url: 'https://example.com/docs' })
+    expect(provider.outcomes[0]![0]).toBe('quiet')
+    expect(provider.outcomes[0]![1]).toBeGreaterThanOrEqual(30)
+    expect(provider.outcomes[0]![1]).toBeLessThan(200)
+  })
+
+  it('waits for a still-young in-flight request to finish (no premature discount)', async () => {
+    // Completes at 80ms — younger than the 120ms stale threshold, so the
+    // settle must hold until it lands rather than exiting at the first
+    // quiet moment (40ms). Elapsed ≥ 70ms proves it waited.
+    const provider = new SettleProvider([{ startAtMs: 5, finishAtMs: 80 }])
+    await provider.fetch({ url: 'https://example.com/docs' })
+    expect(provider.outcomes[0]![0]).toBe('quiet')
+    expect(provider.outcomes[0]![1]).toBeGreaterThanOrEqual(70)
+    expect(provider.outcomes[0]![1]).toBeLessThan(500)
+  })
+
+  it('burns to the cap under steady request activity', async () => {
+    // A start every 30ms out past the cap: the quiet window never opens.
+    const script = Array.from({ length: 25 }, (_, i) => ({ startAtMs: 10 + i * 30 }))
+    const provider = new SettleProvider(script)
+    await provider.fetch({ url: 'https://example.com/docs' })
+    expect(provider.outcomes[0]![0]).toBe('cap')
+    expect(provider.outcomes[0]![1]).toBeGreaterThanOrEqual(550)
+  })
+
+  it('falls back to the legacy bounded networkidle wait without request events', async () => {
+    const provider = new SettleProvider([], {}, { noRequestEvents: true })
+    await provider.fetch({ url: 'https://example.com/docs' })
+    expect(provider.outcomes.length).toBe(1)
+    expect(provider.outcomes[0]![0]).toBe('fallback')
+  })
+
+  it('skips the settle entirely at settleMs 0', async () => {
+    const provider = new SettleProvider([], { settleMs: 0 })
+    await provider.fetch({ url: 'https://example.com/docs' })
+    expect(provider.outcomes).toEqual([['off', 0]])
   })
 })
 

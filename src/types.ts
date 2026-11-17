@@ -57,6 +57,15 @@ export interface PlaywrightRequest {
   frame?(): unknown
 }
 
+/**
+ * A network request notification, as `page.on('request')` and its settled
+ * siblings deliver it. Identity only — the settle's network-quiet tracker
+ * keys its open-request map on the object itself.
+ */
+export interface PlaywrightWebRequest {
+  url?(): string
+}
+
 /** A page inside a context. */
 export interface PlaywrightPage {
   goto(url: string, options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle' | 'commit'; timeout?: number }): Promise<PlaywrightResponse | null>
@@ -77,6 +86,17 @@ export interface PlaywrightPage {
    * document). Absent on minimal fakes (content polling covers them).
    */
   on?(event: 'response', listener: (response: PlaywrightResponse) => void): unknown
+  /**
+   * Request-start notification — the settle's network-quiet tracker. Absent
+   * on minimal fakes (the settle falls back to the legacy bounded
+   * networkidle wait).
+   */
+  on?(event: 'request', listener: (request: PlaywrightWebRequest) => void): unknown
+  /**
+   * Request-settled notification (finished or failed) — closes the tracker's
+   * open-request bookkeeping. Absent on minimal fakes.
+   */
+  on?(event: 'requestfinished' | 'requestfailed', listener: (request: PlaywrightWebRequest) => void): unknown
   /**
    * Download notification — a navigation the browser handed to its download
    * manager instead of committing a document (`Content-Disposition:

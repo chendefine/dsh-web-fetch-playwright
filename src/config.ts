@@ -28,6 +28,15 @@ import z from '@deepseek-ai/schemastery'
  */
 export const DEFAULT_SCROLL_BUDGET_MS = 20_000
 
+/**
+ * Default cap (ms) on the post-navigation settle — the wait for SPA
+ * rendering to finish once the document has loaded (see the settle in
+ * `src/provider.ts`). A CAP, not a fixed cost: the settle ends as soon as
+ * the page's network goes quiet. Code-level only (tests, demo scripts):
+ * not part of the settings schema. `0` disables the settle entirely.
+ */
+export const DEFAULT_SETTLE_MS = 5_000
+
 /** Default CDP endpoint when the settings section leaves it blank. */
 export const DEFAULT_CDP_ENDPOINT = '127.0.0.1:9222'
 
@@ -150,6 +159,14 @@ export interface Config {
    */
   scrollBudgetMs?: number
   /**
+   * Cap (ms) on the post-navigation settle (load baseline + bounded
+   * network-quiet window with stale-request discount). Code-level only
+   * (tests, demo scripts): not part of the settings schema, so users cannot
+   * configure it. `0` disables the settle. Default:
+   * {@link DEFAULT_SETTLE_MS}.
+   */
+  settleMs?: number
+  /**
    * How many fetches may render at once. Blank = backend default (4 for
    * local — each slot launches a browser; 50 for CDP — each slot is a tab in
    * the already-running remote browser).
@@ -242,7 +259,7 @@ export function snapshotsOf(config: PlaywrightPluginConfig): Config {
 export function resolveConfig(config: Partial<Config>): ResolvedConfig {
   // The code-level budgets bypass the schema: they pass through untouched
   // (only when explicitly given) and the effective* helpers default them.
-  const { challengeWaitMs, scrollBudgetMs, ...settings } = config
+  const { challengeWaitMs, scrollBudgetMs, settleMs, ...settings } = config
   const resolved = Config(settings as never) as PlaywrightPluginConfig
   return {
     backend: resolved.backend.get(),
@@ -256,18 +273,19 @@ export function resolveConfig(config: Partial<Config>): ResolvedConfig {
     challengeHttpFallback: resolved.challengeHttpFallback.get(),
     ...(challengeWaitMs === undefined ? {} : { challengeWaitMs }),
     ...(scrollBudgetMs === undefined ? {} : { scrollBudgetMs }),
+    ...(settleMs === undefined ? {} : { settleMs }),
   }
 }
 
 /**
  * Complete config after schemastery applies the field defaults it owns.
  * `maxConcurrency` stays optional because its effective default depends on
- * `backend`; `challengeWaitMs` and `scrollBudgetMs` stay optional because
- * they are code-level overrides outside the schema — absent, the
- * effective* helpers supply the built-in defaults.
+ * `backend`; `challengeWaitMs`, `scrollBudgetMs` and `settleMs` stay
+ * optional because they are code-level overrides outside the schema —
+ * absent, the effective* helpers supply the built-in defaults.
  */
-export type ResolvedConfig = Omit<Required<Config>, 'maxConcurrency' | 'challengeWaitMs' | 'scrollBudgetMs'>
-  & { maxConcurrency?: number; challengeWaitMs?: number; scrollBudgetMs?: number }
+export type ResolvedConfig = Omit<Required<Config>, 'maxConcurrency' | 'challengeWaitMs' | 'scrollBudgetMs' | 'settleMs'>
+  & { maxConcurrency?: number; challengeWaitMs?: number; scrollBudgetMs?: number; settleMs?: number }
 
 /**
  * The concurrency limit a fetch actually runs with: an explicit setting
@@ -327,6 +345,19 @@ export function effectiveChallengeHttpFallback(config: Pick<Config, 'challengeHt
 export function effectiveScrollBudgetMs(config: Pick<Config, 'scrollBudgetMs'>): number {
   if (typeof config.scrollBudgetMs === 'number') return config.scrollBudgetMs
   return DEFAULT_SCROLL_BUDGET_MS
+}
+
+/**
+ * The settle cap a fetch actually runs with: an explicit value wins, else
+ * the built-in default. `0` means the settle is off (domcontentloaded
+ * content is read as-is).
+ *
+ * @param config - the resolved settings section (or any partial of it).
+ * @returns the bounded settle cap in milliseconds.
+ */
+export function effectiveSettleMs(config: Pick<Config, 'settleMs'>): number {
+  if (typeof config.settleMs === 'number') return config.settleMs
+  return DEFAULT_SETTLE_MS
 }
 
 /**
