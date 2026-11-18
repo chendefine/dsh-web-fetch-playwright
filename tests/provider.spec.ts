@@ -714,6 +714,84 @@ describe('PlaywrightFetchProvider', () => {
     expect(code).toBe('WEB_PROVIDER_ERROR')
   })
 
+  // The measured badcase: one session's fetch of source.android.com died to
+  // net::ERR_NETWORK_CHANGED (the host network shifted under the freshly
+  // launched Chromium mid-navigation); the same URL fetched clean from the
+  // same host seconds later. These tests pin the bounded same-page retry.
+  describe('transient-navigation retry (net::ERR_NETWORK_CHANGED family)', () => {
+    /** The exact badcase throw shape, captured from the failing session. */
+    const NETWORK_CHANGED = new Error(
+      'page.goto: net::ERR_NETWORK_CHANGED at https://source.android.com/docs/core/architecture/partitions\nCall log:\n  - navigating to "https://source.android.com/docs/core/architecture/partitions", waiting until "domcontentloaded"',
+    )
+
+    /**
+     * A provider whose fake page's `goto` follows a scripted per-call
+     * behavior; `original` delegates to the fake's happy path. The optional
+     * timeout override subclasses `fetchTimeoutMs` the way {@link BudgetProvider}
+     * does, for budget-boundary tests.
+     */
+    function makeScripted(
+      script: (call: number, original: () => Promise<PlaywrightResponse | null>) => Promise<PlaywrightResponse | null>,
+      fetchTimeoutMs?: number,
+    ): { Scripted: new () => FakeProvider; goto: ReturnType<typeof vi.fn> } {
+      const goto = vi.fn()
+      class Scripted extends FakeProvider {
+        protected override readonly fetchTimeoutMs = fetchTimeoutMs ?? 25_000
+        protected override async openSession(): Promise<BrowserSession> {
+          const session = await super.openSession()
+          const original = session.page.goto.bind(session.page)
+          goto.mockImplementation(async (url: string, options?: { timeout?: number }) =>
+            await script(goto.mock.calls.length, () => original(url, options)))
+          session.page.goto = goto as unknown as PlaywrightPage['goto']
+          return session
+        }
+      }
+      return { Scripted, goto }
+    }
+
+    it('retries one ERR_NETWORK_CHANGED blip and succeeds on the second navigation', async () => {
+      const { Scripted, goto } = makeScripted(async (call, original) => {
+        if (call === 1) throw NETWORK_CHANGED
+        return await original()
+      })
+      const result = await new Scripted().fetch({ url: 'https://source.android.com/docs/core/architecture/partitions' })
+      expect(result.statusCode).toBe(200)
+      expect(result.body.kind).toBe('text')
+      expect(goto).toHaveBeenCalledTimes(2)
+    })
+
+    it('caps transient retries at 3 total navigations, then fails WEB_PROVIDER_ERROR', async () => {
+      const { Scripted, goto } = makeScripted(async () => { throw NETWORK_CHANGED })
+      const code = await codeOf(new Scripted().fetch({ url: 'https://source.android.com/docs/core/architecture/partitions' }))
+      expect(code).toBe('WEB_PROVIDER_ERROR')
+      expect(goto).toHaveBeenCalledTimes(3)
+    }, 15_000)
+
+    it('does not retry non-transient navigation errors (ERR_CONNECTION_REFUSED)', async () => {
+      const { Scripted, goto } = makeScripted(async () => {
+        throw new Error('page.goto: net::ERR_CONNECTION_REFUSED at https://example.com/down')
+      })
+      expect(await codeOf(new Scripted().fetch({ url: 'https://example.com/down' }))).toBe('WEB_PROVIDER_ERROR')
+      expect(goto).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not retry when the waiting budget is below the retry reserve', async () => {
+      // 1200ms budget < the 2000ms retry reserve → the blip is terminal on
+      // attempt 1 even though the error family is retryable.
+      const { Scripted, goto } = makeScripted(async () => { throw NETWORK_CHANGED }, 1_200)
+      expect(await codeOf(new Scripted().fetch({ url: 'https://example.com/blip' }))).toBe('WEB_PROVIDER_ERROR')
+      expect(goto).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not retry Playwright timeout errors (they are not net:: codes)', async () => {
+      const timeout = new Error('page.goto: Timeout 30000ms exceeded.')
+      timeout.name = 'TimeoutError'
+      const { Scripted, goto } = makeScripted(async () => { throw timeout })
+      expect(await codeOf(new Scripted().fetch({ url: 'https://example.com/slow' }))).toBe('WEB_PROVIDER_ERROR')
+      expect(goto).toHaveBeenCalledTimes(1)
+    })
+  })
+
   it('never replays a navigation based on a missing-context-looking error', async () => {
     const goto = vi.fn().mockRejectedValue(new Error('Protocol error (Target.createTarget): Failed to find browser context with id ABC123'))
     class ObservedProvider extends FakeProvider {

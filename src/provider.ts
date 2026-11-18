@@ -18,6 +18,21 @@
  * refetch through the page's API request context
  * ({@link recoverDownloadResponse}) — instead of a `WEB_PROVIDER_ERROR`.
  *
+ * Transient transport failures (issue: `net::ERR_NETWORK_CHANGED` and its
+ * family) are retried, not terminal: Chromium's NetworkChangeNotifier kills
+ * every in-flight request with `ERR_NETWORK_CHANGED` the moment the HOST's
+ * network configuration shifts under the browser — a route/interface/DNS/
+ * proxy change, a VPN or DHCP flap, a Docker embedded-DNS rewrite; the page
+ * and its target are perfectly fine, only that one navigation died, and the
+ * very next `goto` usually succeeds (measured live: source.android.com
+ * failed once mid-navigation in one DSH session and fetched clean from the
+ * same host seconds later). Each navigation therefore retries the
+ * transport-blip family ({@link isTransientNavigationFailure} — deliberately
+ * NOT `ERR_ABORTED`, which is overloaded with the deterministic shapes the
+ * recoveries above already own) a bounded number of times with a short
+ * backoff, inside the same page and the remaining waiting budget; a blip
+ * that survives the attempt cap still fails as before.
+ *
  * Lifecycle: the local backend launches a browser per fetch and closes it —
  * nothing outlives the call. CDP session isolation keeps one connection per
  * DSH session until its context becomes idle; this also isolates gateways that
@@ -195,6 +210,30 @@ const SETTLE_POLL_MS = 100
  * fail every later fetch with the queue error until restart.
  */
 const CLOSE_GRACE_MS = 2_000
+
+/**
+ * How many times a navigation may be re-issued after a TRANSIENT transport
+ * failure (`net::ERR_NETWORK_CHANGED` and family — see
+ * {@link isTransientNavigationFailure}) before the fetch gives up. Three
+ * total navigations cover the single-blip badcase and the rare double-blip
+ * while capping the worst-case latency a persistently flapping network can
+ * add.
+ */
+const MAX_TRANSIENT_NAV_RETRIES = 2
+
+/**
+ * Backoff (ms) before each transient-navigation retry, indexed by the retry
+ * number: short first (most blips clear in well under a second), longer
+ * second. Bounded by the fetch deadline via an abortable sleep.
+ */
+const TRANSIENT_RETRY_BACKOFF_MS = [250, 750]
+
+/**
+ * Waiting budget (ms) that must REMAIN before a transient-navigation retry
+ * may start: the retry must not eat the tail the settle/decode path still
+ * needs, and a re-navigation that cannot finish is pure waste.
+ */
+const TRANSIENT_RETRY_RESERVE_MS = 2_000
 
 /**
  * One render session: a browser, the context this fetch works in, and the
@@ -778,6 +817,11 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
    * status-only 204/205 — {@link recoverUnrenderedStatus}), and the response
    * being a download the browser refuses to commit as a document
    * (`Content-Disposition: attachment` — {@link recoverDownloadResponse}).
+   * A TRANSIENT transport failure (`net::ERR_NETWORK_CHANGED` and family)
+   * is neither: it carries no response and no render decision, only a
+   * momentary host-network blip that killed this one navigation — so it is
+   * retried on the SAME page, bounded by {@link MAX_TRANSIENT_NAV_RETRIES}
+   * attempts, a short backoff, and the remaining waiting budget.
    *
    * @returns the response `goto` resolved with, plus `recovered` when the
    * navigation failure was recovered into a finished result the caller must
@@ -790,27 +834,43 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     deadline: Deadline,
     denoise: boolean,
   ): Promise<{ response: PlaywrightResponse | null; recovered?: WebFetchResult; partial?: boolean }> {
-    try {
-      const response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: deadline.remainingMs() })
-      return { response }
-    } catch (error) {
-      // Our own deadline/abort closing the page mid-navigation is a
-      // cancellation (translateError classifies it) — never a status fact.
-      if (!deadline.signal.aborted) {
-        const recovered = await recoverUnrenderedStatus(error, tracker, url, denoise)
-        if (recovered !== undefined) return { response: null, recovered }
-        const download = await recoverDownloadResponse(error, page, tracker, url, deadline, denoise)
-        if (download !== undefined) return { response: null, recovered: download }
-        // The waiting budget ran out mid-load: once the document's response
-        // arrived the page already holds content, so stop the load and let
-        // the caller extract it instead of failing the whole fetch.
-        const arrived = tracker.last()
-        if (deadline.expired && arrived !== null) {
-          await stopLoading(page)
-          return { response: arrived, partial: true }
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: deadline.remainingMs() })
+        return { response }
+      } catch (error) {
+        // Our own deadline/abort closing the page mid-navigation is a
+        // cancellation (translateError classifies it) — never a status fact.
+        if (!deadline.signal.aborted) {
+          const recovered = await recoverUnrenderedStatus(error, tracker, url, denoise)
+          if (recovered !== undefined) return { response: null, recovered }
+          const download = await recoverDownloadResponse(error, page, tracker, url, deadline, denoise)
+          if (download !== undefined) return { response: null, recovered: download }
+          // The waiting budget ran out mid-load: once the document's response
+          // arrived the page already holds content, so stop the load and let
+          // the caller extract it instead of failing the whole fetch.
+          const arrived = tracker.last()
+          if (deadline.expired && arrived !== null) {
+            await stopLoading(page)
+            return { response: arrived, partial: true }
+          }
+          // The transport blip family: nothing about the PAGE died — the
+          // host's network shifted under the browser and Chromium aborted
+          // the in-flight navigation. Retry on the same page while the
+          // attempt cap, the backoff, and the remaining budget allow; the
+          // reserve keeps enough budget for the settle/decode tail.
+          if (
+            attempt < MAX_TRANSIENT_NAV_RETRIES
+            && isTransientNavigationFailure(error)
+            && deadline.remainingMs() > TRANSIENT_RETRY_RESERVE_MS
+          ) {
+            const backoff = TRANSIENT_RETRY_BACKOFF_MS[Math.min(attempt, TRANSIENT_RETRY_BACKOFF_MS.length - 1)] ?? TRANSIENT_RETRY_BACKOFF_MS.at(-1) ?? 500
+            await abortableSleep(backoff, deadline.signal)
+            if (!deadline.signal.aborted) continue
+          }
         }
+        throw error
       }
-      throw error
     }
   }
 
@@ -1104,6 +1164,48 @@ function isUnrenderedStatusFailure(error: unknown, status: number): boolean {
   const message = error.message
   if (message.includes('ERR_HTTP_RESPONSE_CODE_FAILURE')) return true
   return message.includes('ERR_ABORTED') && (status === 204 || status === 205)
+}
+
+/**
+ * Chromium net errors a plain re-navigation can plausibly fix — the
+ * transport-layer BLIPS, not render decisions (those are recovered above)
+ * and not `ERR_ABORTED` (deliberately excluded: that code is overloaded with
+ * deterministic shapes — SPA cancels, 204/205 aborts, downloads — which the
+ * recoveries already own). `ERR_NETWORK_CHANGED` is the measured badcase:
+ * the host's network configuration shifted under the browser mid-navigation
+ * (route/interface/DNS/proxy change, VPN or DHCP flap, a Docker
+ * embedded-DNS rewrite) and Chromium's NetworkChangeNotifier killed the
+ * in-flight request; the sibling codes are the same story on a different
+ * layer (DNS blips, TCP resets and idle breaks, brief disconnects).
+ * Playwright's own navigation timeouts never match: they reject with a
+ * `TimeoutError` ("Timeout Nms exceeded"), not a `net::ERR_*` code.
+ */
+const TRANSIENT_NET_ERROR_RE = /net::ERR_(NETWORK_CHANGED|INTERNET_DISCONNECTED|CONNECTION_RESET|CONNECTION_CLOSED|CONNECTION_TIMED_OUT|TIMED_OUT|EMPTY_RESPONSE|NAME_NOT_RESOLVED|NAME_RESOLUTION_FAILED|ADDRESS_UNREACHABLE)\b/
+
+/**
+ * Whether a `goto` throw is one of the transient transport failures a
+ * bounded same-page retry can recover (see {@link TRANSIENT_NET_ERROR_RE}).
+ *
+ * @param error - the value `page.goto` rejected with.
+ * @returns true when the navigation died to a momentary network blip.
+ */
+function isTransientNavigationFailure(error: unknown): boolean {
+  return error instanceof Error && TRANSIENT_NET_ERROR_RE.test(error.message)
+}
+
+/**
+ * Sleep for `ms`, ending EARLY when `signal` aborts: the transient-retry
+ * backoff must never outlive the fetch — a deadline firing mid-backoff
+ * resolves immediately so the caller re-checks the signal and rethrows the
+ * original failure for the timeout/abort classification.
+ */
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise(resolve => {
+    if (signal.aborted) return resolve()
+    const onAbort = () => { clearTimeout(timer); resolve() }
+    const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve() }, ms)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 /**
